@@ -1,0 +1,31 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "gemini-bot",
+	"main": "src/index.js",
+	"compatibility_date": "2026-03-10",
+	"observability": {
+		"enabled": true
+	},
+	"upload_source_maps": true,
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"kv_namespaces": [
+		{
+			"binding": "CHAT_KV",
+			"id": "d2c7b772601741328e75a007fbe92551"
+		}
+	],
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "reminders_db",
+			"database_id": "1258722e-0953-4941-af63-8803e44d96e4"
+		}
+	],
+	"triggers": {
+		"crons": [
+			"* * * * *"
+		]
+	}
+}

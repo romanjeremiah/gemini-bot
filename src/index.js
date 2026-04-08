@@ -3,6 +3,10 @@ import * as reminderStore from './services/reminderStore';
 import * as telegram from './lib/telegram';
 import { generateSpeech } from './lib/tts';
 
+// Business connection IDs auto-expire after 30 days — they get refreshed
+// on every business_message or reconnection, so this is just cleanup for stale ones
+const BIZ_CONN_TTL = 2592000; // 30 days in seconds
+
 export default {
 	async fetch(request, env, ctx) {
 		if (!telegram.verifyWebhook(request, env)) {
@@ -17,37 +21,63 @@ export default {
 		if (request.method !== "POST") return new Response("OK");
 		const update = await request.json();
 
-		if (update.callback_query) ctx.waitUntil(handleCallback(update.callback_query, env));
-		else if (update.message) ctx.waitUntil(handleMessage(update.message, env));
+		let task;
+
+		if (update.business_connection) {
+			const bc = update.business_connection;
+			const userId = bc.user?.id;
+			console.log("🏢 Business connection:", bc.id, "user:", userId, "enabled:", bc.is_enabled);
+
+			if (bc.is_enabled && !bc.is_disabled && userId) {
+				await env.CHAT_KV.put(`biz_conn_${userId}`, bc.id, { expirationTtl: BIZ_CONN_TTL });
+				console.log(`🏢 Stored business connection ${bc.id} for user ${userId}`);
+			} else if (userId) {
+				await env.CHAT_KV.delete(`biz_conn_${userId}`);
+				console.log(`🏢 Removed business connection for user ${userId}`);
+			}
+		}
+		else if (update.business_message) {
+			const bizMsg = update.business_message;
+			if (bizMsg.business_connection_id && bizMsg.from?.id) {
+				await env.CHAT_KV.put(`biz_conn_${bizMsg.from.id}`, bizMsg.business_connection_id, { expirationTtl: BIZ_CONN_TTL });
+			}
+			task = handleMessage(bizMsg, env);
+		}
+		else if (update.callback_query) task = handleCallback(update.callback_query, env);
+		else if (update.message) task = handleMessage(update.message, env);
+
+		if (task) {
+			ctx.waitUntil(task);
+		}
 
 		return new Response("OK");
 	},
 
-	async scheduled(event, env, ctx) {
+	// eslint-disable-next-line no-unused-vars
+	async scheduled(_event, env, _ctx) {
 		const reminders = await reminderStore.getDueReminders(env);
+		if (!reminders.length) return;
 
-		for (const r of reminders) {
+		const tasks = reminders.map(async (r) => {
 			const threadId = r.thread_id || "default";
 			const meta = r.parsedMeta || {};
 			const firstName = meta.firstName || "mate";
 			const reason = meta.reason || "Scheduled task";
 
 			const isGroup = r.recipient_chat_id !== r.creator_chat_id;
+			// noinspection HtmlUnknownAttribute — "expandable" is a valid Telegram HTML attribute
 			let reminderText = `⏰ <b>Reminder:</b> ${r.text}\n\n<blockquote expandable>Context: ${reason}</blockquote>`;
-
 			if (isGroup) {
 				reminderText = `⏰ <b>${firstName}</b>, reminder: ${r.text}\n\n<blockquote expandable>Context: ${reason}</blockquote>`;
 			}
 
-			await telegram.sendMessage(
-				r.recipient_chat_id, threadId, reminderText, env, r.original_message_id
-			);
-
 			const personaKey = meta.persona || await env.CHAT_KV.get(`persona_${r.creator_chat_id}`) || "gemini";
-			try {
-				const audio = await generateSpeech(r.text, personaKey, env);
-				await telegram.sendVoice(r.recipient_chat_id, threadId, audio, env, r.original_message_id);
-			} catch (e) { console.error("Cron voice error:", e.message); }
+			await Promise.all([
+				telegram.sendMessage(r.recipient_chat_id, threadId, reminderText, env, r.original_message_id),
+				generateSpeech(r.text, personaKey, env)
+					.then(audio => telegram.sendVoice(r.recipient_chat_id, threadId, audio, env, r.original_message_id))
+					.catch(e => console.error("Cron voice error:", e.message))
+			]);
 
 			if (r.recurrence_type && r.recurrence_type !== "none") {
 				let next = r.due_at;
@@ -62,6 +92,11 @@ export default {
 			} else {
 				await reminderStore.clearReminder(env, r.id);
 			}
+		});
+
+		const BATCH_SIZE = 5;
+		for (let i = 0; i < tasks.length; i += BATCH_SIZE) {
+			await Promise.all(tasks.slice(i, i + BATCH_SIZE));
 		}
 	}
 };

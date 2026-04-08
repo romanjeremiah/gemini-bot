@@ -3,6 +3,13 @@ import { memoryTool } from './memory';
 import { reactionTool } from './reaction';
 import { voiceTool } from './voice';
 import { pinTool } from './pin';
+import { imageTool } from './image';
+import { pollTool } from './poll';
+import { locationTool } from './location';
+import { checklistTool } from './checklist';
+import { draftTool } from './draft';
+import { quoteTool } from './quote';
+import { saveTherapeuticNoteTool, getTherapeuticNotesTool } from './therapeutic';
 
 export const toolRegistry = {
 	[reminderTool.definition.name]: reminderTool,
@@ -10,6 +17,14 @@ export const toolRegistry = {
 	[reactionTool.definition.name]: reactionTool,
 	[voiceTool.definition.name]: voiceTool,
 	[pinTool.definition.name]: pinTool,
+	[imageTool.definition.name]: imageTool,
+	[pollTool.definition.name]: pollTool,
+	[locationTool.definition.name]: locationTool,
+	[checklistTool.definition.name]: checklistTool,
+	[draftTool.definition.name]: draftTool,
+	[quoteTool.definition.name]: quoteTool,
+	[saveTherapeuticNoteTool.definition.name]: saveTherapeuticNoteTool,
+	[getTherapeuticNotesTool.definition.name]: getTherapeuticNotesTool,
 };
 
 export const toolDefinitions = Object.values(toolRegistry).map(t => t.definition);

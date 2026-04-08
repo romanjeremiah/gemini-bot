@@ -5,7 +5,7 @@ export async function generateSpeech(text, personaKey, env) {
 	const voices = {
 		gemini: "en-US-Chirp3-HD-Gacrux",
 		thinking_partner: "en-US-Chirp3-HD-Vindemiatrix",
-		honest_friend: "en-US-Chirp3-HD-Autonoe",
+		mooncake: "en-US-Chirp3-HD-Vindemiatrix",
 		hue: "en-US-Chirp3-HD-Zubenelgenubi",
 		default: "en-US-Chirp3-HD-Gacrux"
 	};

@@ -1,41 +1,63 @@
 import { toolDefinitions } from '../../tools';
 
 const PRIMARY_TEXT_MODEL = "gemini-3.1-pro-preview";
+const FALLBACK_TEXT_MODEL = "gemini-3-flash-preview";
 const PRIMARY_IMAGE_MODEL = "gemini-3.1-flash-image-preview";
 const FALLBACK_IMAGE_MODEL = "gemini-2.5-flash-image";
 
-async function fetchWithRetry(url, options, maxRetries = 3) {
+const API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+
+async function fetchWithRetry(url, options, maxRetries = 3, fallbackUrl = null) {
 	let lastError;
 	for (let i = 0; i < maxRetries; i++) {
 		try {
 			const res = await fetch(url, options);
 			if (res.status === 503 || res.status === 429) {
+				console.log(`⏳ Gemini ${res.status}, retry ${i + 1}/${maxRetries} in ${Math.pow(2, i)}s`);
 				await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000));
 				continue;
 			}
 			return res;
 		} catch (err) { lastError = err; }
 	}
-	throw lastError || new Error("Max retries reached");
+
+	if (fallbackUrl) {
+		console.log(`🔄 Primary model unavailable after ${maxRetries} retries, falling back to secondary model`);
+		try {
+			const res = await fetch(fallbackUrl, options);
+			if (res.ok || (res.status !== 503 && res.status !== 429)) return res;
+		} catch (err) { lastError = err; }
+	}
+
+	throw lastError || new Error("Max retries reached on both primary and fallback models");
+}
+
+function buildTextBody(history, systemInstruction) {
+	return JSON.stringify({
+		systemInstruction: { parts: [{ text: systemInstruction }] },
+		contents: history,
+		tools: [
+			{ functionDeclarations: toolDefinitions },
+			{ googleSearch: {} }
+		],
+		toolConfig: { includeServerSideToolInvocations: true },
+		generationConfig: { temperature: 1.0, maxOutputTokens: 8192 }
+	});
 }
 
 // ---- Standard Completion ----
 export async function getCompletion(history, systemInstruction, env) {
-	const url = `https://generativelanguage.googleapis.com/v1beta/models/${PRIMARY_TEXT_MODEL}:generateContent?key=${env.GEMINI_API_KEY}`;
-	const res = await fetchWithRetry(url, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			systemInstruction: { parts: [{ text: systemInstruction }] },
-			contents: history,
-			tools: [
-				{ functionDeclarations: toolDefinitions },
-				{ googleSearch: {} }
-			],
-			toolConfig: { includeServerSideToolInvocations: true },
-			generationConfig: { temperature: 1.0, maxOutputTokens: 8192 }
-		})
-	});
+	const primaryUrl = `${API_BASE}/${PRIMARY_TEXT_MODEL}:generateContent?key=${env.GEMINI_API_KEY}`;
+	const fallbackUrl = `${API_BASE}/${FALLBACK_TEXT_MODEL}:generateContent?key=${env.GEMINI_API_KEY}`;
+	const body = buildTextBody(history, systemInstruction);
+
+	const res = await fetchWithRetry(
+		primaryUrl,
+		{ method: "POST", headers: { "Content-Type": "application/json" }, body },
+		3,
+		fallbackUrl
+	);
+
 	if (!res.ok) throw new Error(`Gemini API ${res.status}: ${(await res.text()).slice(0, 200)}`);
 	const data = await res.json();
 	const candidate = data.candidates?.[0];
@@ -50,24 +72,18 @@ export async function getCompletion(history, systemInstruction, env) {
 	return data;
 }
 
-// ---- Streaming Completion (Live typing & Google Search) ----
+// ---- Streaming Completion ----
 export async function* streamCompletion(history, systemInstruction, env) {
-	const url = `https://generativelanguage.googleapis.com/v1beta/models/${PRIMARY_TEXT_MODEL}:streamGenerateContent?alt=sse&key=${env.GEMINI_API_KEY}`;
+	const primaryUrl = `${API_BASE}/${PRIMARY_TEXT_MODEL}:streamGenerateContent?alt=sse&key=${env.GEMINI_API_KEY}`;
+	const fallbackUrl = `${API_BASE}/${FALLBACK_TEXT_MODEL}:streamGenerateContent?alt=sse&key=${env.GEMINI_API_KEY}`;
+	const body = buildTextBody(history, systemInstruction);
 
-	const res = await fetch(url, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			systemInstruction: { parts: [{ text: systemInstruction }] },
-			contents: history,
-			tools: [
-				{ functionDeclarations: toolDefinitions },
-				{ googleSearch: {} }
-			],
-			toolConfig: { includeServerSideToolInvocations: true },
-			generationConfig: { temperature: 1.0, maxOutputTokens: 8192 }
-		})
-	});
+	const res = await fetchWithRetry(
+		primaryUrl,
+		{ method: "POST", headers: { "Content-Type": "application/json" }, body },
+		3,
+		fallbackUrl
+	);
 
 	if (!res.ok) throw new Error(`Gemini Stream API ${res.status}: ${(await res.text()).slice(0, 200)}`);
 
@@ -112,10 +128,10 @@ export async function* streamCompletion(history, systemInstruction, env) {
 	}
 }
 
-// ---- Image Generation / Editing (Nano Banana 2) ----
+// ---- Image Generation / Editing ----
 export async function generateImage(prompt, env, inputImageBase64 = null, inputMimeType = null, useFallback = false) {
 	const model = useFallback ? FALLBACK_IMAGE_MODEL : PRIMARY_IMAGE_MODEL;
-	const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
+	const url = `${API_BASE}/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
 
 	const parts = [];
 	if (inputImageBase64 && inputMimeType) {
@@ -125,6 +141,8 @@ export async function generateImage(prompt, env, inputImageBase64 = null, inputM
 
 	console.log(`🎨 Image gen request to ${model}`);
 
+	const fallbackUrl = !useFallback ? `${API_BASE}/${FALLBACK_IMAGE_MODEL}:generateContent?key=${env.GEMINI_API_KEY}` : null;
+
 	const res = await fetchWithRetry(url, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
@@ -132,15 +150,11 @@ export async function generateImage(prompt, env, inputImageBase64 = null, inputM
 			contents: [{ parts }],
 			generationConfig: { responseModalities: ["TEXT", "IMAGE"] }
 		})
-	});
+	}, 3, fallbackUrl);
 
 	if (!res.ok) {
 		const errText = (await res.text()).slice(0, 300);
 		console.error("🎨 Image API error:", errText);
-		if ((res.status === 503 || res.status === 429) && !useFallback) {
-			console.log("🎨 Falling back to", FALLBACK_IMAGE_MODEL);
-			return generateImage(prompt, env, inputImageBase64, inputMimeType, true);
-		}
 		throw new Error(`Image API ${res.status}: ${errText.slice(0, 200)}`);
 	}
 

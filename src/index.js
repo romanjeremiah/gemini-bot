@@ -2,10 +2,16 @@ import { handleMessage, handleCallback } from './bot/handlers';
 import * as reminderStore from './services/reminderStore';
 import * as telegram from './lib/telegram';
 import { generateSpeech } from './lib/tts';
+import { storeDiscoveredEffect } from './tools/effect';
 
-// Business connection IDs auto-expire after 30 days — they get refreshed
-// on every business_message or reconnection, so this is just cleanup for stale ones
-const BIZ_CONN_TTL = 2592000; // 30 days in seconds
+const BIZ_CONN_TTL = 2592000; // 30 days
+
+function extractEffectEmoji(msg) {
+	const text = (msg.text || "").trim();
+	if (text.length <= 4) return text;
+	const emojiMatch = text.match(/^(\p{Emoji_Presentation}|\p{Emoji}\uFE0F)/u);
+	return emojiMatch ? emojiMatch[0] : null;
+}
 
 export default {
 	async fetch(request, env, ctx) {
@@ -27,7 +33,6 @@ export default {
 			const bc = update.business_connection;
 			const userId = bc.user?.id;
 			console.log("🏢 Business connection:", bc.id, "user:", userId, "enabled:", bc.is_enabled);
-
 			if (bc.is_enabled && !bc.is_disabled && userId) {
 				await env.CHAT_KV.put(`biz_conn_${userId}`, bc.id, { expirationTtl: BIZ_CONN_TTL });
 				console.log(`🏢 Stored business connection ${bc.id} for user ${userId}`);
@@ -41,15 +46,24 @@ export default {
 			if (bizMsg.business_connection_id && bizMsg.from?.id) {
 				await env.CHAT_KV.put(`biz_conn_${bizMsg.from.id}`, bizMsg.business_connection_id, { expirationTtl: BIZ_CONN_TTL });
 			}
+			if (bizMsg.effect_id) {
+				const emoji = extractEffectEmoji(bizMsg);
+				console.log(`✨ Effect discovered: ${bizMsg.effect_id} emoji: ${emoji}`);
+				await storeDiscoveredEffect(env, bizMsg.effect_id, emoji);
+			}
 			task = handleMessage(bizMsg, env);
 		}
 		else if (update.callback_query) task = handleCallback(update.callback_query, env);
-		else if (update.message) task = handleMessage(update.message, env);
-
-		if (task) {
-			ctx.waitUntil(task);
+		else if (update.message) {
+			if (update.message.effect_id) {
+				const emoji = extractEffectEmoji(update.message);
+				console.log(`✨ Effect discovered: ${update.message.effect_id} emoji: ${emoji}`);
+				await storeDiscoveredEffect(env, update.message.effect_id, emoji);
+			}
+			task = handleMessage(update.message, env);
 		}
 
+		if (task) ctx.waitUntil(task);
 		return new Response("OK");
 	},
 
@@ -65,7 +79,7 @@ export default {
 			const reason = meta.reason || "Scheduled task";
 
 			const isGroup = r.recipient_chat_id !== r.creator_chat_id;
-			// noinspection HtmlUnknownAttribute — "expandable" is a valid Telegram HTML attribute
+			// noinspection HtmlUnknownAttribute
 			let reminderText = `⏰ <b>Reminder:</b> ${r.text}\n\n<blockquote expandable>Context: ${reason}</blockquote>`;
 			if (isGroup) {
 				reminderText = `⏰ <b>${firstName}</b>, reminder: ${r.text}\n\n<blockquote expandable>Context: ${reason}</blockquote>`;

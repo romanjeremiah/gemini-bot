@@ -31,7 +31,17 @@ export async function sendMessage(chatId, threadId, text, env, replyId = null, m
 	if (markup) payload.reply_markup = markup;
 	if (effectId) payload.message_effect_id = effectId;
 
-	const res = await tgApi("sendMessage", env, payload);
+	let res = await tgApi("sendMessage", env, payload);
+
+	// Fallback 1: thread not found — retry in main chat without thread
+	if (!res.ok && res.description?.includes("thread not found") && payload.message_thread_id) {
+		console.warn(`⚠️ Thread ${payload.message_thread_id} not found — retrying in main chat`);
+		delete payload.message_thread_id;
+		delete payload.reply_parameters;
+		res = await tgApi("sendMessage", env, payload);
+	}
+
+	// Fallback 2: HTML parse error — strip tags and retry
 	if (!res.ok) {
 		delete payload.parse_mode;
 		payload.text = cleanText.replace(/<[^>]*>/g, "");

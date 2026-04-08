@@ -9,6 +9,7 @@ import { locationTool } from './location';
 import { checklistTool } from './checklist';
 import { draftTool } from './draft';
 import { quoteTool } from './quote';
+import { effectTool } from './effect';
 import { saveTherapeuticNoteTool, getTherapeuticNotesTool } from './therapeutic';
 
 export const toolRegistry = {
@@ -23,6 +24,7 @@ export const toolRegistry = {
 	[checklistTool.definition.name]: checklistTool,
 	[draftTool.definition.name]: draftTool,
 	[quoteTool.definition.name]: quoteTool,
+	[effectTool.definition.name]: effectTool,
 	[saveTherapeuticNoteTool.definition.name]: saveTherapeuticNoteTool,
 	[getTherapeuticNotesTool.definition.name]: getTherapeuticNotesTool,
 };

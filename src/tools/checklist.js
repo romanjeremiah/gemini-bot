@@ -1,5 +1,10 @@
 import * as telegram from '../lib/telegram';
 
+// Convert plain text to Unicode strikethrough (U+0336 combining long stroke overlay)
+function toStrikethrough(text) {
+	return text.split('').map(c => c + '\u0336').join('');
+}
+
 // Build the checklist message text with progress info
 function buildChecklistText(title, buttons) {
 	const total = buttons.length;
@@ -9,7 +14,6 @@ function buildChecklistText(title, buttons) {
 	let text = `📝 <b>${title}</b>\n`;
 	text += `<i>Checklist</i>\n\n`;
 
-	// Progress bar
 	const pct = total > 0 ? Math.round((done / total) * 100) : 0;
 	const filled = Math.round(pct / 10);
 	const bar = "▓".repeat(filled) + "░".repeat(10 - filled);
@@ -33,41 +37,12 @@ export const checklistTool = {
 					type: "ARRAY",
 					items: { type: "STRING" },
 					description: "List of tasks (1-30 items)."
-				},
-				others_can_mark: {
-					type: "BOOLEAN",
-					description: "Whether other users can mark tasks as done. Default true."
-				},
-				others_can_add: {
-					type: "BOOLEAN",
-					description: "Whether other users can add new tasks. Default false."
 				}
 			},
 			required: ["title", "items"]
 		}
 	},
 	async execute(args, env, context) {
-		const bizConnId = await env.CHAT_KV.get(`biz_conn_${context.userId}`);
-		const isThirdPartyChat = bizConnId && String(context.chatId) !== String(context.userId);
-
-		if (isThirdPartyChat) {
-			const res = await telegram.sendChecklist(
-				context.chatId,
-				context.threadId,
-				bizConnId,
-				args.title,
-				args.items.map(text => ({ text })),
-				env,
-				{
-					othersCanMark: args.others_can_mark !== false,
-					othersCanAdd: args.others_can_add === true
-				}
-			);
-			if (res.ok) return { status: "success", type: "native_checklist", item_count: args.items.length };
-			console.error("Native checklist failed, falling back to buttons:", res.description);
-		}
-
-		// Build inline keyboard — each task is a toggleable button
 		const kb = {
 			inline_keyboard: args.items.map((item, idx) => ([{
 				text: `☐  ${item}`,
@@ -86,9 +61,8 @@ export const checklistTool = {
 			kb
 		);
 
-		return { status: "success", type: "button_checklist", item_count: args.items.length };
+		return { status: "success", item_count: args.items.length };
 	}
 };
 
-// Exported so handlers.js can use it for callback handling
-export { buildChecklistText };
+export { buildChecklistText, toStrikethrough };

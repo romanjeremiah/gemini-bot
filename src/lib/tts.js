@@ -7,6 +7,7 @@ export async function generateSpeech(text, personaKey, env) {
 		thinking_partner: "en-US-Chirp3-HD-Vindemiatrix",
 		mooncake: "en-US-Chirp3-HD-Vindemiatrix",
 		hue: "en-US-Chirp3-HD-Zubenelgenubi",
+		tribore: "en-US-Chirp3-HD-Gacrux",
 		default: "en-US-Chirp3-HD-Gacrux"
 	};
 

@@ -4,9 +4,8 @@ import { toolRegistry } from '../tools';
 import * as telegram from '../lib/telegram';
 import * as memoryStore from '../services/memoryStore';
 import { generateSpeech } from '../lib/tts';
-import { buildChecklistText } from '../tools/checklist';
+import { buildChecklistText, toStrikethrough } from '../tools/checklist';
 
-// ---- Config: Paid plan optimised values ----
 const HISTORY_LENGTH = 24;
 const HISTORY_TTL = 604800;
 
@@ -53,17 +52,13 @@ async function handleCommand(command, msg, env) {
 		case "/memories": {
 			const mems = await memoryStore.getMemories(env, chatId, 40);
 			if (!mems.length) { await telegram.sendMessage(chatId, threadId, "📭 No memories saved.", env); return true; }
-
-			const factual = {};
-			const therapeutic = {};
+			const factual = {}, therapeutic = {};
 			for (const m of mems) {
 				const target = THERAPEUTIC_CATEGORIES.includes(m.category) ? therapeutic : factual;
 				if (!target[m.category]) target[m.category] = [];
 				target[m.category].push(m);
 			}
-
 			let t = "🧠 <b>Saved Memories</b>\n\n";
-
 			if (Object.keys(factual).length) {
 				for (const [c, items] of Object.entries(factual)) {
 					t += `<b>${c}</b>\n`;
@@ -71,19 +66,14 @@ async function handleCommand(command, msg, env) {
 					t += "\n";
 				}
 			}
-
 			if (Object.keys(therapeutic).length) {
 				t += "🔍 <b>Therapeutic Observations</b>\n\n";
 				for (const [c, items] of Object.entries(therapeutic)) {
 					t += `<b>${c}</b>\n`;
-					items.forEach(m => {
-						const star = m.importance_score >= 2 ? "⭐ " : "";
-						t += `• ${star}${m.fact}\n`;
-					});
+					items.forEach(m => { const star = m.importance_score >= 2 ? "⭐ " : ""; t += `• ${star}${m.fact}\n`; });
 					t += "\n";
 				}
 			}
-
 			await telegram.sendMessage(chatId, threadId, t + "<i>Use /forget to clear all.</i>", env);
 			return true;
 		}
@@ -99,7 +89,6 @@ export async function handleMessage(msg, env) {
 
 	try {
 		const firstName = msg.from.first_name || "User", userText = msg.text || msg.caption || "";
-
 		const cmdMatch = userText.match(/^\/(\w+)(@\w+)?/);
 		if (cmdMatch && await handleCommand(`/${cmdMatch[1]}`, msg, env)) return;
 
@@ -113,7 +102,6 @@ export async function handleMessage(msg, env) {
 
 		const activePersona = getPersona(personaKey);
 		let hist = history || [];
-
 		let replyContext = "";
 		if (msg.reply_to_message) replyContext = `\n[User is replying to ${msg.reply_to_message.from?.first_name || "Someone"}: "${(msg.reply_to_message.text || msg.reply_to_message.caption || "").slice(0, 500)}"]\n`;
 
@@ -140,29 +128,29 @@ export async function handleMessage(msg, env) {
 		if (userParts.length === 0) return;
 		hist.push({ role: "user", parts: userParts });
 
-		let isComplete = false, fullText = "", lastTypingTime = Date.now();
-		let lastSentMsgId = null;
+		let isComplete = false, fullText = "", lastTypingTime = Date.now(), lastSentMsgId = null;
 
 		while (!isComplete) {
 			const stream = streamCompletion(hist, sysPrompt, env);
-			let passText = "", toolCalls = [];
+			let passText = "", toolCalls = [], rawModelParts = null; // rawModelParts preserves thought signatures
 
 			for await (const chunk of stream) {
 				if (chunk.type === 'text') {
 					passText += chunk.text;
 					fullText += chunk.text;
-					const now = Date.now();
-					if (now - lastTypingTime > 4000) {
-						telegram.sendChatAction(chatId, threadId, "typing", env);
-						lastTypingTime = now;
-					}
+					if (Date.now() - lastTypingTime > 4000) { telegram.sendChatAction(chatId, threadId, "typing", env); lastTypingTime = Date.now(); }
 				} else if (chunk.type === 'functionCall') {
 					toolCalls.push(...chunk.calls);
+				} else if (chunk.type === 'modelParts') {
+					rawModelParts = chunk.parts; // Capture complete parts incl. thought signatures
 				}
 			}
 
 			if (toolCalls.length > 0) {
-				hist.push({ role: "model", parts: passText.trim() ? [{ text: passText }, ...toolCalls] : toolCalls });
+				// Use raw model parts when available — preserves thought signatures for Gemini 3.x
+				const modelParts = rawModelParts ?? (passText.trim() ? [{ text: passText }, ...toolCalls] : toolCalls);
+				hist.push({ role: "model", parts: modelParts });
+
 				await telegram.sendChatAction(chatId, threadId, "typing", env);
 				lastTypingTime = Date.now();
 
@@ -175,38 +163,22 @@ export async function handleMessage(msg, env) {
 							await telegram.sendChatAction(chatId, threadId, "upload_voice", env);
 							const buf = await generateSpeech(args.text_to_speak, activePersona, env);
 							await telegram.sendVoice(chatId, threadId, buf, env, messageId);
-
 						} else if (name === "generate_image") {
 							await telegram.sendChatAction(chatId, threadId, "upload_photo", env);
 							console.log("🎨 Image gen started:", args.prompt?.slice(0, 80));
-
 							const isEdit = args.edit_mode && uploadedImageBase64;
-							const { imageBase64, mimeType, caption } = await generateImage(
-								args.prompt, env,
-								isEdit ? uploadedImageBase64 : null,
-								isEdit ? uploadedImageMime : null
-							);
-
+							const { imageBase64, mimeType, caption } = await generateImage(args.prompt, env, isEdit ? uploadedImageBase64 : null, isEdit ? uploadedImageMime : null);
 							const bstr = atob(imageBase64);
 							const bytes = new Uint8Array(bstr.length);
 							for (let i = 0; i < bstr.length; i++) bytes[i] = bstr.charCodeAt(i);
-
 							await env.CHAT_KV.put(`last_img_${chatId}_${threadId}`, JSON.stringify({ prompt: args.prompt }), { expirationTtl: 86400 });
-
 							await telegram.sendPhoto(chatId, threadId, bytes, mimeType, env, messageId, caption?.slice(0, 1024), {
-								inline_keyboard: [[
-									{ text: "🔄 Regenerate", callback_data: "img_regen" },
-									{ text: "🗑️ Delete", callback_data: "action_delete_msg" }
-								]]
+								inline_keyboard: [[{ text: "🔄 Regenerate", callback_data: "img_regen" }, { text: "🗑️ Delete", callback_data: "action_delete_msg" }]]
 							});
 							result = { status: "success", note: "Image sent" };
-
 						} else {
 							const tool = toolRegistry[name];
-							if (tool) result = await tool.execute(args, env, {
-								userId: msg.from.id, chatId, threadId, messageId, firstName, activePersona,
-								lastBotMessageId: lastSentMsgId
-							});
+							if (tool) result = await tool.execute(args, env, { userId: msg.from.id, chatId, threadId, messageId, firstName, activePersona, lastBotMessageId: lastSentMsgId });
 						}
 					} catch (e) {
 						console.error(`Tool ${name} error:`, e.message);
@@ -218,10 +190,7 @@ export async function handleMessage(msg, env) {
 			} else {
 				isComplete = true;
 				if (fullText.trim()) {
-					const btns = { inline_keyboard: [[
-						{ text: "🔊 Voice", callback_data: "action_voice" },
-						{ text: "🗑️ Delete", callback_data: "action_delete_msg" }
-					]] };
+					const btns = { inline_keyboard: [[{ text: "🔊 Voice", callback_data: "action_voice" }, { text: "🗑️ Delete", callback_data: "action_delete_msg" }]] };
 					const sent = await telegram.sendMessage(chatId, threadId, fullText, env, messageId, btns);
 					lastSentMsgId = sent?.result?.message_id;
 					if (passText.trim()) hist.push({ role: "model", parts: [{ text: passText }] });
@@ -229,10 +198,14 @@ export async function handleMessage(msg, env) {
 			}
 		}
 
-		const cleanHistory = hist
+		// Clean history: strip tool calls and binary media, then truncate
+		let cleanHistory = hist
 			.map(h => ({ role: h.role, parts: h.parts.filter(p => !p.functionCall && !p.functionResponse).map(p => p.inlineData ? { text: "[Media]" } : p) }))
 			.filter(h => h.parts.length > 0)
 			.slice(-HISTORY_LENGTH);
+
+		if (cleanHistory.length > 0 && cleanHistory[0].role === "model") cleanHistory.shift();
+
 		await env.CHAT_KV.put(`chat_${chatId}_${threadId}`, JSON.stringify(cleanHistory), { expirationTtl: HISTORY_TTL });
 
 	} catch (err) {
@@ -280,50 +253,32 @@ export async function handleCallback(callbackQuery, env) {
 	} else if (data === "action_delete_msg") {
 		await telegram.deleteMessage(chatId, msgId, env);
 	} else if (data.startsWith("chk|")) {
-		// ---- Checklist toggle with dynamic progress tracking ----
 		const parts = data.split("|");
 		const index = parseInt(parts[1]);
 		const title = parts[2] || "Checklist";
 		const markup = callbackQuery.message.reply_markup;
-
 		if (!markup?.inline_keyboard?.[index]?.[0]) return;
-
-		// Toggle the tapped task
 		const button = markup.inline_keyboard[index][0];
 		if (button.text.startsWith("✅")) {
-			// Un-complete: restore the task text (strip ✅ and strikethrough)
-			const taskText = button.text.replace(/^✅\s+/, "").replace(/^~(.*)~$/, "$1");
-			button.text = `☐  ${taskText}`;
+			const rawText = button.text.replace(/^✅\s+/, "").replace(/\u0336/g, "");
+			button.text = `☐  ${rawText}`;
 		} else {
-			// Complete: add ✅ and strikethrough
 			const taskText = button.text.replace(/^☐\s+/, "");
-			button.text = `✅  ~${taskText}~`;
+			button.text = `✅  ${toStrikethrough(taskText)}`;
 		}
-
-		// Rebuild the message text with updated progress
 		const newText = buildChecklistText(title, markup.inline_keyboard);
-
-		// Update both text and markup in one call
 		await telegram.editMessage(chatId, msgId, newText, env, markup);
-
 	} else if (data === "img_regen") {
 		try {
 			await telegram.sendChatAction(chatId, threadId, "upload_photo", env);
 			const kvData = await env.CHAT_KV.get(`last_img_${chatId}_${threadId}`, { type: "json" });
-			if (!kvData?.prompt) {
-				await telegram.sendMessage(chatId, threadId, "⚠️ No previous prompt found.", env);
-				return;
-			}
+			if (!kvData?.prompt) { await telegram.sendMessage(chatId, threadId, "⚠️ No previous prompt found.", env); return; }
 			const { imageBase64, mimeType, caption } = await generateImage(kvData.prompt, env);
 			const bstr = atob(imageBase64);
 			const bytes = new Uint8Array(bstr.length);
 			for (let i = 0; i < bstr.length; i++) bytes[i] = bstr.charCodeAt(i);
-
 			await telegram.sendPhoto(chatId, threadId, bytes, mimeType, env, null, caption?.slice(0, 1024), {
-				inline_keyboard: [[
-					{ text: "🔄 Regenerate", callback_data: "img_regen" },
-					{ text: "🗑️ Delete", callback_data: "action_delete_msg" }
-				]]
+				inline_keyboard: [[{ text: "🔄 Regenerate", callback_data: "img_regen" }, { text: "🗑️ Delete", callback_data: "action_delete_msg" }]]
 			});
 		} catch (e) {
 			console.error("Image regen error:", e.message);

@@ -1,5 +1,10 @@
 import * as telegram from '../lib/telegram';
 
+// Note: Telegram's sendMessageDraft (Bot API 9.5) is a STREAMING tool —
+// it shows partial text while generating, not a "pre-fill input" feature.
+// For pre-filling the user's input, Telegram's deep link share URL is the
+// correct approach: https://t.me/share/url?text=...
+
 export const draftTool = {
 	definition: {
 		name: "send_draft",
@@ -13,8 +18,6 @@ export const draftTool = {
 		}
 	},
 	async execute(args, env, context) {
-		// Use Telegram's deep link share URL — tapping the button opens
-		// a chat picker with the text pre-filled in the input field
 		const shareUrl = `https://t.me/share/url?text=${encodeURIComponent(args.text)}`;
 
 		await telegram.sendMessage(

@@ -33,7 +33,6 @@ export async function sendMessage(chatId, threadId, text, env, replyId = null, m
 
 	let res = await tgApi("sendMessage", env, payload);
 
-	// Fallback 1: thread not found — retry in main chat without thread
 	if (!res.ok && res.description?.includes("thread not found") && payload.message_thread_id) {
 		console.warn(`⚠️ Thread ${payload.message_thread_id} not found — retrying in main chat`);
 		delete payload.message_thread_id;
@@ -41,13 +40,28 @@ export async function sendMessage(chatId, threadId, text, env, replyId = null, m
 		res = await tgApi("sendMessage", env, payload);
 	}
 
-	// Fallback 2: HTML parse error — strip tags and retry
 	if (!res.ok) {
 		delete payload.parse_mode;
 		payload.text = cleanText.replace(/<[^>]*>/g, "");
 		return await tgApi("sendMessage", env, payload);
 	}
 	return res;
+}
+
+// ---- Send Message Draft (Bot API 9.3+, all bots since 9.5) ----
+// Streams partial text to the user while the message is being generated.
+// Call repeatedly with the same draft_id and growing text — Telegram animates the changes.
+// Finalize with sendMessage when generation is complete (clears the draft bubble).
+// https://core.telegram.org/bots/api#sendmessagedraft
+export async function sendMessageDraft(chatId, threadId, draftId, text, env, replyId = null) {
+	const payload = {
+		chat_id: chatId,
+		draft_id: draftId,
+		text: text,  // plain text — no parse_mode for drafts to avoid mid-stream HTML errors
+	};
+	if (threadId && threadId !== "default") payload.message_thread_id = Number(threadId);
+	if (replyId) payload.reply_parameters = { message_id: replyId, allow_sending_without_reply: true };
+	return await tgApi("sendMessageDraft", env, payload);
 }
 
 // ---- Edit existing message ----
@@ -110,31 +124,6 @@ export async function sendPhoto(chatId, threadId, buffer, mimeType, env, replyId
 	return data;
 }
 
-// ---- Send native checklist (requires business_connection_id) ----
-// InputChecklistTask requires: id (Integer), text (String), optional parse_mode, text_entities
-export async function sendChecklist(chatId, threadId, businessConnectionId, title, tasks, env, options = {}) {
-	const checklist = {
-		title: title,
-		tasks: tasks.map((t, idx) => ({
-			id: idx,
-			text: typeof t === 'string' ? t : t.text,
-			...(t.parse_mode ? { parse_mode: t.parse_mode } : {})
-		})),
-		others_can_mark_tasks_as_done: options.othersCanMark !== false,
-		others_can_add_tasks: options.othersCanAdd === true
-	};
-	if (options.parseMode) checklist.parse_mode = options.parseMode;
-
-	const payload = {
-		business_connection_id: businessConnectionId,
-		chat_id: chatId,
-		checklist: checklist
-	};
-	if (threadId && threadId !== "default") payload.message_thread_id = Number(threadId);
-
-	return await tgApi("sendChecklist", env, payload);
-}
-
 // ---- Send voice note ----
 export async function sendVoice(chatId, threadId, buffer, env, replyId = null) {
 	const fd = new FormData();
@@ -167,10 +156,14 @@ export async function pinMessage(chatId, messageId, env) {
 	return await tgApi("pinChatMessage", env, { chat_id: chatId, message_id: messageId, disable_notification: true });
 }
 
-// ---- Send Poll ----
+// ---- Send Poll (updated for Bot API 9.6) ----
 export async function sendPoll(chatId, threadId, question, options, env, config = {}) {
 	const payload = { chat_id: chatId, question, options, ...config };
 	if (threadId && threadId !== "default") payload.message_thread_id = Number(threadId);
+	if (payload.correct_option_id !== undefined && !payload.correct_option_ids) {
+		payload.correct_option_ids = [payload.correct_option_id];
+		delete payload.correct_option_id;
+	}
 	return await tgApi("sendPoll", env, payload);
 }
 
@@ -179,21 +172,6 @@ export async function sendLocation(chatId, threadId, latitude, longitude, env) {
 	const payload = { chat_id: chatId, latitude, longitude };
 	if (threadId && threadId !== "default") payload.message_thread_id = Number(threadId);
 	return await tgApi("sendLocation", env, payload);
-}
-
-// ---- Send Message Draft (Bot API 9.5) ----
-export async function sendMessageDraft(chatId, threadId, text, env, replyId = null) {
-	const cleanText = sanitizeTelegramHTML(text);
-	const payload = { chat_id: chatId, text: cleanText, parse_mode: "HTML" };
-	if (threadId && threadId !== "default") payload.message_thread_id = Number(threadId);
-	if (replyId) payload.reply_parameters = { message_id: replyId, allow_sending_without_reply: true };
-	const res = await tgApi("sendMessageDraft", env, payload);
-	if (!res.ok) {
-		delete payload.parse_mode;
-		payload.text = cleanText.replace(/<[^>]*>/g, "");
-		return await tgApi("sendMessageDraft", env, payload);
-	}
-	return res;
 }
 
 // ---- Forward / Copy Message ----
@@ -226,10 +204,11 @@ export async function downloadFile(fileId, env) {
 	if (!info.ok) throw new Error("Failed to get file info");
 	if ((info.result.file_size || 0) > MAX_FILE_SIZE) throw new Error(`File too large: ${(info.result.file_size / 1024 / 1024).toFixed(1)} MB`);
 	const fileRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_TOKEN}/${info.result.file_path}`);
-	const binary = new Uint8Array(await fileRes.arrayBuffer());
-	let b64 = '';
-	for (let i = 0; i < binary.length; i++) b64 += String.fromCharCode(binary[i]);
-	return { base64: btoa(b64), filePath: info.result.file_path };
+	const arrayBuffer = await fileRes.arrayBuffer();
+	// Use native Buffer for fast base64 encoding (no manual for-loop)
+	const { Buffer } = await import('node:buffer');
+	const base64 = Buffer.from(arrayBuffer).toString('base64');
+	return { base64, buffer: arrayBuffer, filePath: info.result.file_path, fileSize: info.result.file_size || arrayBuffer.byteLength };
 }
 
 // ---- Register bot commands ----
@@ -237,6 +216,7 @@ export async function registerCommands(env) {
 	return await tgApi("setMyCommands", env, {
 		commands: [
 			{ command: "persona", description: "Switch AI personality" },
+			{ command: "mood", description: "Interactive mood check-in" },
 			{ command: "clear", description: "Reset conversation history" },
 			{ command: "memories", description: "View saved facts" },
 			{ command: "forget", description: "Delete all memories" },
@@ -249,4 +229,14 @@ export async function registerCommands(env) {
 export function verifyWebhook(request, env) {
 	const secret = env.WEBHOOK_SECRET;
 	return !secret || request.headers.get("X-Telegram-Bot-Api-Secret-Token") === secret;
+}
+
+// ---- Answer Inline Query ----
+export async function answerInlineQuery(inlineQueryId, results, env, opts = {}) {
+	return await tgApi("answerInlineQuery", env, {
+		inline_query_id: inlineQueryId,
+		results,
+		cache_time: opts.cacheTime ?? 10,
+		is_personal: opts.isPersonal ?? true,
+	});
 }

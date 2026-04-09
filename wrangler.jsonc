@@ -23,6 +23,21 @@
 			"database_id": "1258722e-0953-4941-af63-8803e44d96e4"
 		}
 	],
+	"r2_buckets": [
+		{
+			"binding": "MEDIA_BUCKET",
+			"bucket_name": "gemini-bot-media"
+		}
+	],
+	"vectorize": [
+		{
+			"binding": "VECTORIZE",
+			"index_name": "gemini-bot-memory"
+		}
+	],
+	"ai": {
+		"binding": "AI"
+	},
 	"triggers": {
 		"crons": [
 			"* * * * *"

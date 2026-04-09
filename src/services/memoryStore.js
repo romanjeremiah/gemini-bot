@@ -5,12 +5,18 @@
 // All categories live in the same table — therapeutic ones are distinguished
 // by category name and higher importance_score
 
+import * as vectorStore from './vectorStore';
+
 const THERAPEUTIC_CATEGORIES = ['pattern', 'trigger', 'avoidance', 'schema', 'growth', 'coping', 'insight'];
 
-export async function saveMemory(env, chatId, category, fact, importance = 1) {
-	await env.DB.prepare(
-		"INSERT INTO memories (chat_id, category, fact, importance_score) VALUES (?, ?, ?, ?)"
-	).bind(chatId, category.toLowerCase(), fact, importance).run();
+export async function saveMemory(env, chatId, category, fact, importance = 1, userId = null) {
+	const result = await env.DB.prepare(
+		"INSERT INTO memories (chat_id, category, fact, importance_score, user_id) VALUES (?, ?, ?, ?, ?)"
+	).bind(chatId, category.toLowerCase(), fact, importance, userId).run();
+	// Also index in Vectorize for semantic search (fire-and-forget)
+	const memoryId = result?.meta?.last_row_id || Date.now();
+	vectorStore.indexMemory(env, chatId, category.toLowerCase(), fact, memoryId)
+		.catch(e => console.error('Vectorize memory index error:', e.message));
 }
 
 export async function getMemories(env, chatId, limit = 30) {
@@ -46,13 +52,11 @@ export async function getFormattedContext(env, chatId) {
 
 	let ctx = "";
 
-	// Factual memories first
 	if (factual.length) {
 		ctx += "Facts:\n";
 		for (const m of factual) ctx += `- [${m.category}] ${m.fact}\n`;
 	}
 
-	// Therapeutic observations — surfaced separately so the AI can see patterns
 	if (therapeutic.length) {
 		ctx += "\nTherapeutic observations:\n";
 		for (const m of therapeutic) {
@@ -65,7 +69,7 @@ export async function getFormattedContext(env, chatId) {
 }
 
 function getRelativeAge(dateStr) {
-	const created = new Date(dateStr + "Z"); // D1 stores UTC without Z
+	const created = new Date(dateStr + "Z");
 	const now = new Date();
 	const days = Math.floor((now - created) / 86400000);
 	if (days === 0) return "today";

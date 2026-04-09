@@ -1,4 +1,8 @@
-import * as therapeuticStore from '../services/therapeuticStore';
+// Therapeutic tools now write to the unified `memories` table (Option A).
+// Categories: pattern, schema, avoidance, homework, session, trigger, growth
+// These map directly to the therapeutic categories in memoryStore.js.
+
+import * as memoryStore from '../services/memoryStore';
 
 export const saveTherapeuticNoteTool = {
 	definition: {
@@ -21,34 +25,34 @@ export const saveTherapeuticNoteTool = {
 				},
 				content: {
 					type: "STRING",
-					description: "The observation itself. Be specific and include context: what was said, what you noticed, what feeling was present."
+					description: "The observation itself. Be specific and include context."
 				},
-				tags: {
-					type: "ARRAY",
-					items: { type: "STRING" },
-					description: "Short tags for cross-referencing, e.g. ['jordan', 'work', 'self-worth', 'anger']"
+				importance: {
+					type: "INTEGER",
+					description: "1 = routine observation, 2 = notable pattern, 3 = significant breakthrough. Default 2."
 				}
 			},
 			required: ["note_type", "content"]
 		}
 	},
 	async execute(args, env, context) {
-		await therapeuticStore.saveNote(env, context.chatId, args.note_type, args.content, args.tags || []);
-		return { status: "success", saved: args.note_type };
+		const importance = args.importance || 2;
+		await memoryStore.saveMemory(env, context.chatId, args.note_type, args.content, importance);
+		return { status: "success", saved: args.note_type, importance };
 	}
 };
 
 export const getTherapeuticNotesTool = {
 	definition: {
 		name: "get_therapeutic_notes",
-		description: `Retrieve previous therapeutic observations and session notes. Use this at the start of conversations to refresh your understanding of ongoing patterns, active schemas, pending homework, and recent session themes. Also use mid-conversation when you sense a connection to a previously noted pattern.`,
+		description: `Retrieve previous therapeutic observations and session notes. Use at the start of conversations to refresh your understanding of ongoing patterns, active schemas, pending homework, and recent session themes. Also use mid-conversation when you sense a connection to a previously noted pattern.`,
 		parameters: {
 			type: "OBJECT",
 			properties: {
 				note_type: {
 					type: "STRING",
 					enum: ["pattern", "schema", "avoidance", "homework", "session", "trigger", "growth"],
-					description: "Filter by type. Omit to retrieve all types."
+					description: "Filter by type. Omit to retrieve all therapeutic types."
 				},
 				limit: {
 					type: "INTEGER",
@@ -59,7 +63,18 @@ export const getTherapeuticNotesTool = {
 		}
 	},
 	async execute(args, env, context) {
-		const notes = await therapeuticStore.getNotes(env, context.chatId, args.note_type || null, args.limit || 15);
+		const therapeuticCategories = ["pattern", "schema", "avoidance", "homework", "session", "trigger", "growth"];
+
+		if (args.note_type) {
+			// Fetch a specific therapeutic category
+			const notes = await memoryStore.getMemoriesByCategory(env, context.chatId, args.note_type, args.limit || 15);
+			if (!notes.length) return { status: "success", notes: [], message: `No ${args.note_type} notes found.` };
+			return { status: "success", notes };
+		}
+
+		// Fetch all memories and filter to therapeutic categories
+		const all = await memoryStore.getMemories(env, context.chatId, args.limit || 30);
+		const notes = all.filter(m => therapeuticCategories.includes(m.category));
 		if (!notes.length) return { status: "success", notes: [], message: "No therapeutic notes found." };
 		return { status: "success", notes };
 	}

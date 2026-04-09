@@ -1,16 +1,121 @@
 import { handleMessage, handleCallback } from './bot/handlers';
+import { handleInlineQuery } from './bot/inlineHandler';
 import * as reminderStore from './services/reminderStore';
+import * as moodStore from './services/moodStore';
 import * as telegram from './lib/telegram';
 import { generateSpeech } from './lib/tts';
 import { storeDiscoveredEffect } from './tools/effect';
+import { personas } from './config/personas';
 
 const BIZ_CONN_TTL = 2592000; // 30 days
 
-function extractEffectEmoji(msg) {
+// Known effect IDs to emoji mapping (for discovery logging)
+const KNOWN_EFFECT_EMOJIS = {
+	"5159385139981059251": "❤️",
+	"5107584321108051014": "👍",
+	"5104858069142078462": "👎",
+	"5070445174516318631": "🔥",
+	"5066970843586925436": "🎉",
+	"5046589136895476101": "💩",
+	"5104841245755180586": "❤️",  // alternate hearts ID
+};
+
+function extractEffectEmoji(msg, effectId) {
+	// First check if we already know this effect ID
+	if (KNOWN_EFFECT_EMOJIS[effectId]) return KNOWN_EFFECT_EMOJIS[effectId];
+
+	// Try to extract from the message text
 	const text = (msg.text || "").trim();
+	if (!text) return null;
+
+	// If the message is just a single emoji (up to 4 bytes), use it
 	if (text.length <= 4) return text;
-	const emojiMatch = text.match(/^(\p{Emoji_Presentation}|\p{Emoji}\uFE0F)/u);
-	return emojiMatch ? emojiMatch[0] : null;
+
+	// Try to extract the first emoji from any message
+	const emojiMatch = text.match(/(\p{Emoji_Presentation}|\p{Emoji}\uFE0F)/u);
+	return emojiMatch ? emojiMatch[0] : `effect_${effectId.slice(-6)}`;
+}
+
+// ---- Health Check-in Scheduler ----
+// Runs inside the cron handler. Checks London time and sends check-ins as Nightfall.
+async function handleHealthCheckIns(env) {
+	const now = new Date();
+	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const hour = londonTime.getHours();
+	const minute = londonTime.getMinutes();
+	const chatId = Number(env.OWNER_ID);
+	const threadId = 'default';
+
+	// Only trigger at specific minutes to avoid duplicate sends (cron runs every minute)
+	// Use KV to track if we already sent this check-in today
+	const today = londonTime.toISOString().split('T')[0];
+
+	// Morning: 08:30
+	if (hour === 8 && minute === 30) {
+		const key = `health_checkin_morning_${today}`;
+		if (await env.CHAT_KV.get(key)) return;
+		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
+
+		// Set Nightfall as active persona for health check-in
+		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'morning', { expirationTtl: 3600 });
+
+		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'morning');
+		if (alreadyLogged) return;
+
+		await telegram.sendMessage(chatId, threadId,
+			`🌙 <b>Nightfall here.</b> Good morning.\n\nHow did you sleep? And have you taken your morning medication yet?`,
+			env, null, {
+				inline_keyboard: [[
+					{ text: '💊 Taken', callback_data: 'mood_med_yes_morning' },
+					{ text: '⏰ Not yet', callback_data: 'mood_med_no_morning' },
+				]]
+			});
+	}
+
+	// Midday: 13:00
+	else if (hour === 13 && minute === 0) {
+		const key = `health_checkin_midday_${today}`;
+		if (await env.CHAT_KV.get(key)) return;
+		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
+
+		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'midday', { expirationTtl: 3600 });
+
+		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'midday');
+		if (alreadyLogged) return;
+
+		await telegram.sendMessage(chatId, threadId,
+			`🌙 <b>Nightfall checking in.</b> Quick midday pulse.\n\nHave you taken your ADHD and anxiety medication?`,
+			env, null, {
+				inline_keyboard: [[
+					{ text: '✅ Both taken', callback_data: 'mood_med_yes_midday' },
+					{ text: '💊 ADHD only', callback_data: 'mood_med_partial_midday' },
+					{ text: '❌ Not yet', callback_data: 'mood_med_no_midday' },
+				]]
+			});
+	}
+
+	// Evening: 20:30
+	else if (hour === 20 && minute === 30) {
+		const key = `health_checkin_evening_${today}`;
+		if (await env.CHAT_KV.get(key)) return;
+		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
+
+		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 7200 });
+
+		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'evening');
+		if (alreadyLogged) return;
+
+		// Evening: send a poll for mood score
+		await telegram.sendMessage(chatId, threadId,
+			`🌙 <b>Nightfall here for your evening check-in.</b>\n\nTime to reflect on the day. Where are you on the mood scale right now?`,
+			env, null, {
+				inline_keyboard: [
+					[{ text: '🔴 0-1 Severe Depression', callback_data: 'mood_score_1' }, { text: '🟠 2-3 Mild/Moderate', callback_data: 'mood_score_3' }],
+					[{ text: '🟢 4-6 Balanced', callback_data: 'mood_score_5' }],
+					[{ text: '🟡 7-8 Hypomania', callback_data: 'mood_score_7' }, { text: '🔴 9-10 Mania', callback_data: 'mood_score_9' }]
+				]
+			});
+	}
 }
 
 export default {
@@ -22,6 +127,16 @@ export default {
 		if (request.method === "GET" && new URL(request.url).pathname === "/register-commands") {
 			const result = await telegram.registerCommands(env);
 			return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
+		}
+
+		if (request.method === "GET" && new URL(request.url).pathname === "/setup-webhook") {
+			const url = new URL(request.url);
+			const workerUrl = `${url.protocol}//${url.host}/`;
+			const params = new URLSearchParams({ url: workerUrl });
+			if (env.WEBHOOK_SECRET) params.set("secret_token", env.WEBHOOK_SECRET);
+			const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/setWebhook?${params}`);
+			const data = await res.json();
+			return new Response(JSON.stringify(data, null, 2), { headers: { "Content-Type": "application/json" } });
 		}
 
 		if (request.method !== "POST") return new Response("OK");
@@ -47,28 +162,35 @@ export default {
 				await env.CHAT_KV.put(`biz_conn_${bizMsg.from.id}`, bizMsg.business_connection_id, { expirationTtl: BIZ_CONN_TTL });
 			}
 			if (bizMsg.effect_id) {
-				const emoji = extractEffectEmoji(bizMsg);
+				const emoji = extractEffectEmoji(bizMsg, bizMsg.effect_id);
 				console.log(`✨ Effect discovered: ${bizMsg.effect_id} emoji: ${emoji}`);
 				await storeDiscoveredEffect(env, bizMsg.effect_id, emoji);
 			}
 			task = handleMessage(bizMsg, env);
 		}
+		else if (update.inline_query) task = handleInlineQuery(update.inline_query, env);
 		else if (update.callback_query) task = handleCallback(update.callback_query, env);
 		else if (update.message) {
 			if (update.message.effect_id) {
-				const emoji = extractEffectEmoji(update.message);
+				const emoji = extractEffectEmoji(update.message, update.message.effect_id);
 				console.log(`✨ Effect discovered: ${update.message.effect_id} emoji: ${emoji}`);
 				await storeDiscoveredEffect(env, update.message.effect_id, emoji);
 			}
 			task = handleMessage(update.message, env);
 		}
 
-		if (task) ctx.waitUntil(task);
+		if (task) await task;
 		return new Response("OK");
 	},
 
 	// eslint-disable-next-line no-unused-vars
 	async scheduled(_event, env, _ctx) {
+		// ---- Health check-ins (owner only, Nightfall persona) ----
+		if (env.OWNER_ID) {
+			await handleHealthCheckIns(env);
+		}
+
+		// ---- Reminders ----
 		const reminders = await reminderStore.getDueReminders(env);
 		if (!reminders.length) return;
 
@@ -85,7 +207,7 @@ export default {
 				reminderText = `⏰ <b>${firstName}</b>, reminder: ${r.text}\n\n<blockquote expandable>Context: ${reason}</blockquote>`;
 			}
 
-			const personaKey = meta.persona || await env.CHAT_KV.get(`persona_${r.creator_chat_id}`) || "gemini";
+			const personaKey = meta.persona || await env.CHAT_KV.get(`persona_${r.creator_chat_id}`) || "tenon";
 			await Promise.all([
 				telegram.sendMessage(r.recipient_chat_id, threadId, reminderText, env, r.original_message_id),
 				generateSpeech(r.text, personaKey, env)

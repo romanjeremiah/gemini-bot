@@ -1,10 +1,5 @@
 import * as telegram from '../lib/telegram';
 
-// Convert plain text to Unicode strikethrough (U+0336 combining long stroke overlay)
-function toStrikethrough(text) {
-	return text.split('').map(c => c + '\u0336').join('');
-}
-
 // Build the checklist message text with progress info
 function buildChecklistText(title, buttons) {
 	const total = buttons.length;
@@ -65,4 +60,4 @@ export const checklistTool = {
 	}
 };
 
-export { buildChecklistText, toStrikethrough };
+export { buildChecklistText };

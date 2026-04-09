@@ -1,185 +1,282 @@
-import { toolDefinitions } from '../../tools';
+import { GoogleGenAI } from '@google/genai';
+import { toolDefinitions } from '../../tools/index.js';
 
-const PRIMARY_TEXT_MODEL = "gemini-3.1-pro-preview";
-const FALLBACK_TEXT_MODEL = "gemini-3-flash-preview";
-const PRIMARY_IMAGE_MODEL = "gemini-3.1-flash-image-preview";
-const FALLBACK_IMAGE_MODEL = "gemini-2.5-flash-image";
+export const PRIMARY_TEXT_MODEL   = 'gemini-3.1-pro-preview';
+export const FALLBACK_TEXT_MODEL  = 'gemini-3-flash-preview';
+const PRIMARY_IMAGE_MODEL  = 'gemini-3-pro-image-preview';     // Nano Banana Pro — best quality gen + edit
+const FALLBACK_IMAGE_MODEL = 'gemini-3.1-flash-image-preview'; // Nano Banana 2 — fast fallback
 
-const API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+const CACHE_TTL = '3600s';
+const MIN_CACHE_TOKENS_GEMINI3 = 4096;
+const CHARS_PER_TOKEN = 4;
 
-async function fetchWithRetry(url, options, maxRetries = 3, fallbackUrl = null) {
-	let lastError;
-	for (let i = 0; i < maxRetries; i++) {
-		try {
-			const res = await fetch(url, options);
-			if (res.status === 503 || res.status === 429) {
-				console.log(`⏳ Gemini ${res.status}, retry ${i + 1}/${maxRetries} in ${Math.pow(2, i)}s`);
-				await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000));
-				continue;
-			}
-			return res;
-		} catch (err) { lastError = err; }
-	}
+let _ai = null;
+let _aiDirect = null; // Direct connection (no gateway) for image gen
 
-	if (fallbackUrl) {
-		console.log(`🔄 Primary model unavailable after ${maxRetries} retries, falling back to secondary model`);
-		try {
-			const res = await fetch(fallbackUrl, options);
-			if (res.ok || (res.status !== 503 && res.status !== 429)) return res;
-		} catch (err) { lastError = err; }
-	}
-
-	throw lastError || new Error("Max retries reached on both primary and fallback models");
+function getAI(env) {
+  if (!_ai) {
+    const opts = { apiKey: env.GEMINI_API_KEY };
+    // Proxy through Cloudflare AI Gateway if configured (caching, analytics, rate limiting)
+    if (env.AI_GATEWAY_ACCOUNT_ID && env.AI_GATEWAY_ID) {
+      opts.httpOptions = {
+        baseUrl: `https://gateway.ai.cloudflare.com/v1/${env.AI_GATEWAY_ACCOUNT_ID}/${env.AI_GATEWAY_ID}/google-ai-studio`,
+      };
+      console.log('🌐 AI Gateway enabled');
+    }
+    _ai = new GoogleGenAI(opts);
+  }
+  return _ai;
 }
 
-function buildTextBody(history, systemInstruction) {
-	return JSON.stringify({
-		systemInstruction: { parts: [{ text: systemInstruction }] },
-		contents: history,
-		tools: [
-			{ functionDeclarations: toolDefinitions },
-			{ googleSearch: {} }
-		],
-		toolConfig: { includeServerSideToolInvocations: true },
-		generationConfig: { temperature: 1.0, maxOutputTokens: 8192 }
-	});
+// Direct connection for image gen — bypasses gateway to avoid extra latency
+function getAIDirect(env) {
+  if (!_aiDirect) {
+    _aiDirect = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
+  }
+  return _aiDirect;
 }
 
-// ---- Standard Completion ----
-export async function getCompletion(history, systemInstruction, env) {
-	const primaryUrl = `${API_BASE}/${PRIMARY_TEXT_MODEL}:generateContent?key=${env.GEMINI_API_KEY}`;
-	const fallbackUrl = `${API_BASE}/${FALLBACK_TEXT_MODEL}:generateContent?key=${env.GEMINI_API_KEY}`;
-	const body = buildTextBody(history, systemInstruction);
-
-	const res = await fetchWithRetry(
-		primaryUrl,
-		{ method: "POST", headers: { "Content-Type": "application/json" }, body },
-		3,
-		fallbackUrl
-	);
-
-	if (!res.ok) throw new Error(`Gemini API ${res.status}: ${(await res.text()).slice(0, 200)}`);
-	const data = await res.json();
-	const candidate = data.candidates?.[0];
-	if (!candidate) {
-		const blockReason = data.promptFeedback?.blockReason;
-		throw new Error(blockReason ? `Blocked: ${blockReason}` : "Gemini returned no candidates");
-	}
-	if (candidate.finishReason === "SAFETY") throw new Error("Response blocked by safety filters");
-	if (candidate.content?.parts) {
-		candidate.content.parts = candidate.content.parts.filter(p => !(p.functionCall && p.functionCall.name === "googleSearch"));
-	}
-	return data;
+function normalizeSchema(obj) {
+  if (Array.isArray(obj)) return obj.map(normalizeSchema);
+  if (obj && typeof obj === 'object') {
+    const result = {};
+    for (const [key, value] of Object.entries(obj)) {
+      result[key] = key === 'type' && typeof value === 'string'
+        ? value.toLowerCase()
+        : normalizeSchema(value);
+    }
+    return result;
+  }
+  return obj;
 }
 
-// ---- Streaming Completion ----
-export async function* streamCompletion(history, systemInstruction, env) {
-	const primaryUrl = `${API_BASE}/${PRIMARY_TEXT_MODEL}:streamGenerateContent?alt=sse&key=${env.GEMINI_API_KEY}`;
-	const fallbackUrl = `${API_BASE}/${FALLBACK_TEXT_MODEL}:streamGenerateContent?alt=sse&key=${env.GEMINI_API_KEY}`;
-	const body = buildTextBody(history, systemInstruction);
+const normalizedTools = normalizeSchema(toolDefinitions);
 
-	const res = await fetchWithRetry(
-		primaryUrl,
-		{ method: "POST", headers: { "Content-Type": "application/json" }, body },
-		3,
-		fallbackUrl
-	);
-
-	if (!res.ok) throw new Error(`Gemini Stream API ${res.status}: ${(await res.text()).slice(0, 200)}`);
-
-	const reader = res.body.getReader();
-	const decoder = new TextDecoder("utf-8");
-	let buffer = "";
-
-	while (true) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		buffer += decoder.decode(value, { stream: true });
-		const events = buffer.split(/\r?\n\r?\n/);
-		buffer = events.pop() || "";
-
-		for (const event of events) {
-			const dataStr = event.trim().split(/\r?\n/).map(l => l.replace(/^data:\s*/, '')).join('').trim();
-			if (dataStr === '[DONE]') return;
-			try {
-				const candidate = JSON.parse(dataStr).candidates?.[0];
-				if (!candidate) continue;
-
-				const textPart = candidate.content?.parts?.find(p => p.text);
-				if (textPart?.text) yield { type: 'text', text: textPart.text };
-
-				const calls = candidate.content?.parts?.filter(p => p.functionCall && p.functionCall.name !== "googleSearch");
-				if (calls?.length) yield { type: 'functionCall', calls };
-
-				if (candidate.groundingMetadata) yield { type: 'groundingMetadata', metadata: candidate.groundingMetadata };
-			} catch (e) {}
-		}
-	}
-
-	if (buffer.trim() && buffer.trim() !== '[DONE]') {
-		try {
-			const dataStr = buffer.split(/\r?\n/).map(l => l.replace(/^data:\s*/, '')).join('').trim();
-			const candidate = JSON.parse(dataStr).candidates?.[0];
-			if (candidate) {
-				const textPart = candidate.content?.parts?.find(p => p.text);
-				if (textPart?.text) yield { type: 'text', text: textPart.text };
-			}
-		} catch (e) {}
-	}
+async function withRetry(fn, maxRetries = 3, fallbackFn = null) {
+  let lastError;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const msg = err?.message || '';
+      const isRetryable = msg.includes('503') || msg.includes('429')
+        || err?.status === 503 || err?.status === 429;
+      if (!isRetryable) throw err;
+      lastError = err;
+      const wait = Math.pow(2, i) * 1000;
+      console.log(`⏳ Gemini retry ${i + 1}/${maxRetries} in ${wait / 1000}s`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  if (fallbackFn) {
+    console.log(`🔄 Primary exhausted — switching to fallback model`);
+    return await fallbackFn();
+  }
+  throw lastError;
 }
 
-// ---- Image Generation / Editing ----
+// ---- Context Caching ----
+const _cacheNames = new Map();
+
+async function getOrCreateCache(personaInstruction, formattingRules, env, model = PRIMARY_TEXT_MODEL) {
+  const cacheKey = `gemini_cache_${model}_${hashStr(personaInstruction).slice(0, 16)}`;
+
+  if (_cacheNames.has(cacheKey)) return _cacheNames.get(cacheKey);
+
+  const kvCacheName = await env.CHAT_KV.get(cacheKey);
+  if (kvCacheName) {
+    try {
+      await getAI(env).caches.get({ name: kvCacheName });
+      _cacheNames.set(cacheKey, kvCacheName);
+      return kvCacheName;
+    } catch {
+      console.log('🗑️ Cached content expired on Google side, recreating...');
+    }
+  }
+
+  const staticContent = `${personaInstruction}\n${formattingRules}`;
+  const estimatedTokens = Math.ceil(staticContent.length / CHARS_PER_TOKEN);
+  const toolsJson = JSON.stringify(normalizedTools);
+  const estimatedToolTokens = Math.ceil(toolsJson.length / CHARS_PER_TOKEN);
+  const totalEstimatedTokens = estimatedTokens + estimatedToolTokens;
+
+  if (totalEstimatedTokens < MIN_CACHE_TOKENS_GEMINI3) {
+    console.log(`📦 Skipping cache: ~${totalEstimatedTokens} tokens < ${MIN_CACHE_TOKENS_GEMINI3} minimum for ${model}`);
+    return null;
+  }
+
+  try {
+    console.log(`🧊 Creating cache (~${totalEstimatedTokens} estimated tokens) for ${model}...`);
+    const cache = await getAI(env).caches.create({
+      model,
+      config: {
+        systemInstruction: staticContent,
+        tools: [{ functionDeclarations: normalizedTools }, { googleSearch: {} }, { codeExecution: {} }],
+        toolConfig: { includeServerSideToolInvocations: true },
+        ttl: CACHE_TTL,
+        displayName: cacheKey,
+      }
+    });
+    const cacheName = cache.name;
+    const actualTokens = cache.usageMetadata?.totalTokenCount || '?';
+    console.log(`🧊 Cache created: ${cacheName} (${actualTokens} tokens, TTL: ${CACHE_TTL})`);
+    await env.CHAT_KV.put(cacheKey, cacheName, { expirationTtl: 3000 });
+    _cacheNames.set(cacheKey, cacheName);
+    return cacheName;
+  } catch (err) {
+    console.error(`⚠️ Cache creation failed for ${PRIMARY_TEXT_MODEL}: ${err.message}`);
+    return null;
+  }
+}
+
+function hashStr(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+function buildConfig(systemInstruction, opts = {}) {
+  const tools = [{ functionDeclarations: normalizedTools }, { googleSearch: {} }];
+  // Code execution is incompatible with audio/video inline data
+  if (!opts.skipCodeExecution) tools.push({ codeExecution: {} });
+  return {
+    systemInstruction,
+    tools,
+    toolConfig: { includeServerSideToolInvocations: true },
+    temperature: 1.0,
+    maxOutputTokens: 8192,
+  };
+}
+
+function buildCachedConfig(cacheName) {
+  return {
+    cachedContent: cacheName,
+    temperature: 1.0,
+    maxOutputTokens: 8192,
+  };
+}
+
+export async function createChat(history, systemInstruction, env, cacheContext = null, model = null, opts = {}) {
+  const useModel = model || PRIMARY_TEXT_MODEL;
+  const config = cacheContext?.cacheName
+    ? buildCachedConfig(cacheContext.cacheName)
+    : buildConfig(systemInstruction, opts);
+
+  console.log(`🤖 Model: ${useModel}`);
+  return getAI(env).chats.create({
+    model: useModel,
+    config,
+    history: history || [],
+  });
+}
+
+export async function setupCache(personaInstruction, formattingRules, dynamicContext, env, model = PRIMARY_TEXT_MODEL) {
+  const cacheName = await getOrCreateCache(personaInstruction, formattingRules, env, model);
+  if (!cacheName) return null;
+  return { cacheName, dynamicPrefix: dynamicContext };
+}
+
+// ---- Non-streaming: waits for full response (needed for function calling) ----
+export async function* sendChatMessage(chat, message) {
+  const response = await withRetry(
+    () => chat.sendMessage({ message }),
+    3, null
+  );
+  const parts = response.candidates?.[0]?.content?.parts || [];
+  for (const part of parts) {
+    if (part.text && !part.thought) yield { type: 'text', text: part.text };
+    if (part.executableCode) yield { type: 'text', text: `\n<i>⚙️ Computing...</i>\n` };
+    if (part.codeExecutionResult) yield { type: 'text', text: `\n<b>Result:</b> <code>${part.codeExecutionResult.output.trim()}</code>\n` };
+  }
+  const calls = parts.filter(p => p.functionCall && p.functionCall.name !== 'googleSearch');
+  if (calls.length) yield { type: 'functionCall', calls };
+  const gm = response.candidates?.[0]?.groundingMetadata;
+  if (gm) yield { type: 'groundingMetadata', metadata: gm };
+}
+
+// ---- True streaming: yields text chunks as Gemini generates them ----
+// Used for the animated text appearing effect via Telegram's sendMessageDraft.
+// Falls back to non-streaming if sendMessageStream is unavailable.
+export async function* sendChatMessageStream(chat, message) {
+  try {
+    const stream = await chat.sendMessageStream({ message });
+    for await (const chunk of stream) {
+      const parts = chunk.candidates?.[0]?.content?.parts || [];
+      for (const part of parts) {
+        if (part.text && !part.thought) {
+          yield { type: 'text', text: part.text };
+        }
+        if (part.executableCode) {
+          yield { type: 'text', text: `\n<i>⚙️ Computing...</i>\n` };
+        }
+        if (part.codeExecutionResult) {
+          yield { type: 'text', text: `\n<b>Result:</b> <code>${part.codeExecutionResult.output.trim()}</code>\n` };
+        }
+      }
+      // Function calls in streaming come in the final chunk
+      const calls = parts.filter(p => p.functionCall && p.functionCall.name !== 'googleSearch');
+      if (calls.length) yield { type: 'functionCall', calls };
+
+      const gm = chunk.candidates?.[0]?.groundingMetadata;
+      if (gm) yield { type: 'groundingMetadata', metadata: gm };
+    }
+  } catch (err) {
+    // If streaming fails, fall back to non-streaming
+    console.warn('⚠️ Stream fallback to non-streaming:', err.message);
+    yield* sendChatMessage(chat, message);
+  }
+}
+
 export async function generateImage(prompt, env, inputImageBase64 = null, inputMimeType = null, useFallback = false) {
-	const model = useFallback ? FALLBACK_IMAGE_MODEL : PRIMARY_IMAGE_MODEL;
-	const url = `${API_BASE}/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
+  const isEditing = !!(inputImageBase64 && inputMimeType);
+  const model = useFallback ? FALLBACK_IMAGE_MODEL : PRIMARY_IMAGE_MODEL;
+  const parts = [];
+  if (isEditing) {
+    parts.push({ inlineData: { mimeType: inputMimeType, data: inputImageBase64 } });
+  }
+  parts.push({ text: prompt });
+  console.log(`🎨 Image ${isEditing ? 'edit' : 'gen'} → ${model}`);
+  const doGenerate = (m) => getAIDirect(env).models.generateContent({
+    model: m, contents: [{ role: 'user', parts }],
+    config: { responseModalities: ['TEXT', 'IMAGE'] },
+  });
+  const response = await withRetry(
+    () => doGenerate(model), 3,
+    !useFallback ? () => doGenerate(FALLBACK_IMAGE_MODEL) : null
+  );
+  const candidate = response.candidates?.[0];
+  if (!candidate) {
+    const blockReason = response.promptFeedback?.blockReason;
+    throw new Error(blockReason ? `Blocked: ${blockReason}` : 'Image generation returned no result');
+  }
+  if (candidate.finishReason === 'SAFETY') throw new Error('Image blocked by safety filters');
+  let imageBase64 = null, mimeType = null, caption = '';
+  for (const part of candidate.content?.parts || []) {
+    if (part.inlineData) { imageBase64 = part.inlineData.data; mimeType = part.inlineData.mimeType || 'image/png'; }
+    else if (part.text) caption += part.text;
+  }
+  if (!imageBase64) throw new Error('No image was generated. Try a different prompt.');
+  console.log(`🎨 Image ready — mime: ${mimeType}, size: ${imageBase64.length}`);
+  return { imageBase64, mimeType, caption };
+}
 
-	const parts = [];
-	if (inputImageBase64 && inputMimeType) {
-		parts.push({ inlineData: { mimeType: inputMimeType, data: inputImageBase64 } });
-	}
-	parts.push({ text: prompt });
 
-	console.log(`🎨 Image gen request to ${model}`);
-
-	const fallbackUrl = !useFallback ? `${API_BASE}/${FALLBACK_IMAGE_MODEL}:generateContent?key=${env.GEMINI_API_KEY}` : null;
-
-	const res = await fetchWithRetry(url, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			contents: [{ parts }],
-			generationConfig: { responseModalities: ["TEXT", "IMAGE"] }
-		})
-	}, 3, fallbackUrl);
-
-	if (!res.ok) {
-		const errText = (await res.text()).slice(0, 300);
-		console.error("🎨 Image API error:", errText);
-		throw new Error(`Image API ${res.status}: ${errText.slice(0, 200)}`);
-	}
-
-	const data = await res.json();
-	const candidate = data.candidates?.[0];
-
-	if (!candidate) {
-		const blockReason = data.promptFeedback?.blockReason;
-		console.error("🎨 No candidate. Feedback:", JSON.stringify(data.promptFeedback));
-		throw new Error(blockReason ? `Blocked: ${blockReason}` : "Image generation returned no result");
-	}
-
-	if (candidate.finishReason === "SAFETY") throw new Error("Image blocked by safety filters");
-
-	let imageBase64 = null, mimeType = null, caption = "";
-	for (const part of candidate.content?.parts || []) {
-		if (part.inlineData) { imageBase64 = part.inlineData.data; mimeType = part.inlineData.mimeType || "image/png"; }
-		else if (part.text) caption += part.text;
-	}
-
-	if (!imageBase64) {
-		console.error("🎨 No image in parts:", JSON.stringify(candidate.content?.parts?.map(p => Object.keys(p))));
-		throw new Error("No image was generated. Try a different prompt.");
-	}
-
-	console.log("🎨 Image generated, mime:", mimeType, "size:", imageBase64.length);
-	return { imageBase64, mimeType, caption };
+// ---- UI Text Generation (Fast & Contextual) ----
+// Uses Flash model for speed. No tools, no history. Just a quick in-character response.
+export async function generateShortResponse(prompt, systemInstruction, env) {
+  const response = await withRetry(
+    () => getAIDirect(env).models.generateContent({
+      model: FALLBACK_TEXT_MODEL,
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config: {
+        systemInstruction: `${systemInstruction}\n\nYou are generating a brief UI message for a Telegram bot. Keep it to 1-2 sentences. Be fully in character. No asterisks, no HTML tags, no markdown.`,
+        temperature: 1.0,
+        maxOutputTokens: 150,
+      }
+    }),
+    2, null
+  );
+  return response.candidates?.[0]?.content?.parts?.filter(p => p.text && !p.thought)?.map(p => p.text)?.join('') || '';
 }

@@ -271,12 +271,18 @@ export async function generateShortResponse(prompt, systemInstruction, env) {
       model: FALLBACK_TEXT_MODEL,
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       config: {
-        systemInstruction: `${systemInstruction}\n\nYou are generating a brief UI message for a Telegram bot. Keep it to 1-2 sentences. Be fully in character. No asterisks, no HTML tags, no markdown.`,
+        systemInstruction: `${systemInstruction}\n\nYou are generating a brief message for a Telegram bot. Keep it to 1-3 complete sentences. Be fully in character. No asterisks, no markdown. You MUST finish every sentence completely. Never stop mid-sentence.`,
         temperature: 1.0,
-        maxOutputTokens: 150,
+        maxOutputTokens: 300,
       }
     }),
     2, null
   );
-  return response.candidates?.[0]?.content?.parts?.filter(p => p.text && !p.thought)?.map(p => p.text)?.join('') || '';
+  const text = response.candidates?.[0]?.content?.parts?.filter(p => p.text && !p.thought)?.map(p => p.text)?.join('') || '';
+  // Safety: if text was truncated mid-sentence, trim to last complete sentence
+  if (text && !text.match(/[.!?…"']$/)) {
+    const lastSentence = text.match(/.*[.!?…"']/s);
+    if (lastSentence) return lastSentence[0].trim();
+  }
+  return text.trim();
 }

@@ -50,8 +50,8 @@ async function handleHealthCheckIns(env) {
 	// Use KV to track if we already sent this check-in today
 	const today = londonTime.toISOString().split('T')[0];
 
-	// Morning: 08:30
-	if (hour === 8 && minute === 30) {
+	// Morning: 08:30+
+	if (hour === 8 && minute >= 30) {
 		const key = `health_checkin_morning_${today}`;
 		if (await env.CHAT_KV.get(key)) return;
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
@@ -72,8 +72,8 @@ async function handleHealthCheckIns(env) {
 			});
 	}
 
-	// Midday: 13:00
-	else if (hour === 13 && minute === 0) {
+	// Midday: 13:00+
+	else if (hour === 13 && minute >= 0) {
 		const key = `health_checkin_midday_${today}`;
 		if (await env.CHAT_KV.get(key)) return;
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
@@ -94,8 +94,8 @@ async function handleHealthCheckIns(env) {
 			});
 	}
 
-	// Evening: 20:30
-	else if (hour === 20 && minute === 30) {
+	// Evening: 20:30+
+	else if (hour === 20 && minute >= 30) {
 		const key = `health_checkin_evening_${today}`;
 		if (await env.CHAT_KV.get(key)) return;
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
@@ -106,13 +106,14 @@ async function handleHealthCheckIns(env) {
 		if (alreadyLogged) return;
 
 		// Evening: send a poll for mood score
+		// Evening: send formatted message with mood scale descriptions + clean buttons
 		await telegram.sendMessage(chatId, threadId,
-			`🌙 <b>Nightfall here for your evening check-in.</b>\n\nTime to reflect on the day. Where are you on the mood scale right now?`,
+			`🌙 <b>Nightfall here for your evening check-in.</b>\n\nLet's take a moment to reflect on your day. Where would you place yourself on the mood scale right now?\n\n🔴 <b>0-1: Severe Depression</b>\n<i>(Bleak, no movement, hopeless)</i>\n\n🟠 <b>2-3: Mild/Moderate</b>\n<i>(Struggle, slow thinking, anxious)</i>\n\n🟢 <b>4-6: Balanced</b>\n<i>(Good decisions, sociable, optimistic)</i>\n\n🟡 <b>7-8: Hypomania</b>\n<i>(Very productive, racing thoughts)</i>\n\n🔴 <b>9-10: Mania</b>\n<i>(Reckless, lost touch with reality)</i>`,
 			env, null, {
 				inline_keyboard: [
-					[{ text: '🔴 0-1 Severe Depression', callback_data: 'mood_score_1' }, { text: '🟠 2-3 Mild/Moderate', callback_data: 'mood_score_3' }],
-					[{ text: '🟢 4-6 Balanced', callback_data: 'mood_score_5' }],
-					[{ text: '🟡 7-8 Hypomania', callback_data: 'mood_score_7' }, { text: '🔴 9-10 Mania', callback_data: 'mood_score_9' }]
+					[{ text: '🔴 0-1', callback_data: 'mood_score_1' }, { text: '🟠 2-3', callback_data: 'mood_score_3' }],
+					[{ text: '🟢 4-6', callback_data: 'mood_score_5' }],
+					[{ text: '🟡 7-8', callback_data: 'mood_score_7' }, { text: '🔴 9-10', callback_data: 'mood_score_9' }]
 				]
 			});
 	}

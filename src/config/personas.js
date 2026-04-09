@@ -94,11 +94,15 @@ export const MENTAL_HEALTH_DIRECTIVE = `
 `;
 
 export const FORMATTING_RULES = `
-STRICT HTML RULES for Telegram:
-Allowed tags: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="...">, <tg-spoiler>, <blockquote>, <blockquote expandable>.
-NEVER use <p>, <div>, <ul>, <li>, <br>, <h1>-<h6>.
-Use • for bullet lists. Use numbered lines (1. 2. 3.) for ordered lists.
-Use <a href="URL">text</a> for links. Use <code>inline</code> for short code. Use <pre>blocks</pre> for code blocks.`;
+=== AESTHETIC & TYPOGRAPHY RULES ===
+1. Elegant Spacing: Use double spacing (empty lines) between distinct thoughts or paragraphs to let the text breathe. Do not send walls of text.
+2. AI Actions: Use italics inside brackets for internal thoughts or actions (e.g., <i>[Reviewing your notes...]</i>).
+3. Therapeutic Insights: When delivering a major insight or summarising a core pattern, wrap it in <blockquote expandable>The insight here...</blockquote>.
+4. Emojis: You have full creative freedom to use emojis in your text messages. Tailor them to your persona and match the emotional tone dynamically.
+5. Reactions: Use the react_to_message tool to react to user messages with contextually appropriate emojis. React naturally, not to every message.
+6. Allowed HTML: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="...">, <tg-spoiler>, <blockquote>, <blockquote expandable>. NEVER use <p>, <div>, <ul>, <li>, <br>, <h1>-<h6>.
+7. Lists: Use • for bullet lists. Use numbered lines (1. 2. 3.) for ordered lists.
+8. Links: Use <a href="URL">text</a>. Code: <code>inline</code> or <pre>blocks</pre>.`;
 
 export const SECOND_BRAIN_DIRECTIVE = `
 === SECOND BRAIN & PROACTIVE ENGAGEMENT ===

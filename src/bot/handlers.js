@@ -44,16 +44,25 @@ function sanitizeHistory(hist) {
 }
 
 function getMediaFromMessage(msg) {
-	if (msg.photo) return { fileId: msg.photo[msg.photo.length - 1].file_id, mimeHint: "image/jpeg" };
-	if (msg.voice) return { fileId: msg.voice.file_id, mimeHint: msg.voice.mime_type || "audio/ogg" };
-	if (msg.audio) return { fileId: msg.audio.file_id, mimeHint: msg.audio.mime_type || "audio/mpeg" };
-	if (msg.video) return { fileId: msg.video.file_id, mimeHint: msg.video.mime_type || "video/mp4" };
-	if (msg.video_note) return { fileId: msg.video_note.file_id, mimeHint: "video/mp4" };
-	if (msg.document && ["image/", "audio/", "video/", "application/pdf", "text/"].some(s => (msg.document.mime_type || "").startsWith(s))) {
-		return { fileId: msg.document.file_id, mimeHint: msg.document.mime_type };
+	let fileId = null, mimeHint = null;
+
+	if (msg.photo) { fileId = msg.photo[msg.photo.length - 1].file_id; mimeHint = "image/jpeg"; }
+	else if (msg.voice) { fileId = msg.voice.file_id; mimeHint = "audio/ogg"; }
+	else if (msg.audio) { fileId = msg.audio.file_id; mimeHint = msg.audio.mime_type || "audio/mpeg"; }
+	else if (msg.video) { fileId = msg.video.file_id; mimeHint = msg.video.mime_type || "video/mp4"; }
+	else if (msg.video_note) { fileId = msg.video_note.file_id; mimeHint = "video/mp4"; }
+	else if (msg.document && ["image/", "audio/", "video/", "application/pdf", "text/"].some(s => (msg.document.mime_type || "").startsWith(s))) {
+		fileId = msg.document.file_id; mimeHint = msg.document.mime_type;
 	}
-	if (msg.sticker && !msg.sticker.is_animated && !msg.sticker.is_video) return { fileId: msg.sticker.file_id, mimeHint: "image/webp" };
-	return null;
+	else if (msg.sticker && !msg.sticker.is_animated && !msg.sticker.is_video) { fileId = msg.sticker.file_id; mimeHint = "image/webp"; }
+
+	if (!fileId) return null;
+
+	// Remap unsupported raw audio formats from Telegram clients
+	if (mimeHint === "audio/s16le" || mimeHint === "audio/x-wav") mimeHint = "audio/wav";
+	if (mimeHint === "audio/m4a") mimeHint = "audio/mp4";
+
+	return { fileId, mimeHint };
 }
 
 async function handleCommand(command, msg, env) {
@@ -101,15 +110,14 @@ async function handleCommand(command, msg, env) {
 			await telegram.sendMessage(chatId, threadId, "⚠️ Delete all saved memories?", env, null, { inline_keyboard: [[{ text: "✅ Yes, delete all", callback_data: "confirm_forget" }, { text: "❌ Cancel", callback_data: "cancel_forget" }]] });
 			return true;
 		case "/mood": {
-			// Set Nightfall as active persona for the check-in
 			await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 7200 });
 			await telegram.sendMessage(chatId, threadId,
-				`🌙 <b>Nightfall here.</b> Let's do a mood check.\n\nWhere are you on the mood scale right now?`,
+				`🌙 <b>Nightfall here.</b> Let's do a mood check.\n\nWhere would you place yourself on the scale right now?\n\n🔴 <b>0-1: Severe Depression</b>\n<i>(Bleak, no movement, hopeless)</i>\n\n🟠 <b>2-3: Mild/Moderate</b>\n<i>(Struggle, slow thinking, anxious)</i>\n\n🟢 <b>4-6: Balanced</b>\n<i>(Good decisions, sociable, optimistic)</i>\n\n🟡 <b>7-8: Hypomania</b>\n<i>(Very productive, racing thoughts)</i>\n\n🔴 <b>9-10: Mania</b>\n<i>(Reckless, lost touch with reality)</i>`,
 				env, null, {
 					inline_keyboard: [
-						[{ text: '🔴 0-1 Severe Depression', callback_data: 'mood_score_1' }, { text: '🟠 2-3 Mild/Moderate', callback_data: 'mood_score_3' }],
-						[{ text: '🟢 4-6 Balanced', callback_data: 'mood_score_5' }],
-						[{ text: '🟡 7-8 Hypomania', callback_data: 'mood_score_7' }, { text: '🔴 9-10 Mania', callback_data: 'mood_score_9' }]
+						[{ text: '🔴 0-1', callback_data: 'mood_score_1' }, { text: '🟠 2-3', callback_data: 'mood_score_3' }],
+						[{ text: '🟢 4-6', callback_data: 'mood_score_5' }],
+						[{ text: '🟡 7-8', callback_data: 'mood_score_7' }, { text: '🔴 9-10', callback_data: 'mood_score_9' }]
 					]
 				});
 			return true;
@@ -155,10 +163,11 @@ export async function handleMessage(msg, env) {
 		const personaInstruction = personas[effectivePersona].instruction;
 		const dynamicContext = `[Context] Current speaker: ${userIdentity} | London Time: ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London" })} | Unix: ${Math.floor(Date.now() / 1000)}${healthCheckin ? ` | HEALTH CHECK-IN MODE (${healthCheckin}): You are Nightfall conducting a ${healthCheckin} health check-in. Ask about mood, sleep, medication as appropriate for this time of day. Use the log_mood_entry tool to record data. Be warm but structured.` : ''}\n\nMEMORY:\n${memCtx}${semanticCtx}`;
 
-		const cacheContext = await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, textModel);
-		const fullSysPrompt = `${personaInstruction}\n\n${MENTAL_HEALTH_DIRECTIVE}\n\n${SECOND_BRAIN_DIRECTIVE}\n\n${FORMATTING_RULES}\n${dynamicContext}`;
 		// Skip code execution when media is present (incompatible with audio/video inline data)
+		// Also skip cache when media is present, because the cache has codeExecution baked in
 		const hasMedia = !!getMediaFromMessage(msg);
+		const cacheContext = hasMedia ? null : await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, textModel);
+		const fullSysPrompt = `${personaInstruction}\n\n${MENTAL_HEALTH_DIRECTIVE}\n\n${SECOND_BRAIN_DIRECTIVE}\n\n${FORMATTING_RULES}\n${dynamicContext}`;
 		const chat = await createChat(hist, fullSysPrompt, env, cacheContext, textModel, { skipCodeExecution: hasMedia });
 
 		let userParts = [];
@@ -266,7 +275,8 @@ export async function handleMessage(msg, env) {
 							console.log("🎨 Image gen started:", args.prompt?.slice(0, 80));
 							const isEdit = args.edit_mode && uploadedImageBase64;
 							const { imageBase64, mimeType, caption } = await generateImage(args.prompt, env, isEdit ? uploadedImageBase64 : null, isEdit ? uploadedImageMime : null);
-							const bstr = atob(imageBase64); const bytes = new Uint8Array(bstr.length); for (let i = 0; i < bstr.length; i++) bytes[i] = bstr.charCodeAt(i);
+							const { Buffer } = await import('node:buffer');
+							const bytes = Buffer.from(imageBase64, 'base64');
 							await env.CHAT_KV.put(`last_img_${chatId}_${threadId}`, JSON.stringify({ prompt: args.prompt }), { expirationTtl: 86400 });
 							// Store generated image in R2
 							if (env.MEDIA_BUCKET) {
@@ -332,17 +342,16 @@ export async function handleCallback(callbackQuery, env) {
 		if (personas[key]) {
 			await env.CHAT_KV.put(`persona_${chatId}_${threadId}`, key);
 			await telegram.editMessageReplyMarkup(chatId, msgId, null, env);
-			// Generate an in-character greeting from the new persona
 			await telegram.sendChatAction(chatId, threadId, "typing", env);
 			try {
 				const greeting = await generateShortResponse(
-					"The user just switched to talking to you. Give a very brief 1-2 sentence greeting in your distinct voice to let them know you are here and listening.",
+					"The user just chose to talk to you. Greet them in 1-2 complete sentences in your distinct voice. Let them know you are here and ready.",
 					personas[key].instruction,
 					env
 				);
-				await telegram.sendMessage(chatId, threadId, `<i>[You are now talking to <b>${personas[key].name}</b>]</i>\n\n${greeting}`, env);
+				await telegram.sendMessage(chatId, threadId, greeting, env, null, null, "5159385139981059251");
 			} catch (e) {
-				await telegram.sendMessage(chatId, threadId, `<i>[You are now talking to <b>${personas[key].name}</b>]</i>`, env);
+				await telegram.sendMessage(chatId, threadId, `You are now talking to <b>${personas[key].name}</b>.`, env);
 			}
 		}
 	} else if (data === "confirm_forget") {
@@ -386,7 +395,8 @@ export async function handleCallback(callbackQuery, env) {
 			const kvData = await env.CHAT_KV.get(`last_img_${chatId}_${threadId}`, { type: "json" });
 			if (!kvData?.prompt) { await telegram.sendMessage(chatId, threadId, "⚠️ No previous prompt found.", env); return; }
 			const { imageBase64, mimeType, caption } = await generateImage(kvData.prompt, env);
-			const bstr = atob(imageBase64); const bytes = new Uint8Array(bstr.length); for (let i = 0; i < bstr.length; i++) bytes[i] = bstr.charCodeAt(i);
+			const { Buffer } = await import('node:buffer');
+			const bytes = Buffer.from(imageBase64, 'base64');
 			await telegram.sendPhoto(chatId, threadId, bytes, mimeType, env, null, caption?.slice(0, 1024), { inline_keyboard: [[{ text: "🔄 Regenerate", callback_data: "img_regen" }, { text: "🗑️ Delete", callback_data: "action_delete_msg" }]] });
 		} catch (e) {
 			console.error("Image regen error:", e.message);
@@ -394,41 +404,81 @@ export async function handleCallback(callbackQuery, env) {
 		}
 	}
 	// ---- Mood/Medication callbacks from health check-ins ----
-	else if (data.startsWith('mood_med_')) {
+	else if (data.startsWith('mood_med_') || data.startsWith('mood_score_')) {
 		const today = moodStore.todayLondon();
 		await telegram.editMessageReplyMarkup(chatId, msgId, null, env);
+		await telegram.sendChatAction(chatId, threadId, "typing", env);
 
+		let contextPrompt = "";
+
+		// Handle Medication Callbacks
 		if (data === 'mood_med_yes_morning') {
 			await moodStore.upsertEntry(env, chatId, today, 'morning', { medication_taken: 1, medication_notes: 'Morning meds taken on time' });
-			await telegram.sendMessage(chatId, threadId, '🌙 Good. Morning medication logged. How did you sleep? Give me a number of hours and how it felt.', env);
+			contextPrompt = "The user just confirmed they took their morning medication on time. Acknowledge this positively in one short sentence, then ask ONE natural follow-up question about how they slept last night. Do not ask anything else.";
 		} else if (data === 'mood_med_no_morning') {
 			await moodStore.upsertEntry(env, chatId, today, 'morning', { medication_taken: 0, medication_notes: 'Morning meds not taken at check-in' });
-			await telegram.sendMessage(chatId, threadId, '🌙 Noted. Please take your medication when you can. Do not skip it.\n\nHow did you sleep?', env);
+			contextPrompt = "The user just said they haven't taken their morning medication yet. Gently remind them not to skip it, then ask ONE natural follow-up question about how they slept last night.";
 		} else if (data === 'mood_med_yes_midday') {
 			await moodStore.upsertEntry(env, chatId, today, 'midday', { medication_taken: 1, medication_notes: 'ADHD + anxiety meds taken' });
-			await telegram.sendMessage(chatId, threadId, '🌙 Both logged. How is the day going so far?', env);
+			contextPrompt = "The user just confirmed they took their midday ADHD and anxiety medications. Acknowledge this, then ask ONE natural conversational question about how their day is going so far.";
 		} else if (data === 'mood_med_partial_midday') {
 			await moodStore.upsertEntry(env, chatId, today, 'midday', { medication_taken: 1, medication_notes: 'ADHD only, anxiety not taken' });
-			await telegram.sendMessage(chatId, threadId, '🌙 ADHD medication logged. Remember your anxiety medication too if needed. How are you feeling?', env);
+			contextPrompt = "The user just confirmed they took their ADHD medication, but not their anxiety medication. Acknowledge this, remind them anxiety meds are there if they need them, and ask ONE conversational question about how their day is going.";
 		} else if (data === 'mood_med_no_midday') {
 			await moodStore.upsertEntry(env, chatId, today, 'midday', { medication_taken: 0, medication_notes: 'Midday meds not taken' });
-			await telegram.sendMessage(chatId, threadId, '🌙 Take your ADHD medication soon. It should not be taken too late or it will affect sleep (per NICE NG87). How is your day?', env);
+			contextPrompt = "The user hasn't taken their midday ADHD medication. Remind them gently that per NICE NG87 guidelines, taking it too late affects sleep, so they should take it soon. Then ask ONE conversational question about their day.";
 		}
-		// Evening mood score callbacks
+		// Handle Evening Mood Score Callbacks
 		else if (data.startsWith('mood_score_')) {
 			const score = parseInt(data.split('_')[2]);
-			const today = moodStore.todayLondon();
-			await telegram.editMessageReplyMarkup(chatId, msgId, null, env);
-			await moodStore.upsertEntry(env, chatId, today, 'evening', { mood_score: score });
+			const entry = await moodStore.upsertEntry(env, chatId, today, 'evening', { mood_score: score });
 			console.log(`📊 Evening mood logged: ${score}`);
 
 			if (score <= 1) {
-				await telegram.sendMessage(chatId, threadId, '🌙 I hear you. That is a really difficult place to be. You are not alone in this.\n\nIf you are in crisis, please reach out to Samaritans (116 123) or text SHOUT to 85258.\n\nCan you tell me what has been weighing on you today?', env);
+				contextPrompt = `The user just logged their mood as ${score}/10 — severe depression. This is a crisis-level score. Respond with genuine warmth and compassion. Mention that Samaritans (116 123) and SHOUT (text 85258) are available. Then ask ONE gentle question about what has been weighing on them. Do not overwhelm them.`;
 			} else if (score >= 9) {
-				await telegram.sendMessage(chatId, threadId, '🌙 That is a very elevated state. I want to check in carefully.\n\nHave you slept? Are you making any big decisions right now? Please consider reaching out to your care team.\n\nTell me about your day.', env);
+				contextPrompt = `The user just logged their mood as ${score}/10 — mania. This is clinically significant. Ask calmly whether they have slept, and whether they are making any big decisions right now. Gently suggest contacting their care team. Keep it to 2 sentences.`;
 			} else {
-				await telegram.sendMessage(chatId, threadId, '🌙 Mood logged. Tell me about your day. What activities did you do, and how are you feeling emotionally?', env);
+				contextPrompt = `The user just logged their mood score as ${score}/10 (${entry.mood_label || 'unknown'}) on the Bipolar scale. Acknowledge this naturally and compassionately in 1-2 sentences. Then ask ONE natural follow-up question to continue the daily journal (e.g., ask about sleep, or what main activity they did today). Do NOT ask multiple questions at once.`;
 			}
+		}
+
+		// Generate dynamic Nightfall response (+ mood art for evening scores)
+		try {
+			const sysPrompt = personas.nightfall.instruction + '\n\n' + MENTAL_HEALTH_DIRECTIVE;
+			const response = await generateShortResponse(contextPrompt, sysPrompt, env);
+			const aiMsg = `🌙 ${response}`;
+
+			// For evening mood scores, generate abstract mood art as journal cover
+			if (data.startsWith('mood_score_')) {
+				await telegram.sendChatAction(chatId, threadId, 'upload_photo', env);
+				const score = parseInt(data.split('_')[2]);
+				const moodLabel = (moodStore.getMoodLabel(score) || 'balanced').replace(/_/g, ' ');
+				const artPrompt = `An elegant, abstract minimalist digital art piece representing a human mood of "${moodLabel}". Atmospheric, evocative, beautiful colour palette matching the emotion. No text, no words, no letters.`;
+
+				try {
+					const { imageBase64, mimeType } = await generateImage(artPrompt, env);
+					const { Buffer } = await import('node:buffer');
+					const bytes = Buffer.from(imageBase64, 'base64');
+					// Send art with Nightfall's response as caption
+					await telegram.sendPhoto(chatId, threadId, bytes, mimeType, env, null, aiMsg);
+				} catch (artErr) {
+					console.error('Mood art failed:', artErr.message);
+					await telegram.sendMessage(chatId, threadId, aiMsg, env);
+				}
+			} else {
+				await telegram.sendMessage(chatId, threadId, aiMsg, env);
+			}
+
+			// Save to chat history so Nightfall remembers asking the question
+			const histKey = `chat_${chatId}_${threadId}`;
+			let hist = await env.CHAT_KV.get(histKey, { type: 'json' }) || [];
+			hist.push({ role: 'model', parts: [{ text: aiMsg }] });
+			if (hist.length > 24) hist = hist.slice(-24);
+			await env.CHAT_KV.put(histKey, JSON.stringify(hist), { expirationTtl: 604800 });
+		} catch (e) {
+			console.error('Health callback AI error:', e.message);
+			await telegram.sendMessage(chatId, threadId, '🌙 Noted. How are you feeling right now?', env);
 		}
 	}
 }

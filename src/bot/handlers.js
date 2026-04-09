@@ -12,7 +12,7 @@ const HISTORY_TTL = 604800;
 const THERAPEUTIC_CATEGORIES = ['pattern', 'trigger', 'avoidance', 'schema', 'growth', 'coping', 'insight'];
 
 function getPersona(key) {
-	return personas[key] ? key : "gemini";
+	return personas[key] ? key : "tenon";
 }
 
 function getMediaFromMessage(msg) {
@@ -39,9 +39,11 @@ async function handleCommand(command, msg, env) {
 		case "/persona":
 			await telegram.sendMessage(chatId, threadId, "Select your active AI protocol:", env, null, {
 				inline_keyboard: [
-					[{ text: "✨ Gemini", callback_data: "set_persona_gemini" }, { text: "🧠 Thinking Partner", callback_data: "set_persona_thinking_partner" }],
-					[{ text: "🟢 Mooncake", callback_data: "set_persona_mooncake" }, { text: "🚀 HUE", callback_data: "set_persona_hue" }],
-					[{ text: "💛 Tribore", callback_data: "set_persona_tribore" }]
+					[
+						{ text: "🎯 Tenon", callback_data: "set_persona_tenon" },
+						{ text: "🌙 Nightfall", callback_data: "set_persona_nightfall" },
+						{ text: "✨ Tribore", callback_data: "set_persona_tribore" }
+					]
 				]
 			});
 			return true;

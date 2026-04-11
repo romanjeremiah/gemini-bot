@@ -117,8 +117,7 @@ export async function consolidateMemories(env, chatId) {
 	const allMemories = await getMemories(env, chatId, 200);
 	if (allMemories.length < 15) return; // Not enough to need consolidation
 
-	const { GoogleGenAI } = await import('@google/genai');
-	const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
+	const { generateWithFallback } = await import('../lib/ai/gemini.js');
 
 	const rawText = allMemories.map(m => `[${m.category}] ${m.fact} (Score: ${m.importance_score})`).join('\n');
 
@@ -138,13 +137,10 @@ Return ONLY a raw JSON array:
 No markdown, no backticks. Just the array.`;
 
 	try {
-		const response = await ai.models.generateContent({
-			model: 'gemini-3.1-pro-preview',
-			contents: [{ role: 'user', parts: [{ text: prompt }] }],
-			config: { temperature: 0.2 }
-		});
-
-		const text = response.candidates?.[0]?.content?.parts?.[0]?.text || '';
+		const { text } = await generateWithFallback(env,
+			[{ role: 'user', parts: [{ text: prompt }] }],
+			{ temperature: 0.2 }
+		);
 		// Safely extract JSON array even if Gemini adds introductory text
 		const arrayMatch = text.match(/\[[\s\S]*\]/);
 		const cleaned = arrayMatch ? arrayMatch[0] : '[]';
@@ -152,11 +148,16 @@ No markdown, no backticks. Just the array.`;
 
 		if (!Array.isArray(consolidated) || consolidated.length === 0) return;
 
-		await deleteAllMemories(env, chatId);
-		for (const m of consolidated) {
-			await saveMemory(env, chatId, m.category, m.fact, m.importance || 1, chatId);
-		}
-		console.log(`🧠 Consolidated ${allMemories.length} → ${consolidated.length} memories`);
+		// Batch write: delete all then insert consolidated in a single atomic transaction
+		const deleteStmt = env.DB.prepare("DELETE FROM memories WHERE chat_id = ?").bind(chatId);
+		const insertStmts = consolidated.map(m =>
+			env.DB.prepare(
+				"INSERT INTO memories (chat_id, category, fact, importance_score, created_by) VALUES (?, ?, ?, ?, ?)"
+			).bind(chatId, (m.category || 'general').toLowerCase(), m.fact, m.importance || 1, chatId)
+		);
+		await env.DB.batch([deleteStmt, ...insertStmts]);
+
+		console.log(`🧠 Consolidated ${allMemories.length} → ${consolidated.length} memories (batched)`);
 	} catch (e) {
 		console.error('Memory consolidation failed:', e.message);
 	}

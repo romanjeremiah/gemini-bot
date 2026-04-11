@@ -592,6 +592,7 @@ Keep it under 500 words. End with: "Awaiting your manual review."` }] }],
 
 export default {
 	async fetch(request, env, ctx) {
+	  try {
 		if (!telegram.verifyWebhook(request, env)) {
 			return new Response("Unauthorized", { status: 401 });
 		}
@@ -612,7 +613,14 @@ export default {
 		}
 
 		if (request.method !== "POST") return new Response("OK");
-		const update = await request.json();
+
+		let update;
+		try {
+			update = await request.json();
+		} catch (e) {
+			console.error(JSON.stringify({ level: 'error', msg: 'Invalid JSON body', error: e.message }));
+			return new Response("Invalid JSON", { status: 400 });
+		}
 
 		let task;
 
@@ -652,11 +660,26 @@ export default {
 		}
 
 		if (task) {
-			// Instantly acknowledge Telegram to prevent 60-second webhook timeout retries.
-			// Heavy operations (/architect, image gen, long AI responses) run in the background.
-			ctx.waitUntil(task.catch(e => console.error('Background task error:', e.message)));
+			ctx.waitUntil(
+				task.catch(err => {
+					console.error(JSON.stringify({ level: 'error', context: 'background_task', msg: err.message, stack: err.stack?.slice(0, 500) }));
+					if (env.OWNER_ID) {
+						telegram.sendMessage(env.OWNER_ID, 'default', `⚠️ <b>Background Error:</b> <code>${(err.message || '').slice(0, 200)}</code>`, env).catch(() => {});
+					}
+				})
+			);
 		}
 		return new Response("OK");
+
+	  } catch (globalErr) {
+		console.error(JSON.stringify({ level: 'fatal', msg: globalErr.message, stack: globalErr.stack?.slice(0, 500) }));
+		if (env.OWNER_ID) {
+			ctx.waitUntil(
+				telegram.sendMessage(env.OWNER_ID, 'default', `🚨 <b>Critical Worker Crash</b>\n<code>${(globalErr.message || '').slice(0, 200)}</code>`, env).catch(() => {})
+			);
+		}
+		return new Response("OK", { status: 200 });
+	  }
 	},
 
 	// eslint-disable-next-line no-unused-vars

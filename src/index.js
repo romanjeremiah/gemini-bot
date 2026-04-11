@@ -5,7 +5,7 @@ import * as moodStore from './services/moodStore';
 import * as memoryStore from './services/memoryStore';
 import * as telegram from './lib/telegram';
 import { generateSpeech } from './lib/tts';
-import { generateShortResponse } from './lib/ai/gemini';
+import { generateShortResponse, generateWithFallback } from './lib/ai/gemini';
 import { storeDiscoveredEffect } from './tools/effect';
 import { personas, MENTAL_HEALTH_DIRECTIVE } from './config/personas';
 import { ARCHITECTURE_SUMMARY } from './config/architecture';
@@ -365,12 +365,8 @@ async function handleCuriosityDigest(env) {
 	await env.CHAT_KV.put(digestKey, '1', { expirationTtl: 86400 * 2 });
 
 	try {
-		const { GoogleGenAI } = await import('@google/genai');
-		const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
-
-		const response = await ai.models.generateContent({
-			model: 'gemini-3.1-pro-preview',
-			contents: [{ role: 'user', parts: [{ text: `Find the most interesting developments from THIS WEEK across these topics. Pick 3-4 of the most genuinely interesting items. For each write one punchy sentence explaining why it matters. Be selective not comprehensive. Skip anything boring.
+		const { text: digest } = await generateWithFallback(env,
+			[{ role: 'user', parts: [{ text: `Find the most interesting developments from THIS WEEK across these topics. Pick 3-4 of the most genuinely interesting items. For each write one punchy sentence explaining why it matters. Be selective not comprehensive. Skip anything boring.
 
 Topics to search:
 • AI and machine learning (new models, agent frameworks, reasoning breakthroughs, open-source releases)
@@ -382,13 +378,9 @@ Topics to search:
 • Anime and manga (seasonal highlights, studio announcements)
 • Photography and drone technology
 • Fitness and exercise science` }] }],
-			config: {
-				temperature: 0.8,
-				tools: [{ googleSearch: {} }],
-			}
-		});
+			{ tools: [{ googleSearch: {} }], temperature: 0.8 }
+		);
 
-		const digest = response.candidates?.[0]?.content?.parts?.filter(p => p.text && !p.thought)?.map(p => p.text)?.join('') || '';
 		if (!digest || digest.length < 50) return;
 
 		const personaKey = await env.CHAT_KV.get(`persona_${chatId}_default`) || 'tenon';
@@ -444,16 +436,10 @@ async function handleAutonomousResearch(env) {
 		];
 		const randomDomain = domains[Math.floor(Math.random() * domains.length)];
 
-		const { GoogleGenAI } = await import('@google/genai');
-		const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
-
-		const response = await ai.models.generateContent({
-			model: 'gemini-3.1-pro-preview',
-			contents: [{ role: 'user', parts: [{ text: `Find ONE highly interesting, concrete piece of news or breakthrough from the last 7 days regarding: ${randomDomain}. Explain what it is and why someone interested in AI, photography, fitness, cooking, and anime would care about it. Keep it to 2-3 sentences.` }] }],
-			config: { tools: [{ googleSearch: {} }], temperature: 0.7 }
-		});
-
-		const text = response.candidates?.[0]?.content?.parts?.filter(p => p.text && !p.thought)?.map(p => p.text)?.join('').trim();
+		const { text } = await generateWithFallback(env,
+			[{ role: 'user', parts: [{ text: `Find ONE highly interesting, concrete piece of news or breakthrough from the last 7 days regarding: ${randomDomain}. Explain what it is and why someone interested in AI, photography, fitness, cooking, and anime would care about it. Keep it to 2-3 sentences.` }] }],
+			{ tools: [{ googleSearch: {} }], temperature: 0.7 }
+		);
 		if (text && text.length > 30) {
 			await memoryStore.saveMemory(env, chatId, 'discovery', `Research (${randomDomain.split('(')[0].trim()}): ${text}`, 1, chatId);
 			console.log(`🧠 Autonomous research: ${randomDomain.split('(')[0].trim()}`);
@@ -481,12 +467,8 @@ async function handleSelfImprovement(env) {
 	await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 * 5 });
 
 	try {
-		const { GoogleGenAI } = await import('@google/genai');
-		const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
-
-		const response = await ai.models.generateContent({
-			model: 'gemini-3.1-pro-preview',
-			contents: [{ role: 'user', parts: [{ text: `You are a senior AI engineer reviewing a Telegram chatbot's architecture. Your job is to suggest concrete, actionable improvements.
+		const { text: suggestions } = await generateWithFallback(env,
+			[{ role: 'user', parts: [{ text: `You are a senior AI engineer reviewing a Telegram chatbot's architecture. Your job is to suggest concrete, actionable improvements.
 
 CURRENT ARCHITECTURE:
 ${ARCHITECTURE_SUMMARY}
@@ -502,13 +484,9 @@ RULES:
 - Do NOT suggest things already listed in the architecture.
 - Prioritise user experience and therapeutic quality over engineering elegance.
 - Be specific and concrete, not vague.` }] }],
-			config: {
-				tools: [{ googleSearch: {} }],
-				temperature: 0.7,
-			}
-		});
+			{ tools: [{ googleSearch: {} }], temperature: 0.7 }
+		);
 
-		const suggestions = response.candidates?.[0]?.content?.parts?.filter(p => p.text && !p.thought)?.map(p => p.text)?.join('') || '';
 		if (!suggestions || suggestions.length < 100) return;
 
 		// Save as a memory for future reference
@@ -547,9 +525,6 @@ async function handleArchitectureEvolution(env) {
 	await env.CHAT_KV.put(currentKey, '1', { expirationTtl: 86400 * 2 });
 
 	try {
-		const { GoogleGenAI } = await import('@google/genai');
-		const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
-
 		const technologies = [
 			'Cloudflare Workers D1 Vectorize latest updates',
 			'Telegram Bot API recent changes new methods',
@@ -559,13 +534,11 @@ async function handleArchitectureEvolution(env) {
 		const randomTech = technologies[Math.floor(Math.random() * technologies.length)];
 
 		// Phase 1: Search for the latest docs/updates
-		const searchResponse = await ai.models.generateContent({
-			model: 'gemini-3.1-pro-preview',
-			contents: [{ role: 'user', parts: [{ text: `Search for the latest updates or changes for: ${randomTech}. Find the most relevant official documentation URL. Return the URL on the first line, then a 2-sentence summary of what changed.` }] }],
-			config: { tools: [{ googleSearch: {} }], temperature: 0.5 }
-		});
+		const { text: searchText } = await generateWithFallback(env,
+			[{ role: 'user', parts: [{ text: `Search for the latest updates or changes for: ${randomTech}. Find the most relevant official documentation URL. Return the URL on the first line, then a 2-sentence summary of what changed.` }] }],
+			{ tools: [{ googleSearch: {} }], temperature: 0.5 }
+		);
 
-		const searchText = searchResponse.candidates?.[0]?.content?.parts?.filter(p => p.text && !p.thought)?.map(p => p.text)?.join('').trim() || '';
 		if (!searchText || searchText.length < 30) return;
 
 		// Phase 2: Deep-read the URL via read_webpage tool
@@ -579,8 +552,7 @@ async function handleArchitectureEvolution(env) {
 		}
 
 		// Phase 3: Compare against architecture and draft PR
-		const prResponse = await ai.models.generateContent({
-			model: 'gemini-3.1-pro-preview',
+		const { text: prText } = await generateWithFallback(env,
 			contents: [{ role: 'user', parts: [{ text: `You are a Principal Architect reviewing a Telegram bot.
 
 SEARCH FINDINGS:
@@ -599,10 +571,8 @@ TRUSTED SOURCES: Ensure all research relies on open, trusted sources. For health
 
 If no improvement is needed, respond with exactly: NO_PR_NEEDED
 Keep it under 500 words. End with: "Awaiting your manual review."` }] }],
-			config: { temperature: 0.5 }
-		});
-
-		const prText = prResponse.candidates?.[0]?.content?.parts?.filter(p => p.text && !p.thought)?.map(p => p.text)?.join('').trim() || '';
+			{ temperature: 0.5 }
+		);
 
 		if (prText && !prText.includes('NO_PR_NEEDED') && prText.length > 50) {
 			await telegram.sendMessage(chatId, 'default', `<b>Architecture Deep Search</b>\n\n${prText}`, env, null, {

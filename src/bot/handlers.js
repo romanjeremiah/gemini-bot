@@ -1,5 +1,5 @@
 import { personas, FORMATTING_RULES, MENTAL_HEALTH_DIRECTIVE, SECOND_BRAIN_DIRECTIVE } from '../config/personas';
-import { createChat, sendChatMessage, sendChatMessageStream, generateImage, setupCache, PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, generateShortResponse } from '../lib/ai/gemini';
+import { createChat, sendChatMessage, sendChatMessageStream, generateImage, setupCache, PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, generateShortResponse, generateWithFallback } from '../lib/ai/gemini';
 import { toolRegistry } from '../tools';
 import * as telegram from '../lib/telegram';
 import * as memoryStore from '../services/memoryStore';
@@ -208,14 +208,11 @@ async function handleCommand(command, msg, env) {
 
 			try {
 				const { ARCHITECTURE_SUMMARY } = await import('../config/architecture.js');
-				const { GoogleGenAI } = await import('@google/genai');
-				const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
 
 				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Phase 2: Querying trusted sources and documentation...</i>", env);
 
-				const response = await ai.models.generateContent({
-					model: 'gemini-3.1-pro-preview',
-					contents: [{ role: 'user', parts: [{ text: `You are a senior AI engineer reviewing a Telegram chatbot. Research the latest developments and suggest improvements.
+				const { text: suggestions } = await generateWithFallback(env,
+					[{ role: 'user', parts: [{ text: `You are a senior AI engineer reviewing a Telegram chatbot. Research the latest developments and suggest improvements.
 
 CURRENT ARCHITECTURE:
 ${ARCHITECTURE_SUMMARY}
@@ -228,12 +225,11 @@ TASK:
 5. For each: explain what it is, why it matters, and sketch the implementation approach (which files to change, what code to add).
 
 Be specific. Reference actual file paths from the architecture. Only suggest things feasible with the existing stack.` }] }],
-					config: { tools: [{ googleSearch: {} }], temperature: 0.7 }
-				});
+					{ tools: [{ googleSearch: {} }], temperature: 0.7 }
+				);
 
 				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Phase 3: Analysing gaps and drafting suggestions...</i>", env);
 
-				const suggestions = response.candidates?.[0]?.content?.parts?.filter(p => p.text && !p.thought)?.map(p => p.text)?.join('') || '';
 				if (!suggestions || suggestions.length < 100) {
 					if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Could not generate suggestions. Try again later.</i>", env);
 					return true;

@@ -75,6 +75,33 @@ async function withRetry(fn, maxRetries = 3, fallbackFn = null) {
   throw lastError;
 }
 
+/**
+ * Generate content with automatic Pro → Flash fallback.
+ * Use this for cron jobs and background tasks instead of direct ai.models.generateContent.
+ */
+export async function generateWithFallback(env, contents, config = {}) {
+  const ai = getAIDirect(env);
+  const proConfig = { ...config };
+  const flashConfig = { ...config };
+
+  const doGenerate = (model) => ai.models.generateContent({
+    model, contents, config: proConfig
+  });
+
+  const response = await withRetry(
+    () => doGenerate(PRIMARY_TEXT_MODEL),
+    2,
+    () => doGenerate(FALLBACK_TEXT_MODEL)
+  );
+
+  const text = response.candidates?.[0]?.content?.parts
+    ?.filter(p => p.text && !p.thought)
+    ?.map(p => p.text)
+    ?.join('') || '';
+
+  return { text: text.trim(), response };
+}
+
 // ---- Context Caching ----
 const _cacheNames = new Map();
 

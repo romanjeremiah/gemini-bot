@@ -536,13 +536,11 @@ async function handleArchitectureEvolution(env) {
 		const randomTech = technologies[Math.floor(Math.random() * technologies.length)];
 
 		// Phase 1: Search for the latest docs/updates
-		const searchResponse = await ai.models.generateContent({
-			model: 'gemini-3.1-pro-preview',
-			contents: [{ role: 'user', parts: [{ text: `Search for the latest updates or changes for: ${randomTech}. Find the most relevant official documentation URL. Return the URL on the first line, then a 2-sentence summary of what changed.` }] }],
-			config: { tools: [{ googleSearch: {} }], temperature: 0.5 }
-		});
+		const { text: searchText } = await generateWithFallback(env,
+			[{ role: 'user', parts: [{ text: `Search for the latest updates or changes for: ${randomTech}. Find the most relevant official documentation URL. Return the URL on the first line, then a 2-sentence summary of what changed.` }] }],
+			{ tools: [{ googleSearch: {} }], temperature: 0.5 }
+		);
 
-		const searchText = searchResponse.candidates?.[0]?.content?.parts?.filter(p => p.text && !p.thought)?.map(p => p.text)?.join('').trim() || '';
 		if (!searchText || searchText.length < 30) return;
 
 		// Phase 2: Deep-read the URL
@@ -551,14 +549,13 @@ async function handleArchitectureEvolution(env) {
 		if (urlMatch && toolRegistry['read_webpage']) {
 			try {
 				const result = await toolRegistry['read_webpage'].execute({ url: urlMatch[0] });
-				if (result.status === 'success') deepContent = `\n\nDOCUMENTATION FROM ${urlMatch[0]}:\n${result.text.slice(0, 8000)}`;
+				if (result.status === 'success') deepContent = `\n\nDOCUMENTATION FROM ${urlMatch[0]}:\n${(result.content || result.text || '').slice(0, 8000)}`;
 			} catch { /* proceed */ }
 		}
 
-		// Phase 3: Self-Coding / PR Generation
-		const prResponse = await ai.models.generateContent({
-			model: 'gemini-3.1-pro-preview',
-			contents: [{ role: 'user', parts: [{ text: `You are a Principal Architect reviewing a Telegram bot.
+		// Phase 3: Compare against architecture and draft PR
+		const { text: prText } = await generateWithFallback(env,
+			[{ role: 'user', parts: [{ text: `You are a Principal Architect reviewing a Telegram bot.
 
 SEARCH FINDINGS:
 ${searchText}
@@ -567,36 +564,26 @@ ${deepContent}
 CURRENT ARCHITECTURE:
 ${ARCHITECTURE_SUMMARY}
 
-Compare findings against the architecture. If you find a concrete improvement NOT already implemented:
-Use the create_pull_request tool to physically propose the change in my GitHub repository. Once done, send me the link to the PR for my review.
+Compare findings against the architecture. If you find a concrete improvement NOT already implemented, draft a Pull Request:
+1. What to change (specific file paths)
+2. Why it matters
+3. A code sketch of the key change
 
-TRUSTED SOURCES: Ensure all research relies on open, trusted sources (NHS, NICE, APA, WHO, official tech docs).
+TRUSTED SOURCES: For health/medical use NHS, NICE, APA, WHO, BAP. For technical use official documentation.
 
-If no improvement is needed, respond with exactly: NO_PR_NEEDED` }] }],
-			config: {
-				temperature: 0.5,
-				tools: [{ functionDeclarations: toolDefinitions }] // Enable all tools
-			}
-		});
+If no improvement is needed, respond with exactly: NO_PR_NEEDED
+Keep it under 500 words. End with: "Awaiting your manual review."` }] }],
+			{ temperature: 0.5 }
+		);
 
-		const part = prResponse.candidates?.[0]?.content?.parts?.[0];
-
-		// Handle Tool Call (The "Self-Coding" step)
-		if (part?.functionCall) {
-			const { name, args } = part.functionCall;
-			if (toolRegistry[name]) {
-				const result = await toolRegistry[name].execute(args, env);
-				if (name === 'create_pull_request' && result.status === 'success') {
-					await telegram.sendMessage(chatId, 'default', `🛠️ <b>Autonomous Pull Request Opened</b>\n\nI found an improvement for ${randomTech} and opened a PR: ${result.url}\n\nAwaiting your manual review.`, env);
-					return;
-				}
-			}
-		}
-
-		// Handle text response if no tool was called
-		const prText = part?.text?.trim() || '';
 		if (prText && !prText.includes('NO_PR_NEEDED') && prText.length > 50) {
-			await telegram.sendMessage(chatId, 'default', `<b>Architecture Analysis</b>\n\n${prText}`, env);
+			await telegram.sendMessage(chatId, 'default', `<b>Architecture Deep Search</b>\n\n${prText}`, env, null, {
+				inline_keyboard: [[
+					{ text: '💬 Discuss', callback_data: 'discuss_pr' },
+					{ text: '❌ Dismiss', callback_data: 'action_dismiss_pr' }
+				]]
+			});
+			await memoryStore.saveMemory(env, chatId, 'discovery', `Architecture PR (${randomTech}): ${prText.slice(0, 300)}`, 1, chatId);
 		}
 	} catch (e) {
 		console.error('Architecture evolution error:', e.message);

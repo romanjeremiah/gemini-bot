@@ -553,7 +553,7 @@ async function handleArchitectureEvolution(env) {
 
 		// Phase 3: Compare against architecture and draft PR
 		const { text: prText } = await generateWithFallback(env,
-			contents: [{ role: 'user', parts: [{ text: `You are a Principal Architect reviewing a Telegram bot.
+			[{ role: 'user', parts: [{ text: `You are a Principal Architect reviewing a Telegram bot.
 
 SEARCH FINDINGS:
 ${searchText}

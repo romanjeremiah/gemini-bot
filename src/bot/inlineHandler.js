@@ -63,7 +63,6 @@ export async function handleInlineQuery(inlineQuery, env) {
 	if (!promptText || !personas[personaKey]) return;
 
 	const persona = personas[personaKey];
-	const emoji = personaKey === 'tenon' ? '🎯' : personaKey === 'nightfall' ? '🌙' : '✨';
 
 	try {
 		// Direct API call (no gateway) for maximum speed
@@ -98,7 +97,7 @@ export async function handleInlineQuery(inlineQuery, env) {
 		const results = [{
 			type: 'article',
 			id: `${personaKey}_${Date.now()}`,
-			title: `${emoji} ${persona.name}'s Take`,
+			title: `${persona.name}'s Take`,
 			description: text.trim().slice(0, 100) + (text.length > 100 ? '...' : ''),
 			input_message_content: { message_text: text.trim() },
 		}];

@@ -3,7 +3,7 @@ import * as reminderStore from '../services/reminderStore';
 export const reminderTool = {
 	definition: {
 		name: "set_reminder",
-		description: "Schedule a reminder for the user. Calculate 'due_at_timestamp' as a Unix timestamp in UTC. The system prompt provides the current Unix time as an anchor. All times must be in UTC. CRITICAL: If the user does NOT explicitly state the day AND time for the reminder, you MUST ask them before calling this tool. Do not guess timing. Example: if user says 'remind me to call Alex', ask 'When would you like me to remind you?' first. Only call this tool once you have a confirmed date and time.",
+		description: "Schedule a reminder for the user. Calculate 'due_at_timestamp' as a Unix timestamp in UTC. The system prompt provides the current Unix time as an anchor. All times must be in UTC. SMART TIMING: If the user explicitly states a time, use it. If the user says 'remind me later' or gives a casual task without specifying a time (e.g., 'remind me to check the oven', 'remind me about this'), use your intelligence to assign a reasonable short delay (+5, +15, +30, or +60 minutes) based on the task's urgency. Do not pester for an exact time unless the task is clearly a major future event (flight, meeting, appointment). Set it and confirm the time you chose.",
 		parameters: {
 			type: "OBJECT",
 			properties: {

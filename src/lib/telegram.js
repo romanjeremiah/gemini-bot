@@ -158,7 +158,9 @@ export async function pinMessage(chatId, messageId, env) {
 
 // ---- Send Poll (updated for Bot API 9.6) ----
 export async function sendPoll(chatId, threadId, question, options, env, config = {}) {
-	const payload = { chat_id: chatId, question, options, ...config };
+	// Normalise options: accept plain strings or { text: ... } objects
+	const normalisedOptions = options.map(o => typeof o === 'string' ? { text: o } : o);
+	const payload = { chat_id: chatId, question, options: normalisedOptions, ...config };
 	if (threadId && threadId !== "default") payload.message_thread_id = Number(threadId);
 	if (payload.correct_option_id !== undefined && !payload.correct_option_ids) {
 		payload.correct_option_ids = [payload.correct_option_id];
@@ -215,7 +217,11 @@ export async function downloadFile(fileId, env) {
 export async function registerCommands(env) {
 	return await tgApi("setMyCommands", env, {
 		commands: [
+			{ command: "listen", description: "Deep listening mode (brain dump)" },
+			{ command: "done", description: "End listening mode and synthesise" },
+			{ command: "architect", description: "Self-improvement analysis" },
 			{ command: "persona", description: "Switch AI personality" },
+			{ command: "model", description: "Choose AI model (Pro/Flash)" },
 			{ command: "mood", description: "Interactive mood check-in" },
 			{ command: "clear", description: "Reset conversation history" },
 			{ command: "memories", description: "View saved facts" },

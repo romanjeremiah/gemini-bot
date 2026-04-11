@@ -120,3 +120,27 @@ function filterNulls(obj) {
 	}
 	return result;
 }
+
+
+/**
+ * Get the last 7 days of mood data for weekly analysis.
+ */
+export async function getWeeklySummary(env, chatId) {
+	const { results } = await env.DB.prepare(`
+		SELECT date, entry_type, mood_score, mood_label, emotions, sleep_hours, sleep_quality,
+			medication_taken, medication_notes, activities, note, ai_observation
+		FROM mood_journal
+		WHERE chat_id = ? AND date > date('now', '-7 days')
+		ORDER BY date ASC, created_at ASC
+	`).bind(chatId).all();
+	return (results || []).map(r => ({
+		...r,
+		emotions: safeParseJSON(r.emotions),
+		activities: safeParseJSON(r.activities),
+	}));
+}
+
+function safeParseJSON(str) {
+	if (!str) return null;
+	try { return JSON.parse(str); } catch { return str; }
+}

@@ -264,25 +264,36 @@ export async function generateImage(prompt, env, inputImageBase64 = null, inputM
 
 
 // ---- UI Text Generation (Fast & Contextual) ----
-// Uses Flash model for speed. No tools, no history. Just a quick in-character response.
+// Uses Flash model via direct connection for speed. No tools, no history.
 export async function generateShortResponse(prompt, systemInstruction, env) {
   const response = await withRetry(
     () => getAIDirect(env).models.generateContent({
       model: FALLBACK_TEXT_MODEL,
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       config: {
-        systemInstruction: `${systemInstruction}\n\nYou are generating a brief message for a Telegram bot. Keep it to 1-3 complete sentences. Be fully in character. No asterisks, no markdown. You MUST finish every sentence completely. Never stop mid-sentence.`,
+        systemInstruction: `${systemInstruction}\n\nYou are generating a brief message for a Telegram bot. Keep it to 2-4 complete sentences. Be fully in character. No asterisks, no markdown, no HTML tags. You MUST finish every sentence completely. Never stop mid-sentence or mid-thought.`,
         temperature: 1.0,
-        maxOutputTokens: 300,
+        maxOutputTokens: 1000,
       }
     }),
     2, null
   );
-  const text = response.candidates?.[0]?.content?.parts?.filter(p => p.text && !p.thought)?.map(p => p.text)?.join('') || '';
+  let text = response.candidates?.[0]?.content?.parts?.filter(p => p.text && !p.thought)?.map(p => p.text)?.join('') || '';
+  text = text.trim();
   // Safety: if text was truncated mid-sentence, trim to last complete sentence
-  if (text && !text.match(/[.!?…"']$/)) {
-    const lastSentence = text.match(/.*[.!?…"']/s);
-    if (lastSentence) return lastSentence[0].trim();
+  if (text && !/[.!?…"']$/.test(text)) {
+    const lastComplete = text.lastIndexOf('. ');
+    const lastExclaim = text.lastIndexOf('! ');
+    const lastQuestion = text.lastIndexOf('? ');
+    const lastEnd = Math.max(
+      lastComplete,
+      lastExclaim,
+      lastQuestion,
+      text.lastIndexOf('.'),
+      text.lastIndexOf('!'),
+      text.lastIndexOf('?')
+    );
+    if (lastEnd > 0) text = text.slice(0, lastEnd + 1).trim();
   }
-  return text.trim();
+  return text;
 }

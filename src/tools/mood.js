@@ -101,7 +101,20 @@ IMPORTANT: If mood_score is 0-1 or 9-10, this is a clinical concern. Always ackn
 		};
 		const entry = await moodStore.upsertEntry(env, context.chatId, date, args.entry_type || 'evening', data);
 		console.log(`📊 Mood logged: ${date} ${args.entry_type} score=${args.mood_score}`);
-		return { status: "success", date, entry_type: args.entry_type, mood_score: args.mood_score, mood_label: entry.mood_label };
+
+		// Dynamic feedback: tell the AI what's still missing
+		const missing = [];
+		if (entry.sleep_hours === null) missing.push('sleep hours/quality');
+		if (!entry.emotions || entry.emotions === '[]' || entry.emotions === 'null') missing.push('specific emotions');
+		if (!entry.activities || entry.activities === '[]' || entry.activities === 'null') missing.push('activities');
+		if (!entry.photo_r2_key) missing.push('a photo of the day');
+		if (!entry.note) missing.push('final reflections');
+
+		const next_step = missing.length > 0
+			? `Data logged. Still missing: ${missing.join(', ')}. Ask ONE natural question to gather the next piece.`
+			: 'Journal complete for today. Warmly summarise the day and wrap up the check-in.';
+
+		return { status: "success", date, entry_type: args.entry_type, mood_score: args.mood_score, mood_label: entry.mood_label, next_step };
 	}
 };
 

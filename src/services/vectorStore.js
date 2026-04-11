@@ -170,15 +170,22 @@ export async function getSemanticContext(env, chatId, userMessage) {
 		if (!relevant.length) return '';
 
 		let ctx = '\nSemantic recall (related past context):\n';
+		let criticalAlert = '';
+
 		for (const r of relevant) {
 			const meta = r.metadata;
 			if (meta.fact) {
 				ctx += `- [${meta.category}] ${meta.fact} (relevance: ${(r.score * 100).toFixed(0)}%)\n`;
+
+				// TRIGGER INTERCEPTION: if the message strongly matches a known trigger, schema, or avoidance pattern
+				if (r.score > 0.75 && ['trigger', 'schema', 'avoidance'].includes(meta.category)) {
+					criticalAlert += `\nCLINICAL ALERT: The user's current message strongly matches a known ${meta.category.toUpperCase()}: "${meta.fact}". Adjust your response to gently deploy coping strategies, validate the trigger, or explore this schema with care. Do not ignore this context.\n`;
+				}
 			} else if (meta.preview) {
 				ctx += `- Past conversation: ${meta.preview} (relevance: ${(r.score * 100).toFixed(0)}%)\n`;
 			}
 		}
-		return ctx;
+		return criticalAlert + ctx;
 	} catch (err) {
 		console.error('⚠️ Semantic context error:', err.message);
 		return '';

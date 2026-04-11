@@ -1,11 +1,11 @@
 export const githubReadTool = {
 	definition: {
 		name: "read_repo_file",
-		description: "Read the raw content of a specific file from the bot's GitHub repository. Use this to inspect the current code before suggesting improvements. Common paths: src/index.js, src/bot/handlers.js, src/config/personas.js, src/lib/ai/gemini.js, src/services/memoryStore.js, src/tools/index.js",
+		description: "Read the raw content of a specific file from the bot's GitHub repository. Common paths: src/index.js, src/bot/handlers.js, src/config/personas.js, src/lib/ai/gemini.js, src/tools/index.js",
 		parameters: {
 			type: "OBJECT",
 			properties: {
-				file_path: { type: "STRING", description: "The path to the file, e.g., 'src/index.js' or 'src/bot/handlers.js'" }
+				file_path: { type: "STRING", description: "The path to the file, e.g., 'src/index.js'" }
 			},
 			required: ["file_path"]
 		}
@@ -18,7 +18,7 @@ export const githubReadTool = {
 				headers: {
 					'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
 					'Accept': 'application/vnd.github.v3.raw',
-					'User-Agent': 'GeminiBot',
+					'User-Agent': 'GeminiBot', // Aligned with project name
 					'X-GitHub-Api-Version': '2022-11-28'
 				}
 			});

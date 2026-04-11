@@ -15,6 +15,7 @@ import { logMoodEntryTool, getMoodHistoryTool } from './mood';
 import { fetchTool } from './fetch';
 import { scheduleTool } from './schedule';
 import { githubReadTool } from './github';
+import { cloudflareAdminTool } from './cloudflare';
 
 export const toolRegistry = {
 	[reminderTool.definition.name]: reminderTool,
@@ -34,6 +35,7 @@ export const toolRegistry = {
 	[logMoodEntryTool.definition.name]: logMoodEntryTool,
 	[getMoodHistoryTool.definition.name]: getMoodHistoryTool,
 	[fetchTool.definition.name]: fetchTool,
+	[cloudflareAdminTool.definition.name]: cloudflareAdminTool,
 	[scheduleTool.definition.name]: scheduleTool,
 	[githubReadTool.definition.name]: githubReadTool,
 };

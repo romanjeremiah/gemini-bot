@@ -629,10 +629,14 @@ export async function handleCallback(callbackQuery, env) {
 		}
 	}
 	// ---- Medication and Mood callbacks from health check-ins ----
-	else if (data.startsWith('mood_med_') || data.startsWith('mood_score_')) {
+	else if (data.startsWith('mood_med_') || data.startsWith('mood_score_') || data.startsWith('mood_cat_') || data.startsWith('mood_emo_')) {
 		const today = moodStore.todayLondon();
-		await telegram.editMessageReplyMarkup(chatId, msgId, null, env);
-		await telegram.sendChatAction(chatId, threadId, "typing", env);
+
+		// Shared setup for med/score callbacks only
+		if (data.startsWith('mood_med_') || data.startsWith('mood_score_')) {
+			await telegram.editMessageReplyMarkup(chatId, msgId, null, env);
+			await telegram.sendChatAction(chatId, threadId, "typing", env);
+		}
 
 		// Clear the nudge flag since the user responded
 		const checkinType = data.includes('morning') ? 'morning' : data.includes('midday') ? 'midday' : 'evening';
@@ -707,16 +711,80 @@ export async function handleCallback(callbackQuery, env) {
 		} else if (data.startsWith('mood_cat_')) {
 			const category = data.replace('mood_cat_', '');
 			await telegram.editMessageReplyMarkup(chatId, msgId, null, env);
-			await telegram.sendChatAction(chatId, threadId, 'typing', env);
+			log.info('mood_category', { chatId, category });
 
 			// Clear nudge flag
 			await env.CHAT_KV.delete(`nudge_pending_evening_${chatId}`);
 
-			const contextPrompt = `The user indicated they are feeling ${category} emotions today. Offer a conversational follow-up listing a few specific examples from our library (Positive: lively, calm, motivated, grateful, confident, energetic, inspired; Negative: anxious, sad, frustrated, tired, empty, insecure, lonely). Ask which ones resonate, then naturally transition into exploring why.`;
+			// Present the full emotion library as selectable inline buttons
+			const positiveEmotions = ['lively', 'grateful', 'proud', 'calm', 'relaxed', 'energetic', 'motivated', 'empathetic', 'inspired', 'curious', 'satisfied', 'excited', 'brave', 'confident', 'happy', 'joyful', 'carefree'];
+			const negativeEmotions = ['devastated', 'empty', 'frustrated', 'scared', 'angry', 'depressed', 'sad', 'anxious', 'annoyed', 'insecure', 'lonely', 'confused', 'tired', 'bored', 'nervous', 'disappointed', 'lost'];
+
+			const emotions = category === 'positive' ? positiveEmotions : negativeEmotions;
+
+			// Build rows of 3 buttons each
+			const rows = [];
+			for (let i = 0; i < emotions.length; i += 3) {
+				rows.push(emotions.slice(i, i + 3).map(e => ({
+					text: e, callback_data: `mood_emo_${e}`
+				})));
+			}
+			// Add a "Done" button at the end
+			rows.push([{ text: '✅ Done selecting', callback_data: 'mood_emo_done' }]);
+
+			// Store selected emotions in KV for accumulation
+			await env.CHAT_KV.put(`mood_emo_selected_${chatId}`, '[]', { expirationTtl: 3600 });
+			await env.CHAT_KV.put(`mood_emo_category_${chatId}`, category, { expirationTtl: 3600 });
+
+			await telegram.sendMessage(chatId, threadId,
+				`<b>Select all ${category} emotions that resonate today.</b>\nTap each one, then tap ✅ Done when finished.`,
+				env, null, { inline_keyboard: rows });
+
+		} else if (data.startsWith('mood_emo_') && data !== 'mood_emo_done') {
+			// Individual emotion selection - toggle and acknowledge
+			const emotion = data.replace('mood_emo_', '');
+			const selectedStr = await env.CHAT_KV.get(`mood_emo_selected_${chatId}`) || '[]';
+			const selected = JSON.parse(selectedStr);
+
+			if (selected.includes(emotion)) {
+				selected.splice(selected.indexOf(emotion), 1);
+			} else {
+				selected.push(emotion);
+			}
+			await env.CHAT_KV.put(`mood_emo_selected_${chatId}`, JSON.stringify(selected), { expirationTtl: 3600 });
+
+			// Acknowledge with a brief answer callback
+			await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/answerCallbackQuery`, {
+				method: 'POST', headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ callback_query_id: callbackQuery.id, text: selected.includes(emotion) ? `✓ ${emotion}` : `✗ ${emotion} removed`, show_alert: false })
+			});
+
+		} else if (data === 'mood_emo_done') {
+			await telegram.editMessageReplyMarkup(chatId, msgId, null, env);
+			await telegram.sendChatAction(chatId, threadId, 'typing', env);
+
+			const selectedStr = await env.CHAT_KV.get(`mood_emo_selected_${chatId}`) || '[]';
+			const selected = JSON.parse(selectedStr);
+			const category = await env.CHAT_KV.get(`mood_emo_category_${chatId}`) || 'mixed';
+
+			// Save emotions to mood journal
+			const today = moodStore.todayLondon();
+			if (selected.length > 0) {
+				await moodStore.upsertEntry(env, chatId, today, 'evening', { emotions: JSON.stringify(selected) });
+				log.info('mood_emotions_logged', { chatId, emotions: selected, category });
+			}
+
+			// Clean up KV
+			await env.CHAT_KV.delete(`mood_emo_selected_${chatId}`);
+			await env.CHAT_KV.delete(`mood_emo_category_${chatId}`);
+
+			// Nightfall responds to the selected emotions
+			const emotionList = selected.length > 0 ? selected.join(', ') : 'none selected';
+			const contextPrompt = `The user selected these ${category} emotions: ${emotionList}. Acknowledge their emotional state with empathy. Ask ONE natural follow-up question exploring what is driving these feelings today. Be warm and curious.`;
 
 			try {
 				const response = await generateShortResponse(contextPrompt, personas.nightfall.instruction, env);
-				await telegram.sendMessage(chatId, threadId, response || `Which specific ${category} emotions resonate today?`, env);
+				await telegram.sendMessage(chatId, threadId, response || `Thank you for sharing. What has been driving those feelings today?`, env);
 
 				const histKey = `chat_${chatId}_${threadId}`;
 				let hist = await env.CHAT_KV.get(histKey, { type: 'json' }) || [];
@@ -724,8 +792,8 @@ export async function handleCallback(callbackQuery, env) {
 				if (hist.length > 24) hist = hist.slice(-24);
 				await env.CHAT_KV.put(histKey, JSON.stringify(hist), { expirationTtl: 604800 });
 			} catch (e) {
-				console.error('Emotion category error:', e.message);
-				await telegram.sendMessage(chatId, threadId, `Which specific ${category} emotions resonate today?`, env);
+				log.error('mood_emotion_response', { msg: e.message });
+				await telegram.sendMessage(chatId, threadId, `You selected: ${emotionList}. What has been driving those feelings?`, env);
 			}
 		}
 

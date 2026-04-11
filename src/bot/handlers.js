@@ -11,6 +11,7 @@ import { generateSpeech } from '../lib/tts';
 import { buildChecklistText } from '../tools/checklist';
 import * as moodStore from '../services/moodStore';
 import { getAllSchedules, setSchedule, resetSchedule } from '../config/schedules';
+import { log } from '../lib/logger';
 
 const HISTORY_LENGTH = 24;
 const HISTORY_TTL = 604800;
@@ -286,10 +287,14 @@ export async function handleMessage(msg, env) {
 
 	try {
 		const firstName = msg.from.first_name || "User", userText = msg.text || msg.caption || "";
+		log.info('message_received', { chatId, from: firstName, len: userText.length, hasMedia: !!getMediaFromMessage(msg) });
 		const userIdentity = buildUserIdentity(msg);
 		upsertUser(env, msg); // fire-and-forget — keeps users table fresh
 		const cmdMatch = userText.match(/^\/(\w+)(@\w+)?/);
-		if (cmdMatch && await handleCommand(`/${cmdMatch[1]}`, msg, env)) return;
+		if (cmdMatch) {
+			log.info('command', { chatId, cmd: cmdMatch[1] });
+			if (await handleCommand(`/${cmdMatch[1]}`, msg, env)) return;
+		}
 
 		// Deep Listening Mode: buffer messages silently, react with contextual emoji
 		const isListening = await env.CHAT_KV.get(`listening_mode_${chatId}`);
@@ -537,6 +542,7 @@ export async function handleMessage(msg, env) {
 export async function handleCallback(callbackQuery, env) {
 	const chatId = callbackQuery.message.chat.id, threadId = callbackQuery.message.message_thread_id || "default";
 	const data = callbackQuery.data, msgId = callbackQuery.message.message_id;
+	log.info('callback', { chatId, data });
 
 	try {
 		await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/answerCallbackQuery`, {

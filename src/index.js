@@ -11,6 +11,7 @@ import { personas, MENTAL_HEALTH_DIRECTIVE } from './config/personas';
 import { ARCHITECTURE_SUMMARY } from './config/architecture';
 import { getSchedule, matchesSchedule } from './config/schedules';
 import { toolRegistry } from './tools/index';
+import { log } from './lib/logger';
 
 const BIZ_CONN_TTL = 2592000; // 30 days
 
@@ -662,6 +663,7 @@ export default {
 
 		// Handle emoji reactions on bot messages (RLHF feedback)
 		if (update.message_reaction) {
+			log.info('reaction_received', { chatId: update.message_reaction.chat?.id, msgId: update.message_reaction.message_id });
 			task = handleReactionFeedback(update.message_reaction, env);
 		}
 		else if (update.business_connection) {
@@ -702,7 +704,7 @@ export default {
 		if (task) {
 			ctx.waitUntil(
 				task.catch(err => {
-					console.error(JSON.stringify({ level: 'error', context: 'background_task', msg: err.message, stack: err.stack?.slice(0, 500) }));
+					log.error('background_task_failed', { msg: err.message, stack: err.stack?.slice(0, 500) });
 					if (env.OWNER_ID) {
 						telegram.sendMessage(env.OWNER_ID, 'default', `⚠️ <b>Background Error:</b> <code>${(err.message || '').slice(0, 200)}</code>`, env).catch(() => {});
 					}
@@ -712,7 +714,7 @@ export default {
 		return new Response("OK");
 
 	  } catch (globalErr) {
-		console.error(JSON.stringify({ level: 'fatal', msg: globalErr.message, stack: globalErr.stack?.slice(0, 500) }));
+		log.fatal('worker_crash', { msg: globalErr.message, stack: globalErr.stack?.slice(0, 500) });
 		if (env.OWNER_ID) {
 			ctx.waitUntil(
 				telegram.sendMessage(env.OWNER_ID, 'default', `🚨 <b>Critical Worker Crash</b>\n<code>${(globalErr.message || '').slice(0, 200)}</code>`, env).catch(() => {})
@@ -726,16 +728,16 @@ export default {
 	async scheduled(_event, env, _ctx) {
 		// ---- Health check-ins (owner only, Nightfall persona) ----
 		if (env.OWNER_ID) {
-			try { await handleHealthCheckIns(env); } catch (e) { console.error('Cron check-in error:', e.message); }
-			try { await handleMedicationNudge(env); } catch (e) { console.error('Cron nudge error:', e.message); }
-			try { await handleWeeklyReport(env); } catch (e) { console.error('Cron report error:', e.message); }
-			try { await handleAccountabilityNudge(env); } catch (e) { console.error('Cron accountability error:', e.message); }
-			try { await handleMemoryConsolidation(env); } catch (e) { console.error('Cron consolidation error:', e.message); }
-			try { await handleSpontaneousOutreach(env); } catch (e) { console.error('Cron outreach error:', e.message); }
-			try { await handleCuriosityDigest(env); } catch (e) { console.error('Cron digest error:', e.message); }
-			try { await handleAutonomousResearch(env); } catch (e) { console.error('Cron research error:', e.message); }
-			try { await handleSelfImprovement(env); } catch (e) { console.error('Cron self-improve error:', e.message); }
-			try { await handleArchitectureEvolution(env); } catch (e) { console.error('Cron architecture error:', e.message); }
+			try { await handleHealthCheckIns(env); } catch (e) { log.error('cron_checkin', { msg: e.message }); }
+			try { await handleMedicationNudge(env); } catch (e) { log.error('cron_nudge', { msg: e.message }); }
+			try { await handleWeeklyReport(env); } catch (e) { log.error('cron_report', { msg: e.message }); }
+			try { await handleAccountabilityNudge(env); } catch (e) { log.error('cron_accountability', { msg: e.message }); }
+			try { await handleMemoryConsolidation(env); } catch (e) { log.error('cron_consolidation', { msg: e.message }); }
+			try { await handleSpontaneousOutreach(env); } catch (e) { log.error('cron_outreach', { msg: e.message }); }
+			try { await handleCuriosityDigest(env); } catch (e) { log.error('cron_digest', { msg: e.message }); }
+			try { await handleAutonomousResearch(env); } catch (e) { log.error('cron_research', { msg: e.message }); }
+			try { await handleSelfImprovement(env); } catch (e) { log.error('cron_self_improve', { msg: e.message }); }
+			try { await handleArchitectureEvolution(env); } catch (e) { log.error('cron_architecture', { msg: e.message }); }
 		}
 
 		// ---- Reminders ----

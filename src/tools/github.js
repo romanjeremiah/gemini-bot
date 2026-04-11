@@ -1,65 +1,32 @@
-export const githubTool = {
+export const githubReadTool = {
 	definition: {
-		name: "create_pull_request",
-		description: "Modify a file in the user's GitHub repository and open a Pull Request. Use this for proposing code changes or architectural improvements.",
+		name: "read_repo_file",
+		description: "Read the raw content of a specific file from the bot's GitHub repository. Use this to inspect the current code before suggesting improvements. Common paths: src/index.js, src/bot/handlers.js, src/config/personas.js, src/lib/ai/gemini.js, src/services/memoryStore.js, src/tools/index.js",
 		parameters: {
 			type: "OBJECT",
 			properties: {
-				file_path: { type: "STRING", description: "Path to the file, e.g., 'src/bot/handlers.js'" },
-				new_content: { type: "STRING", description: "The complete, updated content of the file." },
-				commit_message: { type: "STRING", description: "A brief description of the change." },
-				pr_title: { type: "STRING", description: "Title for the Pull Request." },
-				pr_body: { type: "STRING", description: "Technical explanation of the changes." }
+				file_path: { type: "STRING", description: "The path to the file, e.g., 'src/index.js' or 'src/bot/handlers.js'" }
 			},
-			required: ["file_path", "new_content", "commit_message", "pr_title", "pr_body"]
+			required: ["file_path"]
 		}
 	},
 	async execute(args, env) {
-		if (!env.GITHUB_TOKEN) return { status: "error", message: "GITHUB_TOKEN not found in env." };
-
-		const repo = "romanjeremiah/gemini-bot";
-		const headers = {
-			"Authorization": `Bearer ${env.GITHUB_TOKEN}`,
-			"Accept": "application/vnd.github+json",
-			"User-Agent": "Nightfall-Bot",
-			"X-GitHub-Api-Version": "2022-11-28"
-		};
-
+		const repo = 'romanjeremiah/gemini-bot';
+		if (!env.GITHUB_TOKEN) return { status: 'error', message: 'GITHUB_TOKEN not configured' };
 		try {
-			// 1. Get Main Branch SHA
-			const mainRef = await fetch(`https://api.github.com/repos/${repo}/git/ref/heads/main`, { headers }).then(r => r.json());
-			const branchName = `bot-update-${Date.now()}`;
-
-			// 2. Create New Branch
-			await fetch(`https://api.github.com/repos/${repo}/git/refs`, {
-				method: "POST", headers,
-				body: JSON.stringify({ ref: `refs/heads/${branchName}`, sha: mainRef.object.sha })
+			const res = await fetch(`https://api.github.com/repos/${repo}/contents/${args.file_path}`, {
+				headers: {
+					'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
+					'Accept': 'application/vnd.github.v3.raw',
+					'User-Agent': 'GeminiBot',
+					'X-GitHub-Api-Version': '2022-11-28'
+				}
 			});
-
-			// 3. Get current file SHA (to update it)
-			const fileData = await fetch(`https://api.github.com/repos/${repo}/contents/${args.file_path}`, { headers }).then(r => r.json());
-
-			// 4. Commit Changes
-			const { Buffer } = await import('node:buffer');
-			await fetch(`https://api.github.com/repos/${repo}/contents/${args.file_path}`, {
-				method: "PUT", headers,
-				body: JSON.stringify({
-					message: args.commit_message,
-					content: Buffer.from(args.new_content).toString('base64'),
-					sha: fileData.sha,
-					branch: branchName
-				})
-			});
-
-			// 5. Open Pull Request
-			const pr = await fetch(`https://api.github.com/repos/${repo}/pulls`, {
-				method: "POST", headers,
-				body: JSON.stringify({ title: args.pr_title, body: args.pr_body, head: branchName, base: "main" })
-			}).then(r => r.json());
-
-			return { status: "success", url: pr.html_url };
+			if (!res.ok) return { status: 'error', message: `File not found: ${args.file_path} (${res.status})` };
+			const text = await res.text();
+			return { status: 'success', file: args.file_path, content: text.slice(0, 15000), lines: text.split('\n').length };
 		} catch (e) {
-			return { status: "error", message: e.message };
+			return { status: 'error', message: e.message };
 		}
 	}
 };

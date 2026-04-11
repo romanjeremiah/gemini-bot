@@ -14,6 +14,7 @@ import { saveTherapeuticNoteTool, getTherapeuticNotesTool } from './therapeutic'
 import { logMoodEntryTool, getMoodHistoryTool } from './mood';
 import { fetchTool } from './fetch';
 import { scheduleTool } from './schedule';
+import { githubReadTool } from './github';
 import { githubTool } from './github';
 
 export const toolRegistry = {
@@ -37,6 +38,7 @@ export const toolRegistry = {
 	[getMoodHistoryTool.definition.name]: getMoodHistoryTool,
 	[fetchTool.definition.name]: fetchTool,
 	[scheduleTool.definition.name]: scheduleTool,
+	[githubReadTool.definition.name]: githubReadTool,
 };
 
 export const toolDefinitions = Object.values(toolRegistry).map(t => t.definition);

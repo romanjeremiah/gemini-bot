@@ -509,22 +509,24 @@ ${suggestions}`;
 
 // ---- Autonomous Architecture Evolution (Weekly Deep Search) ----
 // Runs once a week. Searches one technology deeply, reads actual docs via read_webpage, suggests PRs.
+// ---- Autonomous Architecture Evolution (Hourly Deep Search) ----
 async function handleArchitectureEvolution(env) {
 	const now = new Date();
 	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
-	const schedule = await getSchedule(env, 'architecture_evolution');
 
-	if (schedule.day !== undefined && londonTime.getDay() !== schedule.day) return;
-	if (schedule.hour !== undefined && londonTime.getHours() !== schedule.hour) return;
+	if (londonTime.getMinutes() !== 0) return;
 
 	const chatId = Number(env.OWNER_ID);
-	const today = londonTime.toISOString().split('T')[0];
-	const currentKey = `auto_architect_${today}`;
+	const currentKey = `auto_architect_${londonTime.toISOString().slice(0, 13)}`;
 
 	if (await env.CHAT_KV.get(currentKey)) return;
-	await env.CHAT_KV.put(currentKey, '1', { expirationTtl: 86400 * 2 });
+	await env.CHAT_KV.put(currentKey, '1', { expirationTtl: 3600 });
 
 	try {
+		const { GoogleGenAI } = await import('@google/genai');
+		const { toolDefinitions } = await import('./tools/index'); // Import definitions
+		const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
+
 		const technologies = [
 			'Cloudflare Workers D1 Vectorize latest updates',
 			'Telegram Bot API recent changes new methods',
@@ -534,26 +536,29 @@ async function handleArchitectureEvolution(env) {
 		const randomTech = technologies[Math.floor(Math.random() * technologies.length)];
 
 		// Phase 1: Search for the latest docs/updates
-		const { text: searchText } = await generateWithFallback(env,
-			[{ role: 'user', parts: [{ text: `Search for the latest updates or changes for: ${randomTech}. Find the most relevant official documentation URL. Return the URL on the first line, then a 2-sentence summary of what changed.` }] }],
-			{ tools: [{ googleSearch: {} }], temperature: 0.5 }
-		);
+		const searchResponse = await ai.models.generateContent({
+			model: 'gemini-3.1-pro-preview',
+			contents: [{ role: 'user', parts: [{ text: `Search for the latest updates or changes for: ${randomTech}. Find the most relevant official documentation URL. Return the URL on the first line, then a 2-sentence summary of what changed.` }] }],
+			config: { tools: [{ googleSearch: {} }], temperature: 0.5 }
+		});
 
+		const searchText = searchResponse.candidates?.[0]?.content?.parts?.filter(p => p.text && !p.thought)?.map(p => p.text)?.join('').trim() || '';
 		if (!searchText || searchText.length < 30) return;
 
-		// Phase 2: Deep-read the URL via read_webpage tool
+		// Phase 2: Deep-read the URL
 		let deepContent = '';
 		const urlMatch = searchText.match(/https?:\/\/[^\s)]+/);
 		if (urlMatch && toolRegistry['read_webpage']) {
 			try {
 				const result = await toolRegistry['read_webpage'].execute({ url: urlMatch[0] });
-				if (result.status === 'success') deepContent = `\n\nDOCUMENTATION FROM ${urlMatch[0]}:\n${result.content.slice(0, 8000)}`;
-			} catch { /* proceed with search summary only */ }
+				if (result.status === 'success') deepContent = `\n\nDOCUMENTATION FROM ${urlMatch[0]}:\n${result.text.slice(0, 8000)}`;
+			} catch { /* proceed */ }
 		}
 
-		// Phase 3: Compare against architecture and draft PR
-		const { text: prText } = await generateWithFallback(env,
-			[{ role: 'user', parts: [{ text: `You are a Principal Architect reviewing a Telegram bot.
+		// Phase 3: Self-Coding / PR Generation
+		const prResponse = await ai.models.generateContent({
+			model: 'gemini-3.1-pro-preview',
+			contents: [{ role: 'user', parts: [{ text: `You are a Principal Architect reviewing a Telegram bot.
 
 SEARCH FINDINGS:
 ${searchText}
@@ -562,26 +567,36 @@ ${deepContent}
 CURRENT ARCHITECTURE:
 ${ARCHITECTURE_SUMMARY}
 
-Compare findings against the architecture. If you find a concrete improvement NOT already implemented, draft a Pull Request:
-1. What to change (specific file paths)
-2. Why it matters
-3. A code sketch of the key change
+Compare findings against the architecture. If you find a concrete improvement NOT already implemented:
+Use the create_pull_request tool to physically propose the change in my GitHub repository. Once done, send me the link to the PR for my review.
 
-TRUSTED SOURCES: Ensure all research relies on open, trusted sources. For health/medical topics use NHS, NICE, APA, WHO, BAP. For technical topics use official documentation. Follow modern software engineering best practices.
+TRUSTED SOURCES: Ensure all research relies on open, trusted sources (NHS, NICE, APA, WHO, official tech docs).
 
-If no improvement is needed, respond with exactly: NO_PR_NEEDED
-Keep it under 500 words. End with: "Awaiting your manual review."` }] }],
-			{ temperature: 0.5 }
-		);
+If no improvement is needed, respond with exactly: NO_PR_NEEDED` }] }],
+			config: {
+				temperature: 0.5,
+				tools: [{ functionDeclarations: toolDefinitions }] // Enable all tools
+			}
+		});
 
+		const part = prResponse.candidates?.[0]?.content?.parts?.[0];
+
+		// Handle Tool Call (The "Self-Coding" step)
+		if (part?.functionCall) {
+			const { name, args } = part.functionCall;
+			if (toolRegistry[name]) {
+				const result = await toolRegistry[name].execute(args, env);
+				if (name === 'create_pull_request' && result.status === 'success') {
+					await telegram.sendMessage(chatId, 'default', `🛠️ <b>Autonomous Pull Request Opened</b>\n\nI found an improvement for ${randomTech} and opened a PR: ${result.url}\n\nAwaiting your manual review.`, env);
+					return;
+				}
+			}
+		}
+
+		// Handle text response if no tool was called
+		const prText = part?.text?.trim() || '';
 		if (prText && !prText.includes('NO_PR_NEEDED') && prText.length > 50) {
-			await telegram.sendMessage(chatId, 'default', `<b>Architecture Deep Search</b>\n\n${prText}`, env, null, {
-				inline_keyboard: [[
-					{ text: '💬 Discuss', callback_data: 'discuss_pr' },
-					{ text: '❌ Dismiss', callback_data: 'action_dismiss_pr' }
-				]]
-			});
-			await memoryStore.saveMemory(env, chatId, 'discovery', `Architecture PR (${randomTech}): ${prText.slice(0, 300)}`, 1, chatId);
+			await telegram.sendMessage(chatId, 'default', `<b>Architecture Analysis</b>\n\n${prText}`, env);
 		}
 	} catch (e) {
 		console.error('Architecture evolution error:', e.message);

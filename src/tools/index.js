@@ -14,9 +14,12 @@ import { saveTherapeuticNoteTool, getTherapeuticNotesTool } from './therapeutic'
 import { logMoodEntryTool, getMoodHistoryTool } from './mood';
 import { fetchTool } from './fetch';
 import { scheduleTool } from './schedule';
+import { githubTool } from './github';
 
 export const toolRegistry = {
 	[reminderTool.definition.name]: reminderTool,
+	[fetchTool.definition.name]: fetchTool,
+	[githubTool.definition.name]: githubTool,
 	[memoryTool.definition.name]: memoryTool,
 	[reactionTool.definition.name]: reactionTool,
 	[voiceTool.definition.name]: voiceTool,

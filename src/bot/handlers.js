@@ -662,27 +662,15 @@ export async function handleCallback(callbackQuery, env) {
 		} else if (data.startsWith('mood_score_')) {
 			const score = parseInt(data.split('_')[2]);
 			const entry = await moodStore.upsertEntry(env, chatId, today, 'evening', { mood_score: score });
-			console.log(`📊 Evening mood logged: ${score}`);
-
-			const missing = [];
-			if (entry.sleep_hours === null) missing.push('sleep hours and quality');
-			if (!entry.emotions || entry.emotions === '[]' || entry.emotions === 'null') missing.push('specific emotions from the emotions library');
-			if (!entry.activities || entry.activities === '[]' || entry.activities === 'null') missing.push('activities done today');
-
-			let isAskingEmotions = false;
+			log.info('mood_score', { chatId, score });
 
 			if (score <= 1) {
 				contextPrompt = `The user logged their mood as ${score}/10 (severe depression). Respond with deep compassion. Mention Samaritans (116 123) and SHOUT (text 85258). Then gently ask what has been weighing on them.`;
 			} else if (score >= 9) {
 				contextPrompt = `The user logged their mood as ${score}/10 (mania). Acknowledge calmly. Then ask ONE question about their safety or sleep.`;
 			} else {
-				const roadmap = missing.length > 0 ? `Still missing: ${missing.join(', ')}.` : 'All data collected.';
-				if (missing.includes('specific emotions from the emotions library')) {
-					isAskingEmotions = true;
-					contextPrompt = `The user logged their mood as ${score}/10 (${entry.mood_label || 'balanced'}). Acknowledge the score naturally. Then ask them whether they are feeling more positive or negative emotions today, referencing the buttons below.`;
-				} else {
-					contextPrompt = `The user logged their mood as ${score}/10 (${entry.mood_label || 'balanced'}). ${roadmap} Acknowledge the score. Then ask ONE natural conversational question to gather the next piece of journal data.`;
-				}
+				// Normal range: always ask about emotions next
+				contextPrompt = `The user logged their mood as ${score}/10 (${entry.mood_label || 'balanced'}). Acknowledge the score naturally and briefly. Then ask them whether they are feeling more positive or negative emotions today, referencing the buttons below.`;
 			}
 
 			try {
@@ -690,7 +678,8 @@ export async function handleCallback(callbackQuery, env) {
 				const response = await generateShortResponse(contextPrompt, sysPrompt, env);
 				const aiMsg = response || 'Are you feeling more positive or negative right now?';
 
-				const btns = isAskingEmotions ? {
+				// Always show emotion buttons for normal range scores (2-8)
+				const btns = (score >= 2 && score <= 8) ? {
 					inline_keyboard: [[
 						{ text: '☀️ Positive', callback_data: 'mood_cat_positive' },
 						{ text: '🌧 Negative', callback_data: 'mood_cat_negative' }
@@ -705,7 +694,7 @@ export async function handleCallback(callbackQuery, env) {
 				if (hist.length > 24) hist = hist.slice(-24);
 				await env.CHAT_KV.put(histKey, JSON.stringify(hist), { expirationTtl: 604800 });
 			} catch (e) {
-				console.error('Health callback AI error:', e.message, e.stack);
+				log.error('mood_score_response', { msg: e.message });
 			}
 
 		} else if (data.startsWith('mood_cat_')) {

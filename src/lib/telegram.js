@@ -45,6 +45,13 @@ export async function sendMessage(chatId, threadId, text, env, replyId = null, m
 		payload.text = cleanText.replace(/<[^>]*>/g, "");
 		return await tgApi("sendMessage", env, payload);
 	}
+
+	// Cache bot message context for reaction correlation (24h TTL)
+	if (res.ok && res.result?.message_id && text.length > 20) {
+		const plainText = cleanText.replace(/<[^>]*>/g, '').slice(0, 300);
+		env.CHAT_KV.put(`msg_context_${chatId}_${res.result.message_id}`, plainText, { expirationTtl: 86400 }).catch(() => {});
+	}
+
 	return res;
 }
 

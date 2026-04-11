@@ -590,6 +590,42 @@ Keep it under 500 words. End with: "Awaiting your manual review."` }] }],
 	}
 }
 
+// ---- Reaction Feedback Handler ----
+// Processes emoji reactions on bot messages as implicit RLHF feedback.
+async function handleReactionFeedback(reaction, env) {
+	const chatId = reaction.chat.id;
+	const msgId = reaction.message_id;
+	const newReactions = reaction.new_reaction || [];
+
+	if (!newReactions.length) return;
+
+	const emoji = newReactions[0].emoji;
+	if (!emoji) return;
+
+	// Retrieve the context of the message that was reacted to
+	const contextText = await env.CHAT_KV.get(`msg_context_${chatId}_${msgId}`);
+	if (!contextText) return; // Can't correlate reaction without context
+
+	// Only save significant reactions as memories (thumbs, hearts, fire, negative)
+	const significantReactions = {
+		'👍': { sentiment: 'positive', importance: 1 },
+		'❤': { sentiment: 'positive', importance: 2 },
+		'🔥': { sentiment: 'positive', importance: 2 },
+		'👎': { sentiment: 'negative', importance: 2 },
+		'💔': { sentiment: 'negative', importance: 2 },
+		'🤯': { sentiment: 'positive', importance: 1 },
+		'😢': { sentiment: 'negative', importance: 1 },
+		'🤣': { sentiment: 'positive', importance: 1 },
+	};
+
+	const sig = significantReactions[emoji];
+	if (!sig) return; // Ignore casual reactions like 👀 or 🤔
+
+	const feedbackFact = `User reacted ${emoji} (${sig.sentiment}) to: "${contextText.slice(0, 200)}"`;
+	await memoryStore.saveMemory(env, chatId, 'feedback', feedbackFact, sig.importance, chatId);
+	console.log(`✨ Reaction feedback: ${emoji} (${sig.sentiment}) for msg ${msgId}`);
+}
+
 export default {
 	async fetch(request, env, ctx) {
 	  try {
@@ -624,7 +660,11 @@ export default {
 
 		let task;
 
-		if (update.business_connection) {
+		// Handle emoji reactions on bot messages (RLHF feedback)
+		if (update.message_reaction) {
+			task = handleReactionFeedback(update.message_reaction, env);
+		}
+		else if (update.business_connection) {
 			const bc = update.business_connection;
 			const userId = bc.user?.id;
 			console.log("🏢 Business connection:", bc.id, "user:", userId, "enabled:", bc.is_enabled);

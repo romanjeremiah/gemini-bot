@@ -3,6 +3,7 @@
 // Therapeutic: pattern, trigger, avoidance, schema, growth, coping, insight, homework
 // Second Brain: idea, brain_dump
 // Research: discovery (auto-populated by weekly curiosity digest)
+// Feedback: feedback (reaction-based RLHF from user emoji reactions)
 // Health: health, habit, medication, sleep, energy
 // All categories live in the same table — therapeutic ones are distinguished
 // by category name and higher importance_score

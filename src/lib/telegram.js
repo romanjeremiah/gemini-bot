@@ -220,6 +220,7 @@ export async function registerCommands(env) {
 			{ command: "listen", description: "Deep listening mode (brain dump)" },
 			{ command: "done", description: "End listening mode and synthesise" },
 			{ command: "architect", description: "Self-improvement analysis" },
+			{ command: "schedule", description: "View and manage schedules" },
 			{ command: "persona", description: "Switch AI personality" },
 			{ command: "model", description: "Choose AI model (Pro/Flash)" },
 			{ command: "mood", description: "Interactive mood check-in" },

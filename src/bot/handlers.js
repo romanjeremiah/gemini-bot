@@ -10,6 +10,7 @@ import { upsertUser, buildUserIdentity } from '../services/userStore';
 import { generateSpeech } from '../lib/tts';
 import { buildChecklistText } from '../tools/checklist';
 import * as moodStore from '../services/moodStore';
+import { getAllSchedules, setSchedule, resetSchedule } from '../config/schedules';
 
 const HISTORY_LENGTH = 24;
 const HISTORY_TTL = 604800;
@@ -260,6 +261,23 @@ Be specific. Reference actual file paths from the architecture. Only suggest thi
 				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, `⚙️ <b>Architecture Review Failed</b>\n<i>${e.message?.slice(0, 100)}</i>`, env);
 				else await telegram.sendMessage(chatId, threadId, `Architecture review failed: ${e.message?.slice(0, 100)}`, env);
 			}
+			return true;
+		}
+		case "/schedule": {
+			if (!env.OWNER_ID || String(msg.from.id) !== String(env.OWNER_ID)) {
+				await telegram.sendMessage(chatId, threadId, "This command is owner-only.", env);
+				return true;
+			}
+			const schedules = await getAllSchedules(env);
+			let text = '⏰ <b>Current Schedules</b>\n\n';
+			for (const [key, s] of Object.entries(schedules)) {
+				const time = s.hour !== undefined ? `${String(s.hour).padStart(2, '0')}:${String(s.minute || 0).padStart(2, '0')}` : 'every hour';
+				const day = s.day !== undefined ? ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][s.day] : '';
+				const date = s.date !== undefined ? `${s.date}th` : '';
+				text += `• <b>${s.label || key}</b>: ${day}${date} ${time}\n`;
+			}
+			text += '\n<i>To change a schedule, say something like "Move my morning check-in to 10:00" and I will update it.</i>';
+			await telegram.sendMessage(chatId, threadId, text, env);
 			return true;
 		}
 		default: return false;

@@ -9,6 +9,7 @@ import { generateShortResponse } from './lib/ai/gemini';
 import { storeDiscoveredEffect } from './tools/effect';
 import { personas, MENTAL_HEALTH_DIRECTIVE } from './config/personas';
 import { ARCHITECTURE_SUMMARY } from './config/architecture';
+import { getSchedule, matchesSchedule } from './config/schedules';
 import { toolRegistry } from './tools/index';
 
 const BIZ_CONN_TTL = 2592000; // 30 days
@@ -54,8 +55,13 @@ async function handleHealthCheckIns(env) {
 	// Use KV to track if we already sent this check-in today
 	const today = londonTime.toISOString().split('T')[0];
 
-	// Morning: 08:30+
-	if (hour === 8 && minute >= 30) {
+	// Load schedules from KV (with defaults fallback)
+	const morning = await getSchedule(env, 'morning_checkin');
+	const midday = await getSchedule(env, 'midday_checkin');
+	const evening = await getSchedule(env, 'evening_checkin');
+
+	// Morning check-in
+	if (hour === morning.hour && minute >= morning.minute) {
 		const key = `health_checkin_morning_${today}`;
 		if (await env.CHAT_KV.get(key)) return;
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
@@ -78,8 +84,8 @@ async function handleHealthCheckIns(env) {
 		await env.CHAT_KV.put(`nudge_pending_morning_${chatId}`, String(Date.now()), { expirationTtl: 3600 });
 	}
 
-	// Midday: 13:00+
-	else if (hour === 13 && minute >= 0) {
+	// Midday check-in
+	else if (hour === midday.hour && minute >= midday.minute) {
 		const key = `health_checkin_midday_${today}`;
 		if (await env.CHAT_KV.get(key)) return;
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
@@ -102,8 +108,8 @@ async function handleHealthCheckIns(env) {
 		await env.CHAT_KV.put(`nudge_pending_midday_${chatId}`, String(Date.now()), { expirationTtl: 3600 });
 	}
 
-	// Evening: 20:30+
-	else if (hour === 20 && minute >= 30) {
+	// Evening check-in
+	else if (hour === evening.hour && minute >= evening.minute) {
 		const key = `health_checkin_evening_${today}`;
 		if (await env.CHAT_KV.get(key)) return;
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
@@ -171,9 +177,9 @@ async function handleMedicationNudge(env) {
 async function handleWeeklyReport(env) {
 	const now = new Date();
 	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const schedule = await getSchedule(env, 'weekly_report');
 
-	// Only run on Sunday at 20:00+
-	if (londonTime.getDay() !== 0 || londonTime.getHours() !== 20) return;
+	if (londonTime.getDay() !== schedule.day || londonTime.getHours() !== schedule.hour) return;
 
 	const chatId = Number(env.OWNER_ID);
 	const threadId = 'default';
@@ -232,8 +238,9 @@ Do not give advice. Do not prescribe solutions. Present the data, prove your wor
 async function handleAccountabilityNudge(env) {
 	const now = new Date();
 	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const schedule = await getSchedule(env, 'accountability_nudge');
 
-	if (londonTime.getDay() !== 3 || londonTime.getHours() !== 16) return;
+	if (londonTime.getDay() !== schedule.day || londonTime.getHours() !== schedule.hour) return;
 
 	const chatId = Number(env.OWNER_ID);
 	const today = londonTime.toISOString().split('T')[0];
@@ -275,8 +282,9 @@ Keep it to 2-3 sentences. Be warm and curious, not demanding.`;
 async function handleMemoryConsolidation(env) {
 	const now = new Date();
 	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const schedule = await getSchedule(env, 'memory_consolidation');
 
-	if (londonTime.getDate() !== 1 || londonTime.getHours() !== 3) return;
+	if (londonTime.getDate() !== schedule.date || londonTime.getHours() !== schedule.hour) return;
 
 	const chatId = Number(env.OWNER_ID);
 	const month = londonTime.toISOString().split('-').slice(0, 2).join('-');
@@ -345,8 +353,9 @@ Keep it to 1-2 sentences. DO NOT ask a question. DO NOT offer help. DO NOT be a 
 async function handleCuriosityDigest(env) {
 	const now = new Date();
 	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const schedule = await getSchedule(env, 'curiosity_digest');
 
-	if (londonTime.getDay() !== 6 || londonTime.getHours() !== 10) return;
+	if (londonTime.getDay() !== schedule.day || londonTime.getHours() !== schedule.hour) return;
 
 	const chatId = Number(env.OWNER_ID);
 	const today = londonTime.toISOString().split('T')[0];
@@ -408,8 +417,12 @@ async function handleAutonomousResearch(env) {
 	const now = new Date();
 	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
 	const day = londonTime.getDay();
+	const sched1 = await getSchedule(env, 'autonomous_research_1');
+	const sched2 = await getSchedule(env, 'autonomous_research_2');
 
-	if (![2, 5].includes(day) || londonTime.getHours() !== 4) return;
+	const matchDay = (day === sched1.day || day === sched2.day);
+	const matchHour = londonTime.getHours() === sched1.hour;
+	if (!matchDay || !matchHour) return;
 
 	const chatId = Number(env.OWNER_ID);
 	const today = londonTime.toISOString().split('T')[0];
@@ -456,8 +469,9 @@ async function handleAutonomousResearch(env) {
 async function handleSelfImprovement(env) {
 	const now = new Date();
 	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const schedule = await getSchedule(env, 'self_improvement');
 
-	if (londonTime.getDate() !== 15 || londonTime.getHours() !== 5) return;
+	if (londonTime.getDate() !== schedule.date || londonTime.getHours() !== schedule.hour) return;
 
 	const chatId = Number(env.OWNER_ID);
 	const month = londonTime.toISOString().split('-').slice(0, 2).join('-');
@@ -515,22 +529,22 @@ ${suggestions}`;
 	}
 }
 
-// ---- Autonomous Architecture Evolution (Hourly Deep Search) ----
-// Runs every hour. Searches one technology deeply, reads actual docs via read_webpage, suggests PRs.
+// ---- Autonomous Architecture Evolution (Weekly Deep Search) ----
+// Runs once a week. Searches one technology deeply, reads actual docs via read_webpage, suggests PRs.
 async function handleArchitectureEvolution(env) {
 	const now = new Date();
 	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const schedule = await getSchedule(env, 'architecture_evolution');
 
-	// Only trigger at minute 0 of each hour to prevent multi-minute race conditions
-	if (londonTime.getMinutes() !== 0) return;
+	if (schedule.day !== undefined && londonTime.getDay() !== schedule.day) return;
+	if (schedule.hour !== undefined && londonTime.getHours() !== schedule.hour) return;
 
 	const chatId = Number(env.OWNER_ID);
-	const currentKey = `auto_architect_${londonTime.toISOString().slice(0, 13)}`;
+	const today = londonTime.toISOString().split('T')[0];
+	const currentKey = `auto_architect_${today}`;
 
-	// Run exactly once per hour
 	if (await env.CHAT_KV.get(currentKey)) return;
-	// Set the flag IMMEDIATELY before any expensive work to prevent race conditions
-	await env.CHAT_KV.put(currentKey, '1', { expirationTtl: 3600 });
+	await env.CHAT_KV.put(currentKey, '1', { expirationTtl: 86400 * 2 });
 
 	try {
 		const { GoogleGenAI } = await import('@google/genai');

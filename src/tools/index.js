@@ -13,6 +13,7 @@ import { effectTool } from './effect';
 import { saveTherapeuticNoteTool, getTherapeuticNotesTool } from './therapeutic';
 import { logMoodEntryTool, getMoodHistoryTool } from './mood';
 import { fetchTool } from './fetch';
+import { scheduleTool } from './schedule';
 
 export const toolRegistry = {
 	[reminderTool.definition.name]: reminderTool,
@@ -32,6 +33,7 @@ export const toolRegistry = {
 	[logMoodEntryTool.definition.name]: logMoodEntryTool,
 	[getMoodHistoryTool.definition.name]: getMoodHistoryTool,
 	[fetchTool.definition.name]: fetchTool,
+	[scheduleTool.definition.name]: scheduleTool,
 };
 
 export const toolDefinitions = Object.values(toolRegistry).map(t => t.definition);

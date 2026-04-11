@@ -521,11 +521,15 @@ async function handleArchitectureEvolution(env) {
 	const now = new Date();
 	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
 
+	// Only trigger at minute 0 of each hour to prevent multi-minute race conditions
+	if (londonTime.getMinutes() !== 0) return;
+
 	const chatId = Number(env.OWNER_ID);
 	const currentKey = `auto_architect_${londonTime.toISOString().slice(0, 13)}`;
 
 	// Run exactly once per hour
 	if (await env.CHAT_KV.get(currentKey)) return;
+	// Set the flag IMMEDIATELY before any expensive work to prevent race conditions
 	await env.CHAT_KV.put(currentKey, '1', { expirationTtl: 3600 });
 
 	try {

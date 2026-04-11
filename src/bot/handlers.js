@@ -716,31 +716,43 @@ export async function handleCallback(callbackQuery, env) {
 			// Clear nudge flag
 			await env.CHAT_KV.delete(`nudge_pending_evening_${chatId}`);
 
-			// Present the full emotion library as selectable inline buttons
-			const positiveEmotions = ['lively', 'grateful', 'proud', 'calm', 'relaxed', 'energetic', 'motivated', 'empathetic', 'inspired', 'curious', 'satisfied', 'excited', 'brave', 'confident', 'happy', 'joyful', 'carefree'];
+			// Always start with negative emotions first, then positive
 			const negativeEmotions = ['devastated', 'empty', 'frustrated', 'scared', 'angry', 'depressed', 'sad', 'anxious', 'annoyed', 'insecure', 'lonely', 'confused', 'tired', 'bored', 'nervous', 'disappointed', 'lost'];
 
-			const emotions = category === 'positive' ? positiveEmotions : negativeEmotions;
-
-			// Build rows of 3 buttons each
 			const rows = [];
-			for (let i = 0; i < emotions.length; i += 3) {
-				rows.push(emotions.slice(i, i + 3).map(e => ({
+			for (let i = 0; i < negativeEmotions.length; i += 3) {
+				rows.push(negativeEmotions.slice(i, i + 3).map(e => ({
 					text: e, callback_data: `mood_emo_${e}`
 				})));
 			}
-			// Add a "Done" button at the end
-			rows.push([{ text: '✅ Done selecting', callback_data: 'mood_emo_done' }]);
+			rows.push([{ text: '➡️ Next: Positive emotions', callback_data: 'mood_emo_next' }]);
 
-			// Store selected emotions in KV for accumulation
+			// Initialise selection state
 			await env.CHAT_KV.put(`mood_emo_selected_${chatId}`, '[]', { expirationTtl: 3600 });
-			await env.CHAT_KV.put(`mood_emo_category_${chatId}`, category, { expirationTtl: 3600 });
 
 			await telegram.sendMessage(chatId, threadId,
-				`<b>Select all ${category} emotions that resonate today.</b>\nTap each one, then tap ✅ Done when finished.`,
+				`<b>Which negative emotions resonate today?</b>\nTap each one that fits, then tap ➡️ Next.`,
 				env, null, { inline_keyboard: rows });
 
-		} else if (data.startsWith('mood_emo_') && data !== 'mood_emo_done') {
+		} else if (data === 'mood_emo_next') {
+			// User finished negative emotions, now show positive
+			await telegram.editMessageReplyMarkup(chatId, msgId, null, env);
+
+			const positiveEmotions = ['lively', 'grateful', 'proud', 'calm', 'relaxed', 'energetic', 'motivated', 'empathetic', 'inspired', 'curious', 'satisfied', 'excited', 'brave', 'confident', 'happy', 'joyful', 'carefree'];
+
+			const rows = [];
+			for (let i = 0; i < positiveEmotions.length; i += 3) {
+				rows.push(positiveEmotions.slice(i, i + 3).map(e => ({
+					text: e, callback_data: `mood_emo_${e}`
+				})));
+			}
+			rows.push([{ text: '✅ Done selecting', callback_data: 'mood_emo_done' }]);
+
+			await telegram.sendMessage(chatId, threadId,
+				`<b>Now, which positive emotions are also present?</b>\nTap each one, then tap ✅ Done.`,
+				env, null, { inline_keyboard: rows });
+
+		} else if (data.startsWith('mood_emo_') && data !== 'mood_emo_done' && data !== 'mood_emo_next') {
 			// Individual emotion selection - toggle and acknowledge
 			const emotion = data.replace('mood_emo_', '');
 			const selectedStr = await env.CHAT_KV.get(`mood_emo_selected_${chatId}`) || '[]';
@@ -753,7 +765,6 @@ export async function handleCallback(callbackQuery, env) {
 			}
 			await env.CHAT_KV.put(`mood_emo_selected_${chatId}`, JSON.stringify(selected), { expirationTtl: 3600 });
 
-			// Acknowledge with a brief answer callback
 			await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/answerCallbackQuery`, {
 				method: 'POST', headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ callback_query_id: callbackQuery.id, text: selected.includes(emotion) ? `✓ ${emotion}` : `✗ ${emotion} removed`, show_alert: false })
@@ -765,22 +776,28 @@ export async function handleCallback(callbackQuery, env) {
 
 			const selectedStr = await env.CHAT_KV.get(`mood_emo_selected_${chatId}`) || '[]';
 			const selected = JSON.parse(selectedStr);
-			const category = await env.CHAT_KV.get(`mood_emo_category_${chatId}`) || 'mixed';
 
-			// Save emotions to mood journal
+			// Save all emotions to mood journal
 			const today = moodStore.todayLondon();
 			if (selected.length > 0) {
 				await moodStore.upsertEntry(env, chatId, today, 'evening', { emotions: JSON.stringify(selected) });
-				log.info('mood_emotions_logged', { chatId, emotions: selected, category });
+				log.info('mood_emotions_logged', { chatId, emotions: selected });
 			}
 
 			// Clean up KV
 			await env.CHAT_KV.delete(`mood_emo_selected_${chatId}`);
-			await env.CHAT_KV.delete(`mood_emo_category_${chatId}`);
 
-			// Nightfall responds to the selected emotions
-			const emotionList = selected.length > 0 ? selected.join(', ') : 'none selected';
-			const contextPrompt = `The user selected these ${category} emotions: ${emotionList}. Acknowledge their emotional state with empathy. Ask ONE natural follow-up question exploring what is driving these feelings today. Be warm and curious.`;
+			// Separate into positive and negative for Nightfall's context
+			const negativeList = ['devastated', 'empty', 'frustrated', 'scared', 'angry', 'depressed', 'sad', 'anxious', 'annoyed', 'insecure', 'lonely', 'confused', 'tired', 'bored', 'nervous', 'disappointed', 'lost'];
+			const negSelected = selected.filter(e => negativeList.includes(e));
+			const posSelected = selected.filter(e => !negativeList.includes(e));
+
+			const contextPrompt = `The user completed their emotion check-in.
+Negative emotions selected: ${negSelected.length > 0 ? negSelected.join(', ') : 'none'}
+Positive emotions selected: ${posSelected.length > 0 ? posSelected.join(', ') : 'none'}
+Total emotions: ${selected.length}
+
+Respond with empathy. Notice the balance (or imbalance) between positive and negative. Ask ONE natural follow-up question exploring what is driving the dominant emotional theme today. If both positive and negative are present, explore what is creating that tension.`;
 
 			try {
 				const response = await generateShortResponse(contextPrompt, personas.nightfall.instruction, env);
@@ -793,7 +810,7 @@ export async function handleCallback(callbackQuery, env) {
 				await env.CHAT_KV.put(histKey, JSON.stringify(hist), { expirationTtl: 604800 });
 			} catch (e) {
 				log.error('mood_emotion_response', { msg: e.message });
-				await telegram.sendMessage(chatId, threadId, `You selected: ${emotionList}. What has been driving those feelings?`, env);
+				await telegram.sendMessage(chatId, threadId, `You selected: ${selected.join(', ')}. What has been driving those feelings?`, env);
 			}
 		}
 

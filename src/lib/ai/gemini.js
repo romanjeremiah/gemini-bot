@@ -113,7 +113,8 @@ async function getOrCreateCache(personaInstruction, formattingRules, env, model 
   const kvCacheName = await env.CHAT_KV.get(cacheKey);
   if (kvCacheName) {
     try {
-      await getAI(env).caches.get({ name: kvCacheName });
+      // Use direct connection for cache management (Gateway doesn't proxy cache calls)
+      await getAIDirect(env).caches.get({ name: kvCacheName });
       _cacheNames.set(cacheKey, kvCacheName);
       return kvCacheName;
     } catch {
@@ -134,7 +135,8 @@ async function getOrCreateCache(personaInstruction, formattingRules, env, model 
 
   try {
     console.log(`🧊 Creating cache (~${totalEstimatedTokens} estimated tokens) for ${model}...`);
-    const cache = await getAI(env).caches.create({
+    // Use direct connection for cache creation (Gateway doesn't proxy cache management)
+    const cache = await getAIDirect(env).caches.create({
       model,
       config: {
         systemInstruction: staticContent,

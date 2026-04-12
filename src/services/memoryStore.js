@@ -44,10 +44,16 @@ export async function getFormattedContext(env, chatId) {
 
 	const therapeutic = [];
 	const factual = [];
+	const learned = [];
+	const feedback = [];
 
 	for (const m of all) {
 		if (THERAPEUTIC_CATEGORIES.includes(m.category)) {
 			therapeutic.push(m);
+		} else if (m.category === 'discovery' || m.category === 'growth') {
+			learned.push(m);
+		} else if (m.category === 'feedback') {
+			feedback.push(m);
 		} else {
 			factual.push(m);
 		}
@@ -56,7 +62,7 @@ export async function getFormattedContext(env, chatId) {
 	let ctx = "";
 
 	if (factual.length) {
-		ctx += "Facts:\n";
+		ctx += "Facts about the user:\n";
 		for (const m of factual) ctx += `- [${m.category}] ${m.fact}\n`;
 	}
 
@@ -66,6 +72,16 @@ export async function getFormattedContext(env, chatId) {
 			const age = getRelativeAge(m.created_at);
 			ctx += `- [${m.category}] ${m.fact} (${age})\n`;
 		}
+	}
+
+	if (learned.length) {
+		ctx += "\nYour recent independent learning (things you studied or discovered on your own):\n";
+		for (const m of learned.slice(0, 8)) ctx += `- ${m.fact}\n`;
+	}
+
+	if (feedback.length) {
+		ctx += "\nUser reaction feedback (how the user responded to your messages):\n";
+		for (const m of feedback.slice(0, 5)) ctx += `- ${m.fact}\n`;
 	}
 
 	return ctx || "- No facts saved yet.";

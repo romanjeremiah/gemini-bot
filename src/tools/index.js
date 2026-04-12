@@ -14,7 +14,7 @@ import { saveTherapeuticNoteTool, getTherapeuticNotesTool } from './therapeutic'
 import { logMoodEntryTool, getMoodHistoryTool } from './mood';
 import { fetchTool } from './fetch';
 import { scheduleTool } from './schedule';
-import { githubReadTool } from './github';
+import { githubReadTool, githubPatchTool, githubExploreTool } from './github';
 import { cloudflareAdminTool } from './cloudflare';
 
 export const toolRegistry = {
@@ -38,6 +38,8 @@ export const toolRegistry = {
 	[cloudflareAdminTool.definition.name]: cloudflareAdminTool,
 	[scheduleTool.definition.name]: scheduleTool,
 	[githubReadTool.definition.name]: githubReadTool,
+	[githubPatchTool.definition.name]: githubPatchTool,
+	[githubExploreTool.definition.name]: githubExploreTool,
 };
 
 export const toolDefinitions = Object.values(toolRegistry).map(t => t.definition);

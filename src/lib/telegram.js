@@ -14,6 +14,37 @@ async function tgApi(method, env, payload) {
 	return data;
 }
 
+/**
+ * Create a date_time entity for Telegram messages.
+ * Renders the timestamp in the user's local timezone.
+ * @param {number} offset - Character offset in the message text
+ * @param {number} length - Length of the placeholder text
+ * @param {number} unixTime - Unix timestamp (seconds)
+ * @param {string} format - One of: 'wDT' (weekday+date+time), 'DT' (date+time), 'D' (date), 'T' (time), 'wD' (weekday+date), 't' (relative time), 'r' (relative), 'dT' (short date+time)
+ * @returns {object} MessageEntity object
+ */
+export function dateTimeEntity(offset, length, unixTime, format = 'DT') {
+	return { type: 'date_time', offset, length, unix_time: unixTime, date_time_format: format };
+}
+
+/**
+ * Build a message text with an embedded date_time placeholder.
+ * Returns { text, entities } ready for sendMessage.
+ * @param {string} before - Text before the timestamp
+ * @param {number} unixTime - Unix timestamp (seconds)
+ * @param {string} after - Text after the timestamp
+ * @param {string} format - date_time format string
+ * @returns {{ text: string, entities: object[] }}
+ */
+export function buildDateTimeMessage(before, unixTime, after = '', format = 'DT') {
+	// The placeholder text is what users on old clients see
+	const date = new Date(unixTime * 1000);
+	const placeholder = date.toLocaleString('en-GB', { timeZone: 'Europe/London', dateStyle: 'medium', timeStyle: 'short' });
+	const text = `${before}${placeholder}${after}`;
+	const entity = dateTimeEntity(before.length, placeholder.length, unixTime, format);
+	return { text, entities: [entity] };
+}
+
 // ---- Send text message ----
 export async function sendMessage(chatId, threadId, text, env, replyId = null, markup = null, effectId = null, quote = null) {
 	const cleanText = sanitizeTelegramHTML(text);
@@ -53,6 +84,21 @@ export async function sendMessage(chatId, threadId, text, env, replyId = null, m
 	}
 
 	return res;
+}
+
+// ---- Send Message with Entities (for date_time, custom_emoji, etc.) ----
+// Uses the entities array instead of parse_mode. Pass pre-built entities from buildDateTimeMessage.
+export async function sendMessageWithEntities(chatId, threadId, text, entities, env, replyId = null, markup = null) {
+	const payload = {
+		chat_id: chatId,
+		text,
+		entities,
+		link_preview_options: { is_disabled: true }
+	};
+	if (threadId && threadId !== "default") payload.message_thread_id = Number(threadId);
+	if (replyId) payload.reply_parameters = { message_id: replyId, allow_sending_without_reply: true };
+	if (markup) payload.reply_markup = markup;
+	return await tgApi("sendMessage", env, payload);
 }
 
 // ---- Send Message Draft (Bot API 9.3+, all bots since 9.5) ----

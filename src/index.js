@@ -933,15 +933,16 @@ export default {
 			const reason = meta.reason || "Scheduled task";
 
 			const isGroup = r.recipient_chat_id !== r.creator_chat_id;
-			// noinspection HtmlUnknownAttribute
-			let reminderText = `⏰ <b>Reminder:</b> ${r.text}\n\n<blockquote expandable>Context: ${reason}</blockquote>`;
-			if (isGroup) {
-				reminderText = `⏰ <b>${firstName}</b>, reminder: ${r.text}\n\n<blockquote expandable>Context: ${reason}</blockquote>`;
-			}
 
-			const personaKey = meta.persona || await env.CHAT_KV.get(`persona_${r.creator_chat_id}`) || "tenon";
+			// Build reminder with native date_time entity for timezone-aware display
+			const prefix = isGroup ? `⏰ ${firstName}, reminder: ` : '⏰ Reminder: ';
+			const { text: dtText, entities } = telegram.buildDateTimeMessage(
+				`${prefix}${r.text}\nScheduled for: `, r.due_at, `\n\nContext: ${reason}`, 'DT'
+			);
+
+			const personaKey = meta.persona || await env.CHAT_KV.get(`persona_${r.creator_chat_id}`) || 'xaridotis';
 			await Promise.all([
-				telegram.sendMessage(r.recipient_chat_id, threadId, reminderText, env, r.original_message_id),
+				telegram.sendMessageWithEntities(r.recipient_chat_id, threadId, dtText, entities, env, r.original_message_id),
 				generateSpeech(r.text, personaKey, env)
 					.then(audio => telegram.sendVoice(r.recipient_chat_id, threadId, audio, env, r.original_message_id))
 					.catch(e => console.error("Cron voice error:", e.message))

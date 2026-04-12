@@ -33,6 +33,10 @@ export const reminderTool = {
 				createdAt: Math.floor(Date.now() / 1000)
 			}
 		});
-		return { status: "success", scheduled_at_utc: args.due_at_timestamp };
+		return {
+			status: "success",
+			scheduled_at_utc: args.due_at_timestamp,
+			display_hint: `Use this in your confirmation message to show the time in the user's timezone: include the text "Scheduled for: [time]" and the system will render it natively.`
+		};
 	}
 };

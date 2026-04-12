@@ -106,18 +106,11 @@ async function handleCommand(command, msg, env) {
 	const chatId = msg.chat.id, threadId = msg.message_thread_id || "default";
 	switch (command) {
 		case "/start": {
-			const pKey = getPersona(await env.CHAT_KV.get(`persona_${chatId}_${threadId}`));
-			await telegram.sendMessage(chatId, threadId, `👋 Welcome. You are currently talking to <b>${personas[pKey].name}</b>.\n\nSend a message, voice note, photo, or document to begin.\n\n<b>Commands:</b>\n/persona — Choose who to talk to\n/mood — Interactive mood check-in\n/memories — View saved facts\n/clear — Fresh start\n/forget — Delete all memories`, env);
+			await telegram.sendMessage(chatId, threadId, `Hey. I am <b>Xaridotis</b>.\n\nSend a message, voice note, photo, or document to begin.\n\n<b>Commands:</b>\n/mood — Interactive mood check-in\n/listen — Deep listening mode\n/architect — Architecture review\n/schedule — View schedules\n/memories — View saved facts\n/clear — Fresh start\n/forget — Delete all memories`, env);
 			return true;
 		}
 		case "/persona":
-			await telegram.sendMessage(chatId, threadId, "Who would you like to speak with?", env, null, {
-				inline_keyboard: [[
-					{ text: "🎯 Tenon", callback_data: "set_persona_tenon" },
-					{ text: "🌙 Nightfall", callback_data: "set_persona_nightfall" },
-					{ text: "✨ Tribore", callback_data: "set_persona_tribore" }
-				]]
-			});
+			await telegram.sendMessage(chatId, threadId, "You are talking to <b>Xaridotis</b>. I adapt my tone naturally based on the conversation. No switching needed.\n\nIf you want to explicitly set a tone, just tell me: \"be direct\" or \"be gentle\".", env);
 			return true;
 		case "/clear":
 			await env.CHAT_KV.delete(`chat_${chatId}_${threadId}`);
@@ -188,7 +181,7 @@ async function handleCommand(command, msg, env) {
 		case "/mood": {
 			await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 7200 });
 			await telegram.sendMessage(chatId, threadId,
-				`<b>Nightfall here.</b> Let's do a mood check.\n\nWhere would you place yourself on the scale right now?\n\n🔴 <b>0-1: Severe Depression</b>\n<i>(Bleak, hopeless)</i>\n\n🟠 <b>2-3: Mild/Moderate</b>\n<i>(Struggle, anxious)</i>\n\n🟢 <b>4-6: Balanced</b>\n<i>(Optimistic, sociable)</i>\n\n🟡 <b>7-8: Hypomania</b>\n<i>(Productive, racing)</i>\n\n🔴 <b>9-10: Mania</b>\n<i>(Reckless, delusions)</i>`,
+				`<b>Mood check.</b>\n\nWhere would you place yourself on the scale right now?\n\n🔴 <b>0-1: Severe Depression</b>\n<i>(Bleak, hopeless)</i>\n\n🟠 <b>2-3: Mild/Moderate</b>\n<i>(Struggle, anxious)</i>\n\n🟢 <b>4-6: Balanced</b>\n<i>(Optimistic, sociable)</i>\n\n🟡 <b>7-8: Hypomania</b>\n<i>(Productive, racing)</i>\n\n🔴 <b>9-10: Mania</b>\n<i>(Reckless, delusions)</i>`,
 				env, null, {
 					inline_keyboard: [
 						[{ text: '🔴 0-1', callback_data: 'mood_score_1' }, { text: '🟠 2-3', callback_data: 'mood_score_3' }],
@@ -341,9 +334,9 @@ export async function handleMessage(msg, env) {
 		const modelOverride = await env.CHAT_KV.get(`model_override_${chatId}_${threadId}`);
 		const textModel = modelOverride || (isOwner ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL);
 
-		// Health check-in auto-switch: if a health check-in is active, override to Nightfall
+		// Unified persona: Xaridotis handles all tones naturally
 		const healthCheckin = isOwner ? await env.CHAT_KV.get(`health_checkin_active_${chatId}`) : null;
-		const effectivePersona = healthCheckin ? 'nightfall' : activePersona;
+		const effectivePersona = 'xaridotis';
 
 		// Build dynamic journal roadmap for evening check-ins
 		let checkinProgress = '';
@@ -673,7 +666,7 @@ export async function handleCallback(callbackQuery, env) {
 			}
 
 			try {
-				const sysPrompt = personas.nightfall.instruction;
+				const sysPrompt = personas.xaridotis.instruction;
 				const response = await generateShortResponse(contextPrompt, sysPrompt, env);
 				const aiMsg = response || 'Tap below to tell me about your emotions today.';
 				log.info('mood_score_response_ready', { chatId, score, hasResponse: !!response, showButtons: score >= 2 && score <= 8 });
@@ -816,7 +809,7 @@ Then ask: "Would you like to talk about any of this now, or shall we pick it up 
 Be human. Be warm. No clinical jargon. 2-4 sentences max.`;
 
 			try {
-				const response = await generateShortResponse(contextPrompt, personas.nightfall.instruction, env);
+				const response = await generateShortResponse(contextPrompt, personas.xaridotis.instruction, env);
 				await telegram.sendMessage(chatId, threadId, response || `Thank you for sharing. What has been driving those feelings today?`, env);
 
 				const histKey = `chat_${chatId}_${threadId}`;
@@ -833,7 +826,7 @@ Be human. Be warm. No clinical jargon. 2-4 sentences max.`;
 		// Generate dynamic response for MEDICATION callbacks only (mood_score and mood_cat handle their own)
 		if (data.startsWith('mood_med_') && contextPrompt) {
 			try {
-				const sysPrompt = personas.nightfall.instruction;
+				const sysPrompt = personas.xaridotis.instruction;
 				const response = await generateShortResponse(contextPrompt, sysPrompt, env);
 				const aiMsg = response || 'How are you feeling right now?';
 				await telegram.sendMessage(chatId, threadId, aiMsg, env);

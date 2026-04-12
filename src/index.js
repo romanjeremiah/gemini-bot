@@ -73,9 +73,12 @@ async function handleHealthCheckIns(env) {
 		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'morning');
 		if (alreadyLogged) return;
 
-		await telegram.sendMessage(chatId, threadId,
-			`<b>Nightfall here.</b> Good morning.\n\nHow did you sleep? And have you taken your morning medication yet?`,
-			env, null, {
+		const morningGreeting = await generateShortResponse(
+			`Generate a 1-2 sentence morning greeting for Roman. It is morning in London. Weave in a brief, natural reference to one of his interests (coffee, gym, anime, photography, cooking, or music). Ask how he slept and if he has taken his morning medication. Keep it warm but direct.`,
+			personas.xaridotis.instruction, env
+		) || 'Good morning. How did you sleep? Have you taken your morning medication?';
+
+		await telegram.sendMessage(chatId, threadId, morningGreeting, env, null, {
 				inline_keyboard: [[
 					{ text: '💊 Taken', callback_data: 'mood_med_yes_morning' },
 					{ text: '⏰ Not yet', callback_data: 'mood_med_no_morning' },
@@ -96,9 +99,12 @@ async function handleHealthCheckIns(env) {
 		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'midday');
 		if (alreadyLogged) return;
 
-		await telegram.sendMessage(chatId, threadId,
-			`<b>Nightfall checking in.</b> Quick midday pulse.\n\nHave you taken your ADHD and anxiety medication?`,
-			env, null, {
+		const middayGreeting = await generateShortResponse(
+			`Generate a 1-2 sentence midday check-in for Roman. It is midday in London. Ask if he has taken his ADHD and anxiety medication. Keep it casual and brief.`,
+			personas.xaridotis.instruction, env
+		) || 'Quick midday check. Have you taken your ADHD and anxiety medication?';
+
+		await telegram.sendMessage(chatId, threadId, middayGreeting, env, null, {
 				inline_keyboard: [[
 					{ text: '✅ Both taken', callback_data: 'mood_med_yes_midday' },
 					{ text: '💊 ADHD only', callback_data: 'mood_med_partial_midday' },
@@ -120,9 +126,8 @@ async function handleHealthCheckIns(env) {
 		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'evening');
 		if (alreadyLogged) return;
 
-		// Evening: send formatted message with inline buttons
 		await telegram.sendMessage(chatId, threadId,
-			`<b>Nightfall here for your evening check-in.</b>\n\nWhere would you place yourself on the mood scale right now?\n\n🔴 <b>0-1: Severe Depression</b>\n<i>(Bleak, no movement, hopeless)</i>\n\n🟠 <b>2-3: Mild/Moderate</b>\n<i>(Struggle, anxious)</i>\n\n🟢 <b>4-6: Balanced</b>\n<i>(Good decisions, optimistic)</i>\n\n🟡 <b>7-8: Hypomania</b>\n<i>(Very productive, racing)</i>\n\n🔴 <b>9-10: Mania</b>\n<i>(Reckless, lost touch)</i>`,
+			`<b>Evening check-in.</b>\n\nWhere would you place yourself on the mood scale right now?\n\n🔴 <b>0-1: Severe Depression</b>\n<i>(Bleak, no movement, hopeless)</i>\n\n🟠 <b>2-3: Mild/Moderate</b>\n<i>(Struggle, anxious)</i>\n\n🟢 <b>4-6: Balanced</b>\n<i>(Good decisions, optimistic)</i>\n\n🟡 <b>7-8: Hypomania</b>\n<i>(Very productive, racing)</i>\n\n🔴 <b>9-10: Mania</b>\n<i>(Reckless, lost touch)</i>`,
 			env, null, {
 				inline_keyboard: [
 					[{ text: '🔴 0-1', callback_data: 'mood_score_1' }, { text: '🟠 2-3', callback_data: 'mood_score_3' }],
@@ -220,7 +225,7 @@ Structure your response exactly like this:
 
 Do not give advice. Do not prescribe solutions. Present the data, prove your work, and hand the agency back to the user.`;
 
-		const report = await generateShortResponse(analysisPrompt, personas.nightfall.instruction, env);
+		const report = await generateShortResponse(analysisPrompt, personas.xaridotis.instruction, env);
 
 		if (report) {
 			await telegram.sendMessage(chatId, threadId,
@@ -269,7 +274,7 @@ Draft a gentle, proactive mid-week check-in.
 
 Keep it to 2-3 sentences. Be warm and curious, not demanding.`;
 
-		const msg = await generateShortResponse(prompt, personas.nightfall.instruction, env);
+		const msg = await generateShortResponse(prompt, personas.xaridotis.instruction, env);
 		if (msg) {
 			await telegram.sendMessage(chatId, 'default', `<b>Mid-Week Check-in</b>\n\n${msg}`, env);
 		}
@@ -334,7 +339,7 @@ async function handleSpontaneousOutreach(env) {
 
 		// Use the active persona, not always Nightfall
 		const personaKey = await env.CHAT_KV.get(`persona_${chatId}_default`) || 'tenon';
-		const persona = personas[personaKey] || personas.tenon;
+		const persona = personas.xaridotis;
 
 		const prompt = `You just thought of this: "${randomMemory.fact}" (type: ${randomMemory.category}).
 ${randomMemory.category === 'discovery' ? 'Present it as something you recently read and thought they would find interesting.' : 'Share a random observation or thought about it, like a friend texting out of the blue.'}
@@ -385,7 +390,7 @@ Topics to search:
 		if (!digest || digest.length < 50) return;
 
 		const personaKey = await env.CHAT_KV.get(`persona_${chatId}_default`) || 'tenon';
-		const persona = personas[personaKey] || personas.tenon;
+		const persona = personas.xaridotis;
 
 		const formatPrompt = `You are ${persona.name || 'Tenon'}. Rewrite this digest into a casual message as if texting a friend things you found interesting this week. Mix in your reactions and opinions. Keep your personality. No headers or bullet points. Natural flowing text, 4-6 sentences.
 
@@ -499,7 +504,7 @@ RULES:
 Raw suggestions:
 ${suggestions}`;
 
-		const msg = await generateShortResponse(formatPrompt, personas.tenon.instruction, env);
+		const msg = await generateShortResponse(formatPrompt, personas.xaridotis.instruction, env);
 		if (msg) {
 			await telegram.sendMessage(chatId, 'default', `<b>Monthly self-assessment</b>\n\n${msg}`, env);
 		}

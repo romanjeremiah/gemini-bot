@@ -3,10 +3,11 @@
  */
 export async function generateSpeech(text, personaKey, env) {
 	const voices = {
-		tenon:    "en-US-Chirp3-HD-Zubenelgenubi",
+		xaridotis: "en-US-Chirp3-HD-Gacrux",
+		tenon:     "en-US-Chirp3-HD-Gacrux",
 		nightfall: "en-US-Chirp3-HD-Gacrux",
-		tribore:  "en-US-Chirp3-HD-Sadachbia",
-		default:  "en-US-Chirp3-HD-Gacrux"
+		tribore:   "en-US-Chirp3-HD-Gacrux",
+		default:   "en-US-Chirp3-HD-Gacrux"
 	};
 
 	const url = `https://texttospeech.googleapis.com/v1/text:synthesize?key=${env.GCP_TTS_API_KEY}`;

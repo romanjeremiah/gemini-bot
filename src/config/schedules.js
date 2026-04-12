@@ -15,6 +15,7 @@ export const DEFAULT_SCHEDULES = {
 	self_improvement: { date: 15, hour: 5, label: 'Self-improvement (15th)' },
 	memory_consolidation: { date: 1, hour: 3, label: 'REM sleep (1st)' },
 	architecture_evolution: { day: 1, hour: 4, label: 'Architecture review (Monday)' },
+	daily_study: { hour: 6, minute: 0, label: 'Daily study session' },
 };
 
 /**

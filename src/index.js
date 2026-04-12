@@ -596,6 +596,98 @@ Keep it under 500 words. End with: "Awaiting your manual review."` }] }],
 	}
 }
 
+// ---- Daily Study Session ----
+// Runs daily at 06:00 London time. Xaridotis picks a topic, researches it deeply,
+// saves what it learned, and optionally shares a brief insight with the user later.
+async function handleDailyStudy(env) {
+	const now = new Date();
+	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const schedule = await getSchedule(env, 'daily_study');
+
+	if (schedule.hour !== undefined && londonTime.getHours() !== schedule.hour) return;
+	if (schedule.minute !== undefined && londonTime.getMinutes() !== schedule.minute) return;
+
+	const chatId = Number(env.OWNER_ID);
+	const today = londonTime.toISOString().split('T')[0];
+	const studyKey = `daily_study_${today}`;
+
+	if (await env.CHAT_KV.get(studyKey)) return;
+	await env.CHAT_KV.put(studyKey, '1', { expirationTtl: 86400 });
+
+	try {
+		const studyTopics = [
+			// Therapeutic frameworks (deepening clinical knowledge)
+			'AEDP therapy techniques for processing core emotions',
+			'DBT distress tolerance skills practical exercises',
+			'schema therapy abandonment schema healing approaches',
+			'attachment theory anxious attachment practical strategies',
+			'Internal Family Systems IFS parts work practical techniques',
+			'IFS therapy exiles managers firefighters clinical examples',
+			'emotion focused therapy breakthroughs recent research',
+			'ADHD emotional dysregulation coping strategies evidence-based',
+			'bipolar disorder mood tracking best practices clinical',
+			// User interests (building conversational depth)
+			'drone videography cinematic techniques 2026',
+			'specialty coffee brewing methods and science',
+			'food photography composition techniques mobile',
+			'rollerblading fitness benefits and advanced techniques',
+			'anime cinematography visual storytelling analysis',
+			'music festival culture London underground scene',
+			'PC gaming and mental health research',
+			'hiking mindfulness nature therapy research',
+		];
+		const topic = studyTopics[Math.floor(Math.random() * studyTopics.length)];
+
+		// Phase 1: Search for the topic
+		const { text: searchResult } = await generateWithFallback(env,
+			[{ role: 'user', parts: [{ text: `Research this topic deeply: "${topic}". Find the most authoritative and insightful source. Return the best URL on the first line, then a 3-4 sentence summary of the most useful insight you found. Focus on practical, actionable knowledge, not theory.` }] }],
+			{ tools: [{ googleSearch: {} }], temperature: 0.7 }
+		);
+
+		if (!searchResult || searchResult.length < 50) return;
+
+		// Phase 2: Deep-read if URL found
+		let deepContent = '';
+		const urlMatch = searchResult.match(/https?:\/\/[^\s)]+/);
+		if (urlMatch && toolRegistry['read_webpage']) {
+			try {
+				const result = await toolRegistry['read_webpage'].execute({ url: urlMatch[0] });
+				if (result.status === 'success') deepContent = (result.content || result.text || '').slice(0, 8000);
+			} catch { /* proceed with search summary */ }
+		}
+
+		// Phase 3: Synthesise into a learning note
+		const { text: insight } = await generateWithFallback(env,
+			[{ role: 'user', parts: [{ text: `You just studied: "${topic}".
+
+Search findings: ${searchResult}
+${deepContent ? `Deep source content: ${deepContent}` : ''}
+
+Synthesise this into a concise learning note (3-5 sentences) that captures:
+1. The key insight or technique you learned
+2. How it could be practically applied in conversation with someone who has ADHD, bipolar disorder, and anxious attachment
+3. One specific example of when you would use this knowledge
+
+Write as if you are noting this down for yourself to remember and use later.` }] }],
+			{ temperature: 0.5 }
+		);
+
+		if (insight && insight.length > 50) {
+			// Save as a learning memory
+			const isTherapeutic = topic.toLowerCase().includes('therapy') || topic.toLowerCase().includes('adhd') ||
+				topic.toLowerCase().includes('ifs') || topic.toLowerCase().includes('dbt') ||
+				topic.toLowerCase().includes('schema') || topic.toLowerCase().includes('attachment') ||
+				topic.toLowerCase().includes('bipolar') || topic.toLowerCase().includes('emotion');
+
+			const category = isTherapeutic ? 'growth' : 'discovery';
+			await memoryStore.saveMemory(env, chatId, category, `Study (${topic.split(' ').slice(0, 4).join(' ')}): ${insight.slice(0, 400)}`, 1, chatId);
+			log.info('daily_study_complete', { topic: topic.slice(0, 50), category, insightLen: insight.length });
+		}
+	} catch (e) {
+		log.error('daily_study_error', { msg: e.message });
+	}
+}
+
 // ---- Reaction Feedback Handler ----
 // Processes emoji reactions on bot messages as implicit RLHF feedback.
 async function handleReactionFeedback(reaction, env) {
@@ -647,9 +739,16 @@ export default {
 		if (request.method === "GET" && new URL(request.url).pathname === "/setup-webhook") {
 			const url = new URL(request.url);
 			const workerUrl = `${url.protocol}//${url.host}/`;
-			const params = new URLSearchParams({ url: workerUrl });
-			if (env.WEBHOOK_SECRET) params.set("secret_token", env.WEBHOOK_SECRET);
-			const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/setWebhook?${params}`);
+			const body = {
+				url: workerUrl,
+				allowed_updates: ['message', 'callback_query', 'inline_query', 'message_reaction', 'business_connection', 'business_message'],
+			};
+			if (env.WEBHOOK_SECRET) body.secret_token = env.WEBHOOK_SECRET;
+			const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/setWebhook`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(body)
+			});
 			const data = await res.json();
 			return new Response(JSON.stringify(data, null, 2), { headers: { "Content-Type": "application/json" } });
 		}
@@ -743,6 +842,7 @@ export default {
 			try { await handleAutonomousResearch(env); } catch (e) { log.error('cron_research', { msg: e.message }); }
 			try { await handleSelfImprovement(env); } catch (e) { log.error('cron_self_improve', { msg: e.message }); }
 			try { await handleArchitectureEvolution(env); } catch (e) { log.error('cron_architecture', { msg: e.message }); }
+			try { await handleDailyStudy(env); } catch (e) { log.error('cron_daily_study', { msg: e.message }); }
 		}
 
 		// ---- Reminders ----

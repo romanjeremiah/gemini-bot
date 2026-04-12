@@ -330,27 +330,51 @@ async function handleSpontaneousOutreach(env) {
 	await env.CHAT_KV.put(outreachKey, '1', { expirationTtl: 86400 });
 
 	try {
-		// Pull memories but filter out heavy clinical/trauma content
+		// Pull memories with a mix of types for contextual check-ins
 		const allMemories = await memoryStore.getMemories(env, chatId, 50);
-		const casualMemories = allMemories.filter(m => !['pattern', 'schema', 'trigger', 'avoidance', 'insight'].includes(m.category));
+		const casualMemories = allMemories.filter(m => !['pattern', 'schema', 'trigger', 'avoidance'].includes(m.category));
 		if (!casualMemories.length) return;
 
-		const randomMemory = casualMemories[Math.floor(Math.random() * casualMemories.length)];
+		// Prefer recent implicit observations and discoveries for natural check-ins
+		const implicit = casualMemories.filter(m => m.fact?.startsWith('Implicit:'));
+		const discoveries = casualMemories.filter(m => m.category === 'discovery');
+		const ideas = casualMemories.filter(m => m.category === 'idea' || m.category === 'brain_dump');
+		const homework = allMemories.filter(m => m.category === 'homework');
 
-		// Use the active persona, not always Nightfall
-		const personaKey = await env.CHAT_KV.get(`persona_${chatId}_default`) || 'tenon';
-		const persona = personas.xaridotis;
+		// Pick the most contextually interesting memory
+		let chosenMemory;
+		const roll = Math.random();
+		if (homework.length > 0 && roll < 0.2) {
+			// 20% chance: follow up on homework/goals
+			chosenMemory = homework[Math.floor(Math.random() * homework.length)];
+		} else if (implicit.length > 0 && roll < 0.5) {
+			// 30% chance: reference something observed implicitly
+			chosenMemory = implicit[Math.floor(Math.random() * implicit.length)];
+		} else if (discoveries.length > 0 && roll < 0.75) {
+			// 25% chance: share something learned during study
+			chosenMemory = discoveries[Math.floor(Math.random() * discoveries.length)];
+		} else {
+			// 25% chance: random casual memory
+			chosenMemory = casualMemories[Math.floor(Math.random() * casualMemories.length)];
+		}
 
-		const prompt = `You just thought of this: "${randomMemory.fact}" (type: ${randomMemory.category}).
-${randomMemory.category === 'discovery' ? 'Present it as something you recently read and thought they would find interesting.' : 'Share a random observation or thought about it, like a friend texting out of the blue.'}
-Keep it to 1-2 sentences. DO NOT ask a question. DO NOT offer help. DO NOT be a therapist. Just share it naturally.`;
+		const isFollowUp = chosenMemory.category === 'homework' || chosenMemory.fact?.startsWith('Implicit:');
 
-		const msg = await generateShortResponse(prompt, persona.instruction, env);
+		const prompt = isFollowUp
+			? `You remembered this about Roman: "${chosenMemory.fact}".
+Send a natural, casual check-in based on this. Like a friend who remembered something and is following up.
+Examples of tone: "How did that thing go?" or "Been thinking about what you said about..." or "Did you end up doing that?"
+Keep it to 1-2 sentences. Be warm but not pushy.`
+			: `You just thought of this: "${chosenMemory.fact}" (type: ${chosenMemory.category}).
+${chosenMemory.category === 'discovery' ? 'Present it as something you recently read and thought they would find interesting.' : 'Share a random observation or thought about it, like a friend texting out of the blue.'}
+Keep it to 1-2 sentences. DO NOT offer help. DO NOT be a therapist. Just share it naturally.`;
+
+		const msg = await generateShortResponse(prompt, personas.xaridotis.instruction, env);
 		if (msg) {
 			await telegram.sendMessage(chatId, 'default', msg, env);
 		}
 	} catch (e) {
-		console.error('Spontaneous outreach error:', e.message);
+		log.error('spontaneous_outreach_error', { msg: e.message });
 	}
 }
 

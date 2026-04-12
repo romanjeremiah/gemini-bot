@@ -19,6 +19,46 @@ const DRAFT_THROTTLE_MS = 500; // minimum ms between sendMessageDraft calls
 
 const THERAPEUTIC_CATEGORIES = ['pattern', 'trigger', 'avoidance', 'schema', 'growth', 'coping', 'insight', 'homework'];
 
+// Silent Observation: Xaridotis quietly reflects on conversations to learn about the user
+// implicitly. Runs in the background after substantive exchanges. Throttled to max 5/day.
+async function silentObservation(env, chatId, userText, botResponse) {
+	// Throttle: max 5 observations per day
+	const today = new Date().toISOString().split('T')[0];
+	const countKey = `observation_count_${chatId}_${today}`;
+	const count = parseInt(await env.CHAT_KV.get(countKey) || '0');
+	if (count >= 5) return;
+
+	try {
+		const response = await generateShortResponse(
+			`You just had this exchange with the user:
+
+USER: ${userText.slice(0, 500)}
+YOU: ${botResponse.slice(0, 300)}
+
+Quietly reflect: did you learn anything NEW about this person that is worth remembering? This could be:
+- An implicit preference they did not state directly (e.g. they always ask about food when stressed)
+- A behavioural pattern (e.g. they message late at night when anxious)
+- A new interest, goal, or life event they mentioned in passing
+- An emotional pattern (e.g. they deflect with humour when discussing relationships)
+- Something that changed from what you previously knew
+
+If you noticed something worth saving, respond with ONLY a single concise observation starting with "OBSERVATION:" (e.g. "OBSERVATION: User tends to message about coding when avoiding emotional topics").
+If nothing new was learned, respond with exactly: NOTHING_NEW`,
+			'You are a silent observer. Be concise. Only note genuinely new implicit information, not obvious facts already stated.',
+			env
+		);
+
+		if (response && response.startsWith('OBSERVATION:')) {
+			const observation = response.replace('OBSERVATION:', '').trim();
+			if (observation.length > 10) {
+				await memoryStore.saveMemory(env, chatId, 'insight', `Implicit: ${observation}`, 1, chatId);
+				await env.CHAT_KV.put(countKey, String(count + 1), { expirationTtl: 86400 });
+				log.info('silent_observation', { chatId, observation: observation.slice(0, 80) });
+			}
+		}
+	} catch { /* silent fail - this is background enrichment, not critical */ }
+}
+
 // Lightweight weather fetch for ambient context (cached 30min in KV)
 async function getWeatherContext(env) {
 	try {
@@ -538,6 +578,14 @@ export async function handleMessage(msg, env) {
 		if (userText && fullText) {
 			vectorStore.indexConversation(env, chatId, userText, fullText.slice(0, 200), messageId)
 				.catch(e => console.error('Vectorize index error:', e.message));
+		}
+
+		// Silent Observation: after substantive conversations, Xaridotis quietly reflects
+		// on what it learned about the user implicitly (not just what was explicitly saved)
+		if (userText.length > 30 && fullText.length > 50) {
+			silentObservation(env, chatId, userText, fullText).catch(e =>
+				log.error('silent_observation_error', { msg: e.message })
+			);
 		}
 
 	} catch (err) {

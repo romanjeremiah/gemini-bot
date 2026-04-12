@@ -669,14 +669,14 @@ export async function handleCallback(callbackQuery, env) {
 			} else if (score >= 9) {
 				contextPrompt = `The user logged their mood as ${score}/10 (mania). Acknowledge calmly. Then ask ONE question about their safety or sleep.`;
 			} else {
-				// Normal range: always ask about emotions next
-				contextPrompt = `The user logged their mood as ${score}/10 (${entry.mood_label || 'balanced'}). Acknowledge the score naturally and briefly. Then ask them whether they are feeling more positive or negative emotions today, referencing the buttons below.`;
+				contextPrompt = `The user logged their mood as ${score}/10 (${entry.mood_label || 'balanced'}). Acknowledge the score naturally and briefly. Then tell them to tap one of the buttons below to start logging emotions.`;
 			}
 
 			try {
 				const sysPrompt = personas.nightfall.instruction;
 				const response = await generateShortResponse(contextPrompt, sysPrompt, env);
-				const aiMsg = response || 'Are you feeling more positive or negative right now?';
+				const aiMsg = response || 'Tap below to tell me about your emotions today.';
+				log.info('mood_score_response_ready', { chatId, score, hasResponse: !!response, showButtons: score >= 2 && score <= 8 });
 
 				// Always show emotion buttons for normal range scores (2-8)
 				const btns = (score >= 2 && score <= 8) ? {
@@ -686,7 +686,8 @@ export async function handleCallback(callbackQuery, env) {
 					]]
 				} : undefined;
 
-				await telegram.sendMessage(chatId, threadId, aiMsg, env, null, btns);
+				const sendRes = await telegram.sendMessage(chatId, threadId, aiMsg, env, null, btns);
+				log.info('mood_score_message_sent', { chatId, ok: sendRes?.ok, hasButtons: !!btns });
 
 				const histKey = `chat_${chatId}_${threadId}`;
 				let hist = await env.CHAT_KV.get(histKey, { type: 'json' }) || [];
@@ -694,7 +695,14 @@ export async function handleCallback(callbackQuery, env) {
 				if (hist.length > 24) hist = hist.slice(-24);
 				await env.CHAT_KV.put(histKey, JSON.stringify(hist), { expirationTtl: 604800 });
 			} catch (e) {
-				log.error('mood_score_response', { msg: e.message });
+				log.error('mood_score_response', { msg: e.message, stack: e.stack?.slice(0, 300) });
+				// Fallback: send buttons even if AI response fails
+				await telegram.sendMessage(chatId, threadId, 'How are your emotions today?', env, null, {
+					inline_keyboard: [[
+						{ text: '☀️ Positive', callback_data: 'mood_cat_positive' },
+						{ text: '🌧 Negative', callback_data: 'mood_cat_negative' }
+					]]
+				});
 			}
 
 		} else if (data.startsWith('mood_cat_')) {

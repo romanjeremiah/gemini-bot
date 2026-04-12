@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_chat ON memories(chat_id);
+CREATE INDEX IF NOT EXISTS idx_memories_chat_category ON memories(chat_id, category);
 
 -- 3. REMINDERS
 CREATE TABLE IF NOT EXISTS reminders (

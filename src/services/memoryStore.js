@@ -12,10 +12,10 @@ import * as vectorStore from './vectorStore';
 
 const THERAPEUTIC_CATEGORIES = ['pattern', 'trigger', 'avoidance', 'schema', 'growth', 'coping', 'insight', 'homework'];
 
-export async function saveMemory(env, chatId, category, fact, importance = 1, userId = null) {
+export async function saveMemory(env, chatId, category, fact, importance = 1, _userId = null) {
 	const result = await env.DB.prepare(
-		"INSERT INTO memories (chat_id, category, fact, importance_score, user_id) VALUES (?, ?, ?, ?, ?)"
-	).bind(chatId, category.toLowerCase(), fact, importance, userId).run();
+		"INSERT INTO memories (chat_id, category, fact, importance_score) VALUES (?, ?, ?, ?)"
+	).bind(chatId, category.toLowerCase(), fact, importance).run();
 	// Also index in Vectorize for semantic search (fire-and-forget)
 	const memoryId = result?.meta?.last_row_id || Date.now();
 	vectorStore.indexMemory(env, chatId, category.toLowerCase(), fact, memoryId)
@@ -152,8 +152,8 @@ No markdown, no backticks. Just the array.`;
 		const deleteStmt = env.DB.prepare("DELETE FROM memories WHERE chat_id = ?").bind(chatId);
 		const insertStmts = consolidated.map(m =>
 			env.DB.prepare(
-				"INSERT INTO memories (chat_id, category, fact, importance_score, created_by) VALUES (?, ?, ?, ?, ?)"
-			).bind(chatId, (m.category || 'general').toLowerCase(), m.fact, m.importance || 1, chatId)
+				"INSERT INTO memories (chat_id, category, fact, importance_score) VALUES (?, ?, ?, ?)"
+			).bind(chatId, (m.category || 'general').toLowerCase(), m.fact, m.importance || 1)
 		);
 		await env.DB.batch([deleteStmt, ...insertStmts]);
 

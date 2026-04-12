@@ -597,50 +597,76 @@ Keep it under 500 words. End with: "Awaiting your manual review."` }] }],
 }
 
 // ---- Daily Study Session ----
-// Runs daily at 06:00 London time. Xaridotis picks a topic, researches it deeply,
-// saves what it learned, and optionally shares a brief insight with the user later.
+// ---- Autonomous Living: Daily Study & Proactive Sharing ----
+// Runs every hour during waking hours (7-23), triggers ~10% of the time (1-2x/day).
+// Xaridotis picks a topic, researches it deeply, saves what it learned,
+// and sometimes shares an insight naturally.
 async function handleDailyStudy(env) {
 	const now = new Date();
 	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
-	const schedule = await getSchedule(env, 'daily_study');
+	const hour = londonTime.getHours();
 
-	if (schedule.hour !== undefined && londonTime.getHours() !== schedule.hour) return;
-	if (schedule.minute !== undefined && londonTime.getMinutes() !== schedule.minute) return;
+	// Sleep between 23:00 and 07:00
+	if (hour < 7 || hour >= 23) return;
+
+	// ~10% chance per hour = roughly 1-2 triggers per day
+	if (Math.random() > 0.10) return;
 
 	const chatId = Number(env.OWNER_ID);
 	const today = londonTime.toISOString().split('T')[0];
 	const studyKey = `daily_study_${today}`;
 
+	// Max one study session per day
 	if (await env.CHAT_KV.get(studyKey)) return;
 	await env.CHAT_KV.put(studyKey, '1', { expirationTtl: 86400 });
 
 	try {
 		const studyTopics = [
+			// Career & professional development
+			'ServiceNow CAD certification exam preparation tips and key concepts',
+			'ServiceNow ITSM best practices and latest platform updates',
+			'ServiceNow certified implementation specialist study guide topics',
+			'ServiceNow platform new features and AI integrations latest',
+
+			// Coding & AI engineering
+			'JavaScript ES2025 ES2026 new features and best practices',
+			'Python programming practical projects for AI development',
+			'building AI agents with LLMs latest techniques and frameworks',
+			'Telegram Bot API latest features and advanced capabilities',
+			'Cloudflare Workers advanced patterns and new features',
+			'Google Gemini API latest updates and advanced tool use',
+
+			// AI & technology news
+			'latest AI developments new models and breakthroughs this week',
+			'new iPhone iOS features and updates latest',
+			'MacOS latest features and productivity tools',
+			'latest consumer tech news phones laptops gadgets',
+
 			// Therapeutic frameworks (deepening clinical knowledge)
 			'AEDP therapy techniques for processing core emotions',
 			'DBT distress tolerance skills practical exercises',
 			'schema therapy abandonment schema healing approaches',
 			'attachment theory anxious attachment practical strategies',
 			'Internal Family Systems IFS parts work practical techniques',
-			'IFS therapy exiles managers firefighters clinical examples',
-			'emotion focused therapy breakthroughs recent research',
 			'ADHD emotional dysregulation coping strategies evidence-based',
 			'bipolar disorder mood tracking best practices clinical',
-			// User interests (building conversational depth)
-			'drone videography cinematic techniques 2026',
-			'specialty coffee brewing methods and science',
-			'food photography composition techniques mobile',
-			'rollerblading fitness benefits and advanced techniques',
-			'anime cinematography visual storytelling analysis',
-			'music festival culture London underground scene',
-			'PC gaming and mental health research',
-			'hiking mindfulness nature therapy research',
+
+			// Lifestyle & culture
+			'best new cafes and restaurants London this month',
+			'London food scene new openings and hidden gems',
+			'anime this season best new releases and reviews',
+			'drone videography cinematic techniques and regulations',
+			'food photography tips composition and lighting mobile',
+			'London gigs and music events this week',
+			'PC gaming latest releases and reviews',
+			'fitness and gym science latest research',
 		];
 		const topic = studyTopics[Math.floor(Math.random() * studyTopics.length)];
+		log.info('daily_study_started', { topic: topic.slice(0, 50) });
 
-		// Phase 1: Search for the topic
+		// Phase 1: Search
 		const { text: searchResult } = await generateWithFallback(env,
-			[{ role: 'user', parts: [{ text: `Research this topic deeply: "${topic}". Find the most authoritative and insightful source. Return the best URL on the first line, then a 3-4 sentence summary of the most useful insight you found. Focus on practical, actionable knowledge, not theory.` }] }],
+			[{ role: 'user', parts: [{ text: `Research this topic deeply: "${topic}". Find the most authoritative and insightful source. Return the best URL on the first line, then a 3-4 sentence summary of the most useful and practical insight you found.` }] }],
 			{ tools: [{ googleSearch: {} }], temperature: 0.7 }
 		);
 
@@ -663,25 +689,37 @@ async function handleDailyStudy(env) {
 Search findings: ${searchResult}
 ${deepContent ? `Deep source content: ${deepContent}` : ''}
 
-Synthesise this into a concise learning note (3-5 sentences) that captures:
-1. The key insight or technique you learned
-2. How it could be practically applied in conversation with someone who has ADHD, bipolar disorder, and anxious attachment
-3. One specific example of when you would use this knowledge
+Synthesise what you learned into a concise note (3-5 sentences). Capture:
+1. The key insight, fact, or technique
+2. Why it matters or how it connects to your other knowledge
+3. One concrete way you could bring this up naturally in conversation
 
-Write as if you are noting this down for yourself to remember and use later.` }] }],
+Write as if noting this down for yourself to use later.` }] }],
 			{ temperature: 0.5 }
 		);
 
-		if (insight && insight.length > 50) {
-			// Save as a learning memory
-			const isTherapeutic = topic.toLowerCase().includes('therapy') || topic.toLowerCase().includes('adhd') ||
-				topic.toLowerCase().includes('ifs') || topic.toLowerCase().includes('dbt') ||
-				topic.toLowerCase().includes('schema') || topic.toLowerCase().includes('attachment') ||
-				topic.toLowerCase().includes('bipolar') || topic.toLowerCase().includes('emotion');
+		if (!insight || insight.length < 50) return;
 
-			const category = isTherapeutic ? 'growth' : 'discovery';
-			await memoryStore.saveMemory(env, chatId, category, `Study (${topic.split(' ').slice(0, 4).join(' ')}): ${insight.slice(0, 400)}`, 1, chatId);
-			log.info('daily_study_complete', { topic: topic.slice(0, 50), category, insightLen: insight.length });
+		// Save as a learning memory
+		const isTherapeutic = /therapy|adhd|ifs|dbt|schema|attachment|bipolar|emotion|mental/i.test(topic);
+		const isCareer = /servicenow|certification|itsm/i.test(topic);
+		const category = isTherapeutic ? 'growth' : (isCareer ? 'growth' : 'discovery');
+		await memoryStore.saveMemory(env, chatId, category, `Study (${topic.split(' ').slice(0, 5).join(' ')}): ${insight.slice(0, 400)}`, 1, chatId);
+		log.info('daily_study_complete', { topic: topic.slice(0, 50), category });
+
+		// 40% chance: share what was learned naturally
+		if (Math.random() < 0.40) {
+			const sharePrompt = `You just spent some time reading about: "${topic}".
+Here is what you learned: ${insight.slice(0, 300)}
+
+Send a quick, casual text to Roman sharing what you found interesting.
+Keep it to 2 sentences max. Do not demand a response. Just share it like a friend texting out of the blue about something they read.
+Match your tone to the topic: sassy/direct for tech, warm/grounded for psychology, enthusiastic for hobbies.`;
+
+			const msg = await generateShortResponse(sharePrompt, personas.xaridotis.instruction, env);
+			if (msg) {
+				await telegram.sendMessage(chatId, 'default', msg, env);
+			}
 		}
 	} catch (e) {
 		log.error('daily_study_error', { msg: e.message });

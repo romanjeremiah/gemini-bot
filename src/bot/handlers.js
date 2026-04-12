@@ -629,7 +629,7 @@ export async function handleCallback(callbackQuery, env) {
 		}
 	}
 	// ---- Medication and Mood callbacks from health check-ins ----
-	else if (data.startsWith('mood_med_') || data.startsWith('mood_score_') || data.startsWith('mood_cat_') || data.startsWith('mood_emo_')) {
+	else if (data.startsWith('mood_med_') || data.startsWith('mood_score_') || data.startsWith('mood_cat_') || data.startsWith('mood_emo')) {
 		const today = moodStore.todayLondon();
 
 		// Shared setup for med/score callbacks only
@@ -710,46 +710,52 @@ export async function handleCallback(callbackQuery, env) {
 			await telegram.editMessageReplyMarkup(chatId, msgId, null, env);
 			log.info('mood_category', { chatId, category });
 
-			// Clear nudge flag
 			await env.CHAT_KV.delete(`nudge_pending_evening_${chatId}`);
 
-			// Always start with negative emotions first, then positive
+			const positiveEmotions = ['lively', 'grateful', 'proud', 'calm', 'relaxed', 'energetic', 'motivated', 'empathetic', 'inspired', 'curious', 'satisfied', 'excited', 'brave', 'confident', 'happy', 'joyful', 'carefree'];
 			const negativeEmotions = ['devastated', 'empty', 'frustrated', 'scared', 'angry', 'depressed', 'sad', 'anxious', 'annoyed', 'insecure', 'lonely', 'confused', 'tired', 'bored', 'nervous', 'disappointed', 'lost'];
 
+			// Show whichever category they tapped first
+			const firstList = category === 'positive' ? positiveEmotions : negativeEmotions;
+			const otherCategory = category === 'positive' ? 'negative' : 'positive';
+
 			const rows = [];
-			for (let i = 0; i < negativeEmotions.length; i += 3) {
-				rows.push(negativeEmotions.slice(i, i + 3).map(e => ({
+			for (let i = 0; i < firstList.length; i += 3) {
+				rows.push(firstList.slice(i, i + 3).map(e => ({
 					text: e, callback_data: `mood_emo_${e}`
 				})));
 			}
-			rows.push([{ text: '➡️ Next: Positive emotions', callback_data: 'mood_emo_next' }]);
+			rows.push([{ text: `➡️ Next: ${otherCategory} emotions`, callback_data: `mood_emo_next_${otherCategory}` }]);
+			rows.push([{ text: '✅ Done (skip the rest)', callback_data: 'mood_emo_done' }]);
 
-			// Initialise selection state
 			await env.CHAT_KV.put(`mood_emo_selected_${chatId}`, '[]', { expirationTtl: 3600 });
 
 			await telegram.sendMessage(chatId, threadId,
-				`<b>Which negative emotions resonate today?</b>\nTap each one that fits, then tap ➡️ Next.`,
+				`<b>Select all ${category} emotions that resonate.</b>\nTap each one, then ➡️ Next or ✅ Done.`,
 				env, null, { inline_keyboard: rows });
 
-		} else if (data === 'mood_emo_next') {
-			// User finished negative emotions, now show positive
+		} else if (data.startsWith('mood_emo_next_')) {
+			const nextCategory = data.replace('mood_emo_next_', '');
 			await telegram.editMessageReplyMarkup(chatId, msgId, null, env);
 
 			const positiveEmotions = ['lively', 'grateful', 'proud', 'calm', 'relaxed', 'energetic', 'motivated', 'empathetic', 'inspired', 'curious', 'satisfied', 'excited', 'brave', 'confident', 'happy', 'joyful', 'carefree'];
+			const negativeEmotions = ['devastated', 'empty', 'frustrated', 'scared', 'angry', 'depressed', 'sad', 'anxious', 'annoyed', 'insecure', 'lonely', 'confused', 'tired', 'bored', 'nervous', 'disappointed', 'lost'];
+
+			const list = nextCategory === 'positive' ? positiveEmotions : negativeEmotions;
 
 			const rows = [];
-			for (let i = 0; i < positiveEmotions.length; i += 3) {
-				rows.push(positiveEmotions.slice(i, i + 3).map(e => ({
+			for (let i = 0; i < list.length; i += 3) {
+				rows.push(list.slice(i, i + 3).map(e => ({
 					text: e, callback_data: `mood_emo_${e}`
 				})));
 			}
 			rows.push([{ text: '✅ Done selecting', callback_data: 'mood_emo_done' }]);
 
 			await telegram.sendMessage(chatId, threadId,
-				`<b>Now, which positive emotions are also present?</b>\nTap each one, then tap ✅ Done.`,
+				`<b>Now select any ${nextCategory} emotions.</b>\nTap each one, then ✅ Done.`,
 				env, null, { inline_keyboard: rows });
 
-		} else if (data.startsWith('mood_emo_') && data !== 'mood_emo_done' && data !== 'mood_emo_next') {
+		} else if (data.startsWith('mood_emo_') && data !== 'mood_emo_done' && !data.startsWith('mood_emo_next_')) {
 			// Individual emotion selection - toggle and acknowledge
 			const emotion = data.replace('mood_emo_', '');
 			const selectedStr = await env.CHAT_KV.get(`mood_emo_selected_${chatId}`) || '[]';
@@ -789,12 +795,21 @@ export async function handleCallback(callbackQuery, env) {
 			const negSelected = selected.filter(e => negativeList.includes(e));
 			const posSelected = selected.filter(e => !negativeList.includes(e));
 
-			const contextPrompt = `The user completed their emotion check-in.
-Negative emotions selected: ${negSelected.length > 0 ? negSelected.join(', ') : 'none'}
-Positive emotions selected: ${posSelected.length > 0 ? posSelected.join(', ') : 'none'}
-Total emotions: ${selected.length}
+			// Pull recent mood history for context
+			const recentEntries = await moodStore.getWeeklySummary(env, chatId).catch(() => []);
+			const pastContext = recentEntries.length > 1
+				? `Recent mood history (last 7 days): ${recentEntries.slice(0, 5).map(e => `${e.date} ${e.entry_type}: score ${e.mood_score}, emotions: ${e.emotions || 'none'}`).join(' | ')}`
+				: 'No previous check-ins this week.';
 
-Respond with empathy. Notice the balance (or imbalance) between positive and negative. Ask ONE natural follow-up question exploring what is driving the dominant emotional theme today. If both positive and negative are present, explore what is creating that tension.`;
+			const contextPrompt = `The user just completed their mood check-in.
+Mood score: ${selected.length > 0 ? 'already logged' : 'unknown'}
+Negative emotions: ${negSelected.length > 0 ? negSelected.join(', ') : 'none'}
+Positive emotions: ${posSelected.length > 0 ? posSelected.join(', ') : 'none'}
+${pastContext}
+
+Give a brief, warm overview of what you notice in their emotional state today. If there are patterns compared to recent days, mention them naturally.
+Then ask: "Would you like to talk about any of this now, or shall we pick it up another time?"
+Be human. Be warm. No clinical jargon. 2-4 sentences max.`;
 
 			try {
 				const response = await generateShortResponse(contextPrompt, personas.nightfall.instruction, env);

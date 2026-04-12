@@ -234,7 +234,7 @@ async function handleCommand(command, msg, env) {
 			return handleMessage(fakeMsg, env);
 		}
 		case "/mood": {
-			await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 7200 });
+			await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 1800 });
 			await telegram.sendMessage(chatId, threadId,
 				`<b>Mood check.</b>\n\nWhere would you place yourself on the scale right now?\n\n🔴 <b>0-1: Severe Depression</b>\n<i>(Bleak, hopeless)</i>\n\n🟠 <b>2-3: Mild/Moderate</b>\n<i>(Struggle, anxious)</i>\n\n🟢 <b>4-6: Balanced</b>\n<i>(Optimistic, sociable)</i>\n\n🟡 <b>7-8: Hypomania</b>\n<i>(Productive, racing)</i>\n\n🔴 <b>9-10: Mania</b>\n<i>(Reckless, delusions)</i>`,
 				env, null, {
@@ -396,9 +396,20 @@ export async function handleMessage(msg, env) {
 		const healthCheckin = isOwner ? await env.CHAT_KV.get(`health_checkin_active_${chatId}`) : null;
 		const effectivePersona = 'xaridotis';
 
+		// If the user is clearly NOT engaging with a health check-in, clear the flag
+		// so it doesn't pollute unrelated conversations
+		const isHealthRelated = /sleep|mood|medication|medic|anxious|anxiety|depressed|how.*feel|emotion|check.?in/i.test(userText);
+		if (healthCheckin && !isHealthRelated && userText.length > 10) {
+			await env.CHAT_KV.delete(`health_checkin_active_${chatId}`);
+			log.info('checkin_cleared', { chatId, reason: 'non_health_message', was: healthCheckin });
+		}
+
+		// Only inject check-in context if the flag survived (user is still engaging with health)
+		const activeCheckin = await env.CHAT_KV.get(`health_checkin_active_${chatId}`);
+
 		// Build dynamic journal roadmap for evening check-ins
 		let checkinProgress = '';
-		if (healthCheckin === 'evening') {
+		if (activeCheckin === 'evening') {
 			const roadmap = await getCheckinRoadmap(env, chatId);
 			if (roadmap.includes('All data collected')) {
 				checkinProgress = ` | ${roadmap}`;
@@ -406,8 +417,8 @@ export async function handleMessage(msg, env) {
 			} else {
 				checkinProgress = ` | ${roadmap}`;
 			}
-		} else if (healthCheckin) {
-			checkinProgress = ` | HEALTH CHECK-IN MODE (${healthCheckin}): You are Nightfall. Conduct the ${healthCheckin} check-in naturally. Use log_mood_entry to record data.`;
+		} else if (activeCheckin) {
+			checkinProgress = ` | HEALTH CHECK-IN MODE (${activeCheckin}): Conduct the ${activeCheckin} check-in naturally. Use log_mood_entry to record data. If the user changes topic, drop the check-in and help with their request instead.`;
 		}
 
 		let replyContext = "";

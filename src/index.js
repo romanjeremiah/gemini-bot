@@ -75,7 +75,7 @@ async function handleHealthCheckIns(env) {
 		if (isUserActive) return; // Defer until conversation pauses
 
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
-		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'morning', { expirationTtl: 3600 });
+		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'morning', { expirationTtl: 1800 });
 
 		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'morning');
 		if (alreadyLogged) return;
@@ -101,7 +101,7 @@ async function handleHealthCheckIns(env) {
 		if (isUserActive) return;
 
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
-		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'midday', { expirationTtl: 3600 });
+		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'midday', { expirationTtl: 1800 });
 
 		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'midday');
 		if (alreadyLogged) return;
@@ -128,7 +128,7 @@ async function handleHealthCheckIns(env) {
 		if (isUserActive) return;
 
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
-		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 7200 });
+		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 1800 });
 
 		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'evening');
 		if (alreadyLogged) return;

@@ -125,15 +125,30 @@ async function handleCommand(command, msg, env) {
 				if (!target[m.category]) target[m.category] = [];
 				target[m.category].push(m);
 			}
-			let t = "🧠 <b>Saved Memories</b>\n\n";
+			let t = "🧠 <b>Saved Memories</b> (" + mems.length + " total)\n\n";
 			if (Object.keys(factual).length) {
-				for (const [c, items] of Object.entries(factual)) { t += `<b>${c}</b>\n`; items.forEach(m => t += `• ${m.fact}\n`); t += "\n"; }
+				for (const [c, items] of Object.entries(factual)) {
+					t += `<b>${c}</b> (${items.length})\n`;
+					items.slice(0, 5).forEach(m => t += `• ${m.fact.slice(0, 120)}${m.fact.length > 120 ? '...' : ''}\n`);
+					if (items.length > 5) t += `<i>  ...and ${items.length - 5} more</i>\n`;
+					t += "\n";
+				}
 			}
 			if (Object.keys(therapeutic).length) {
 				t += "🔍 <b>Therapeutic Observations</b>\n\n";
-				for (const [c, items] of Object.entries(therapeutic)) { t += `<b>${c}</b>\n`; items.forEach(m => { const star = m.importance_score >= 2 ? "⭐ " : ""; t += `• ${star}${m.fact}\n`; }); t += "\n"; }
+				for (const [c, items] of Object.entries(therapeutic)) {
+					t += `<b>${c}</b> (${items.length})\n`;
+					items.slice(0, 3).forEach(m => { const star = m.importance_score >= 2 ? "⭐ " : ""; t += `• ${star}${m.fact.slice(0, 120)}${m.fact.length > 120 ? '...' : ''}\n`; });
+					if (items.length > 3) t += `<i>  ...and ${items.length - 3} more</i>\n`;
+					t += "\n";
+				}
 			}
-			await telegram.sendMessage(chatId, threadId, t + "<i>Use /forget to clear all.</i>", env);
+			// Safety: split into chunks if still too long
+			const footer = "<i>Use /forget to clear all.</i>";
+			if (t.length + footer.length > 4000) {
+				t = t.slice(0, 3900) + "\n\n<i>...truncated. Too many memories to display.</i>\n";
+			}
+			await telegram.sendMessage(chatId, threadId, t + footer, env);
 			return true;
 		}
 		case "/forget":

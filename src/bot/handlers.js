@@ -336,6 +336,9 @@ export async function handleMessage(msg, env) {
 	try {
 		const firstName = msg.from.first_name || "User", userText = msg.text || msg.caption || "";
 		log.info('message_received', { chatId, from: firstName, len: userText.length, hasMedia: !!getMediaFromMessage(msg) });
+
+		// Track last seen for contextual outreach timing
+		await env.CHAT_KV.put(`last_seen_${chatId}`, String(Date.now()), { expirationTtl: 86400 * 7 });
 		const userIdentity = buildUserIdentity(msg);
 		upsertUser(env, msg); // fire-and-forget — keeps users table fresh
 		const cmdMatch = userText.match(/^\/(\w+)(@\w+)?/);

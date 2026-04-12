@@ -329,6 +329,12 @@ async function handleSpontaneousOutreach(env) {
 	if (await env.CHAT_KV.get(outreachKey)) return;
 	await env.CHAT_KV.put(outreachKey, '1', { expirationTtl: 86400 });
 
+	// Check when we last spoke (don't double-text)
+	const lastSeenStr = await env.CHAT_KV.get(`last_seen_${chatId}`);
+	const lastSeen = lastSeenStr ? parseInt(lastSeenStr) : 0;
+	const hoursSinceLastChat = Math.round((Date.now() - lastSeen) / (1000 * 60 * 60));
+	if (hoursSinceLastChat < 3) return;
+
 	try {
 		// Pull memories with a mix of types for contextual check-ins
 		const allMemories = await memoryStore.getMemories(env, chatId, 50);
@@ -362,11 +368,14 @@ async function handleSpontaneousOutreach(env) {
 
 		const prompt = isFollowUp
 			? `You remembered this about Roman: "${chosenMemory.fact}".
+It has been about ${hoursSinceLastChat} hours since you last spoke.
 Send a natural, casual check-in based on this. Like a friend who remembered something and is following up.
-Examples of tone: "How did that thing go?" or "Been thinking about what you said about..." or "Did you end up doing that?"
+${hoursSinceLastChat > 24 ? 'It has been a while, so check how he is doing.' : 'Keep it light and brief.'}
 Keep it to 1-2 sentences. Be warm but not pushy.`
 			: `You just thought of this: "${chosenMemory.fact}" (type: ${chosenMemory.category}).
+It has been about ${hoursSinceLastChat} hours since you last spoke.
 ${chosenMemory.category === 'discovery' ? 'Present it as something you recently read and thought they would find interesting.' : 'Share a random observation or thought about it, like a friend texting out of the blue.'}
+${hoursSinceLastChat > 24 ? 'Since it has been a while, you could naturally ask how they are doing too.' : ''}
 Keep it to 1-2 sentences. DO NOT offer help. DO NOT be a therapist. Just share it naturally.`;
 
 		const msg = await generateShortResponse(prompt, personas.xaridotis.instruction, env);

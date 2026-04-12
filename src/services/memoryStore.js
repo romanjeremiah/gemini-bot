@@ -12,7 +12,7 @@ import * as vectorStore from './vectorStore';
 
 const THERAPEUTIC_CATEGORIES = ['pattern', 'trigger', 'avoidance', 'schema', 'growth', 'coping', 'insight', 'homework'];
 
-export async function saveMemory(env, chatId, category, fact, importance = 1, _userId = null) {
+export async function saveMemory(env, chatId, category, fact, importance = 1) {
 	const result = await env.DB.prepare(
 		"INSERT INTO memories (chat_id, category, fact, importance_score) VALUES (?, ?, ?, ?)"
 	).bind(chatId, category.toLowerCase(), fact, importance).run();

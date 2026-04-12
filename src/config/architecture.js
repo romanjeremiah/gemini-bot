@@ -1,3 +1,4 @@
+// Last audited: 2026-04-12
 // Bot Architecture Summary
 // This file is read by the self-improvement advisor to understand the bot's capabilities.
 // It is NOT executable code. It is a reference document for the AI to reason about.

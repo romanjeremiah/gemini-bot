@@ -51,23 +51,30 @@ async function handleHealthCheckIns(env) {
 	const minute = londonTime.getMinutes();
 	const chatId = Number(env.OWNER_ID);
 	const threadId = 'default';
-
-	// Only trigger at specific minutes to avoid duplicate sends (cron runs every minute)
-	// Use KV to track if we already sent this check-in today
 	const today = londonTime.toISOString().split('T')[0];
+	const currentMins = hour * 60 + minute;
 
-	// Load schedules from KV (with defaults fallback)
+	// Load schedules
 	const morning = await getSchedule(env, 'morning_checkin');
 	const midday = await getSchedule(env, 'midday_checkin');
 	const evening = await getSchedule(env, 'evening_checkin');
 
-	// Morning check-in
-	if (hour === morning.hour && minute >= morning.minute) {
+	const morningMins = morning.hour * 60 + (morning.minute || 0);
+	const middayMins = midday.hour * 60 + (midday.minute || 0);
+	const eveningMins = evening.hour * 60 + (evening.minute || 0);
+
+	// Polite deferral: if the user messaged within the last 20 minutes, wait
+	const lastSeenStr = await env.CHAT_KV.get(`last_seen_${chatId}`);
+	const lastSeen = lastSeenStr ? parseInt(lastSeenStr) : 0;
+	const isUserActive = (Date.now() - lastSeen) < 20 * 60 * 1000;
+
+	// Morning check-in (window: morning schedule until midday schedule)
+	if (currentMins >= morningMins && currentMins < middayMins) {
 		const key = `health_checkin_morning_${today}`;
 		if (await env.CHAT_KV.get(key)) return;
-		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
+		if (isUserActive) return; // Defer until conversation pauses
 
-		// Set Nightfall as active persona for health check-in
+		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
 		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'morning', { expirationTtl: 3600 });
 
 		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'morning');
@@ -79,21 +86,21 @@ async function handleHealthCheckIns(env) {
 		) || 'Good morning. How did you sleep? Have you taken your morning medication?';
 
 		await telegram.sendMessage(chatId, threadId, morningGreeting, env, null, {
-				inline_keyboard: [[
-					{ text: '💊 Taken', callback_data: 'mood_med_yes_morning' },
-					{ text: '⏰ Not yet', callback_data: 'mood_med_no_morning' },
-				]]
-			});
-		// Set nudge timer (checked every cron tick, fires after 30 min)
+			inline_keyboard: [[
+				{ text: '💊 Taken', callback_data: 'mood_med_yes_morning' },
+				{ text: '⏰ Not yet', callback_data: 'mood_med_no_morning' },
+			]]
+		});
 		await env.CHAT_KV.put(`nudge_pending_morning_${chatId}`, String(Date.now()), { expirationTtl: 3600 });
 	}
 
-	// Midday check-in
-	else if (hour === midday.hour && minute >= midday.minute) {
+	// Midday check-in (window: midday schedule until evening schedule)
+	else if (currentMins >= middayMins && currentMins < eveningMins) {
 		const key = `health_checkin_midday_${today}`;
 		if (await env.CHAT_KV.get(key)) return;
-		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
+		if (isUserActive) return;
 
+		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
 		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'midday', { expirationTtl: 3600 });
 
 		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'midday');
@@ -105,22 +112,22 @@ async function handleHealthCheckIns(env) {
 		) || 'Quick midday check. Have you taken your ADHD and anxiety medication?';
 
 		await telegram.sendMessage(chatId, threadId, middayGreeting, env, null, {
-				inline_keyboard: [[
-					{ text: '✅ Both taken', callback_data: 'mood_med_yes_midday' },
-					{ text: '💊 ADHD only', callback_data: 'mood_med_partial_midday' },
-					{ text: '❌ Not yet', callback_data: 'mood_med_no_midday' },
-				]]
-			});
-		// Set nudge timer
+			inline_keyboard: [[
+				{ text: '✅ Both taken', callback_data: 'mood_med_yes_midday' },
+				{ text: '💊 ADHD only', callback_data: 'mood_med_partial_midday' },
+				{ text: '❌ Not yet', callback_data: 'mood_med_no_midday' },
+			]]
+		});
 		await env.CHAT_KV.put(`nudge_pending_midday_${chatId}`, String(Date.now()), { expirationTtl: 3600 });
 	}
 
-	// Evening check-in
-	else if (hour === evening.hour && minute >= evening.minute) {
+	// Evening check-in (window: evening schedule until midnight)
+	else if (currentMins >= eveningMins) {
 		const key = `health_checkin_evening_${today}`;
 		if (await env.CHAT_KV.get(key)) return;
-		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
+		if (isUserActive) return;
 
+		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
 		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 7200 });
 
 		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'evening');
@@ -135,7 +142,6 @@ async function handleHealthCheckIns(env) {
 					[{ text: '🟡 7-8', callback_data: 'mood_score_7' }, { text: '🔴 9-10', callback_data: 'mood_score_9' }]
 				]
 			});
-		// Set nudge timer
 		await env.CHAT_KV.put(`nudge_pending_evening_${chatId}`, String(Date.now()), { expirationTtl: 7200 });
 	}
 }

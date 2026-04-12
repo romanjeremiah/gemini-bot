@@ -174,6 +174,9 @@ No markdown, no backticks. Just the array.`;
 		await env.DB.batch([deleteStmt, ...insertStmts]);
 
 		console.log(`🧠 Consolidated ${allMemories.length} → ${consolidated.length} memories (batched)`);
+
+		// Optimise D1 indexes after bulk write (recommended by Cloudflare)
+		await env.DB.exec('PRAGMA optimize;');
 	} catch (e) {
 		console.error('Memory consolidation failed:', e.message);
 	}

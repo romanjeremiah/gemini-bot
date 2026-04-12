@@ -795,11 +795,15 @@ export async function handleCallback(callbackQuery, env) {
 			const negSelected = selected.filter(e => negativeList.includes(e));
 			const posSelected = selected.filter(e => !negativeList.includes(e));
 
-			// Pull recent mood history for context
-			const recentEntries = await moodStore.getWeeklySummary(env, chatId).catch(() => []);
-			const pastContext = recentEntries.length > 1
-				? `Recent mood history (last 7 days): ${recentEntries.slice(0, 5).map(e => `${e.date} ${e.entry_type}: score ${e.mood_score}, emotions: ${e.emotions || 'none'}`).join(' | ')}`
-				: 'No previous check-ins this week.';
+			// Pull recent mood history for context (last 30 days)
+			const recentEntries = await moodStore.getHistory(env, chatId, 30, 'evening').catch(() => []);
+			let pastContext = 'No previous check-ins found.';
+			if (recentEntries.length > 1) {
+				const summaries = recentEntries.slice(0, 10).map(e =>
+					`${e.date}: score ${e.mood_score ?? '?'}, emotions: ${e.emotions || 'none'}`
+				).join(' | ');
+				pastContext = `Recent evening check-ins (up to 30 days): ${summaries}`;
+			}
 
 			const contextPrompt = `The user just completed their mood check-in.
 Mood score: ${selected.length > 0 ? 'already logged' : 'unknown'}

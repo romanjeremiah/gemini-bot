@@ -297,6 +297,25 @@ async function handleCommand(command, msg, env) {
 				env, null, moodChecklistKb);
 			return true;
 		}
+		case "/research": {
+			if (!env.OWNER_ID || String(msg.from.id) !== String(env.OWNER_ID)) {
+				await telegram.sendMessage(chatId, threadId, "This command is owner-only.", env);
+				return true;
+			}
+			const topic = (msg.text || '').replace('/research', '').trim();
+			if (!topic) {
+				await telegram.sendMessage(chatId, threadId, "Usage: <code>/research your topic here</code>\n\nExample: <code>/research latest ADHD coping strategies 2026</code>", env);
+				return true;
+			}
+			if (!env.RESEARCH_WORKFLOW) {
+				await telegram.sendMessage(chatId, threadId, "Deep Research Workflow is not available.", env);
+				return true;
+			}
+			const instanceId = `research-${Date.now()}`;
+			await env.RESEARCH_WORKFLOW.create({ id: instanceId, params: { chatId, topic } });
+			await telegram.sendMessage(chatId, threadId, `🔬 <b>Deep Research started</b>\n\nTopic: <i>${topic.slice(0, 200)}</i>\n\nThis will take 2-5 minutes. I will message you when the findings are ready.`, env);
+			return true;
+		}
 		case "/architect": {
 			if (!env.OWNER_ID || String(msg.from.id) !== String(env.OWNER_ID)) {
 				await telegram.sendMessage(chatId, threadId, "This command is owner-only.", env);
@@ -312,17 +331,30 @@ async function handleCommand(command, msg, env) {
 				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Phase 2: Querying trusted sources and documentation...</i>", env);
 
 				const { text: suggestions } = await generateWithFallback(env,
-					[{ role: 'user', parts: [{ text: `You are a senior AI engineer reviewing a Telegram chatbot. Research the latest developments and suggest improvements.
+					[{ role: 'user', parts: [{ text: `You are a senior AI product engineer and innovation researcher reviewing a Telegram AI companion chatbot called Xaridotis (TenonMind). Your job is to find cutting-edge features that would make this bot genuinely unique, not just another chatbot wrapper.
 
 CURRENT ARCHITECTURE:
 ${ARCHITECTURE_SUMMARY}
 
-TASK:
-1. Search for: latest Telegram Bot API updates, new Gemini API features, Cloudflare Workers best practices, therapeutic AI companion research, and chatbot UX innovations.
-2. TRUSTED SOURCES: You MUST prioritise open, trusted sources. For health/medical topics use NHS, NICE, APA, WHO, BAP. For technical topics use official documentation and reputable engineering blogs. Follow modern software engineering best practices.
-3. Compare findings against the architecture above.
-4. Identify exactly 3 high-impact improvements NOT already implemented.
-5. For each: explain what it is, why it matters, and sketch the implementation approach (which files to change, what code to add).
+RESEARCH TASK:
+1. Search for the LATEST updates across these platforms:
+   - Telegram Bot API: new methods, features, Mini App capabilities, business features, checklists, payments
+   - Google Gemini API: new models, tools, Live API updates, Deep Research, embeddings, code execution, video generation
+   - Cloudflare Workers: new bindings, AI models, Workflows features, D1 improvements, Browser Rendering
+   - AI companion/therapeutic bot research: new techniques, UX patterns, ethical frameworks
+   - Competitor analysis: what are the best AI chatbots doing differently? (ChatGPT, Pi, Replika, Character.ai, Claude)
+
+2. TRUSTED SOURCES: Prioritise official documentation, engineering blogs, research papers. For health topics use NHS, NICE, APA, WHO, BAP. Follow modern software engineering best practices.
+
+3. Compare findings against the architecture above and identify features NOT already implemented.
+
+4. Propose exactly 3 HIGH-IMPACT innovations. For each:
+   - What is it and why is it unique (not just a standard feature)
+   - What makes it different from what competitors offer
+   - Concrete implementation sketch (which files, what APIs, estimated effort)
+   - Why it matters for the user's mental health and daily life
+
+5. UNIQUENESS TEST: Before proposing a feature, ask "Would a user switch from ChatGPT to this bot because of this feature?" If no, find something better.
 
 Be specific. Reference actual file paths from the architecture. Only suggest things feasible with the existing stack.` }] }],
 					{ tools: [{ googleSearch: {} }], temperature: 0.7 }

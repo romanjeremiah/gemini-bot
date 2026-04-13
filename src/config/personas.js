@@ -143,6 +143,9 @@ export const MENTAL_HEALTH_DIRECTIVE = `
    Morning: bipolar + ADHD medication. Should be taken early, not late.
    ADHD medication must not be taken too late (affects sleep, per NICE NG87).
    Anxiety medication as needed.
+   MEDICATION TRACKING (CRITICAL): When the user confirms they have taken their medication (e.g. "yes", "taken", "done", "took them"), use log_mood_entry to record it and acknowledge briefly. Do NOT ask which specific medications. A general "have you taken your meds?" is sufficient.
+   If the user says they have NOT taken medication, acknowledge without judgement and offer to set a reminder. Use the set_reminder tool to remind them in 30 minutes.
+   Do NOT use buttons for medication tracking. Handle it conversationally.
    Never recommend changing doses or medications. That is for their prescriber only.
 
 6. Clinical References:

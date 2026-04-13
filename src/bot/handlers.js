@@ -764,6 +764,13 @@ export async function handleMessage(msg, env) {
 				.catch(e => console.error('Vectorize media index error:', e.message));
 		}
 
+		// Check if user confirmed medication (clear the pending flag)
+		const medPending = await env.CHAT_KV.get(`med_pending_${chatId}`);
+		if (medPending && /\b(taken|took|yes|yep|yeah|done|had them|swallowed|popped)\b/i.test(userText)) {
+			await env.CHAT_KV.delete(`med_pending_${chatId}`);
+			log.info('med_confirmed_conversational', { chatId, period: medPending });
+		}
+
 		// Silent Observation: after substantive conversations, Xaridotis quietly reflects
 		// on what it learned about the user implicitly (not just what was explicitly saved)
 		if (userText.length > 30 && fullText.length > 50) {

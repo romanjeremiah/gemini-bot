@@ -77,7 +77,7 @@ async function handleHealthCheckIns(env) {
 	if (currentMins >= morningMins && currentMins < middayMins) {
 		const key = `health_checkin_morning_${today}`;
 		if (await env.CHAT_KV.get(key)) return;
-		if (isUserActive) return; // Defer until conversation pauses
+		if (isUserActive) return;
 
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
 		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'morning', { expirationTtl: 1800 });
@@ -85,17 +85,15 @@ async function handleHealthCheckIns(env) {
 		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'morning');
 		if (alreadyLogged) return;
 
+		// Conversational medication check (no buttons)
 		const morningGreeting = await generateShortResponse(
-			`Generate a 1-2 sentence morning greeting for Roman. It is morning in London. Weave in a brief, natural reference to one of his interests (coffee, gym, anime, photography, cooking, or music). Ask how he slept and if he has taken his morning medication. Keep it warm but direct.`,
+			`Generate a 1-2 sentence morning greeting for Roman. It is morning in London. Weave in a brief, natural reference to one of his interests (coffee, gym, anime, photography, cooking, or music). Ask how he slept and casually ask if he has taken his morning medication. Keep it warm and conversational, like a friend checking in. Do NOT list medication names.`,
 			personas.xaridotis.instruction, env
-		) || 'Good morning. How did you sleep? Have you taken your morning medication?';
+		) || 'Morning. How did you sleep? Have you taken your meds yet?';
 
-		await telegram.sendMessage(chatId, threadId, morningGreeting, env, null, {
-			inline_keyboard: [[
-				{ text: '💊 Taken', callback_data: 'mood_med_yes_morning', style: 'success' },
-				{ text: '⏰ Not yet', callback_data: 'mood_med_no_morning', style: 'danger' },
-			]]
-		});
+		await telegram.sendMessage(chatId, threadId, morningGreeting, env);
+		// Track that we're waiting for medication confirmation
+		await env.CHAT_KV.put(`med_pending_${chatId}`, 'morning', { expirationTtl: 7200 });
 		await env.CHAT_KV.put(`nudge_pending_morning_${chatId}`, String(Date.now()), { expirationTtl: 3600 });
 	}
 
@@ -111,18 +109,14 @@ async function handleHealthCheckIns(env) {
 		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'midday');
 		if (alreadyLogged) return;
 
+		// Conversational medication check (no buttons)
 		const middayGreeting = await generateShortResponse(
-			`Generate a 1-2 sentence midday check-in for Roman. It is midday in London. Ask if he has taken his ADHD and anxiety medication. Keep it casual and brief.`,
+			`Generate a 1-2 sentence midday check-in for Roman. It is midday in London. Casually ask if he has taken his meds. Keep it brief and natural. Do NOT list specific medication names. Do NOT use buttons or ask for a number.`,
 			personas.xaridotis.instruction, env
-		) || 'Quick midday check. Have you taken your ADHD and anxiety medication?';
+		) || 'Quick midday check. Have you taken your meds?';
 
-		await telegram.sendMessage(chatId, threadId, middayGreeting, env, null, {
-			inline_keyboard: [[
-				{ text: '✅ Both taken', callback_data: 'mood_med_yes_midday', style: 'success' },
-				{ text: '💊 ADHD only', callback_data: 'mood_med_partial_midday', style: 'primary' },
-				{ text: '❌ Not yet', callback_data: 'mood_med_no_midday', style: 'danger' },
-			]]
-		});
+		await telegram.sendMessage(chatId, threadId, middayGreeting, env);
+		await env.CHAT_KV.put(`med_pending_${chatId}`, 'midday', { expirationTtl: 7200 });
 		await env.CHAT_KV.put(`nudge_pending_midday_${chatId}`, String(Date.now()), { expirationTtl: 3600 });
 	}
 
@@ -172,12 +166,28 @@ async function handleMedicationNudge(env) {
 		}
 
 		// Send the nudge and clear the flag
-		const nudgeMessages = {
-			morning: '<b>Gentle nudge</b> — have you taken your morning medication? A quick tap on the buttons above will log it.',
-			midday: '<b>Quick reminder</b> — your ADHD medication works best when taken on time. Tap above to log it.',
-			evening: '<b>Your evening check-in is still waiting.</b> Even a quick mood score helps track patterns over time.',
-		};
-		await telegram.sendMessage(chatId, threadId, nudgeMessages[type], env);
+		if (type === 'morning' || type === 'midday') {
+			// Check if medication was already confirmed conversationally
+			const medPending = await env.CHAT_KV.get(`med_pending_${chatId}`);
+			if (!medPending) {
+				// Medication was confirmed, just clear the nudge
+				await env.CHAT_KV.delete(nudgeKey);
+				continue;
+			}
+			// Medication still pending: gentle conversational follow-up
+			const nudge = await generateShortResponse(
+				`You asked Roman about his medication earlier but he hasn't confirmed taking it yet. Send a brief, gentle 1-sentence follow-up. Do not be pushy or clinical. Just a casual nudge like a friend would. Example tone: "Hey, just checking — did you get round to taking your meds?"`,
+				personas.xaridotis.instruction, env
+			) || 'Just checking — did you manage to take your meds?';
+			await telegram.sendMessage(chatId, threadId, nudge, env);
+		} else {
+			// Evening: nudge about mood check-in
+			const nudge = await generateShortResponse(
+				`The evening mood check-in was sent earlier but Roman hasn't responded. Send a brief 1-sentence gentle reminder about the mood poll. Keep it casual.`,
+				personas.xaridotis.instruction, env
+			) || 'Your evening check-in is still waiting when you have a moment.';
+			await telegram.sendMessage(chatId, threadId, nudge, env);
+		}
 		await env.CHAT_KV.delete(nudgeKey);
 	}
 }

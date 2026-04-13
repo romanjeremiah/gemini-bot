@@ -61,8 +61,10 @@ export const searchResearchTool = {
 			return {
 				status: "success",
 				topic: args.topic,
-				report: fullReport.slice(0, 10000), // Cap at 10K chars for context window safety
-				truncated: fullReport.length > 10000
+				report: fullReport.slice(0, 10000),
+				truncated: fullReport.length > 10000,
+				charCount: fullReport.length,
+				instructions: "IMPORTANT: This report may be very long. Present it in digestible sections. If the response exceeds 3500 characters, split it across multiple messages using the draft tool. After sharing, offer: 'Want me to read this to you as audio?'"
 			};
 		}
 

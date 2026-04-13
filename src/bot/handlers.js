@@ -15,7 +15,29 @@ import { log } from '../lib/logger';
 
 const HISTORY_LENGTH = 24;
 const HISTORY_TTL = 604800;
-const DRAFT_THROTTLE_MS = 500; // minimum ms between sendMessageDraft calls
+const DRAFT_THROTTLE_MS = 500;
+
+/** Split long text into chunks at paragraph boundaries, respecting a max length */
+function splitMessage(text, maxLen = 3900) {
+	const chunks = [];
+	let remaining = text;
+	while (remaining.length > maxLen) {
+		// Try to split at a double newline (paragraph break)
+		let splitIdx = remaining.lastIndexOf('\n\n', maxLen);
+		if (splitIdx < maxLen * 0.3) {
+			// No good paragraph break, try single newline
+			splitIdx = remaining.lastIndexOf('\n', maxLen);
+		}
+		if (splitIdx < maxLen * 0.3) {
+			// No good newline, hard split at maxLen
+			splitIdx = maxLen;
+		}
+		chunks.push(remaining.slice(0, splitIdx).trim());
+		remaining = remaining.slice(splitIdx).trim();
+	}
+	if (remaining) chunks.push(remaining);
+	return chunks;
+}
 
 const THERAPEUTIC_CATEGORIES = ['pattern', 'trigger', 'avoidance', 'schema', 'growth', 'coping', 'insight', 'homework'];
 
@@ -49,8 +71,11 @@ function detectComplexTask(text, activeCheckin) {
 	// Mental health / emotional depth
 	if (/\b(anxious|depressed|panic|overwhelm|trigger|dissociat|suicid|self.?harm|therapy|therapist|schema|attachment|ifs|dbt|aedp|emotion|mood|bipolar|mania|hypo)\b/i.test(text)) return true;
 
-	// Complex requests
-	if (/\b(analyse|analyze|compare|explain.*detail|research|deep dive|break down|pros and cons|trade.?off|strategy|plan)\b/i.test(text)) return true;
+	// Complex requests (but NOT simple retrieval like "show me my research")
+	if (/\b(analyse|analyze|compare|explain.*detail|deep dive|break down|pros and cons|trade.?off|strategy|plan)\b/i.test(text)) return true;
+
+	// "research" only triggers Pro when asking to DO research, not to VIEW past results
+	if (/\b(research|investigate|look into)\b/i.test(text) && !/\b(show|list|recent|history|results|previous|past|full report)\b/i.test(text)) return true;
 
 	// Long messages (>300 chars) likely need deeper reasoning
 	if (text.length > 300) return true;
@@ -864,10 +889,20 @@ export async function handleMessage(msg, env) {
 			} else {
 				isComplete = true;
 				if (fullText.trim()) {
-					// Final message: send with HTML formatting + buttons (replaces the draft bubble)
 					const btns = { inline_keyboard: [[{ text: "🔊 Voice", callback_data: "action_voice" }, { text: "🗑️ Delete", callback_data: "action_delete_msg" }]] };
-					const sent = await telegram.sendMessage(chatId, threadId, fullText, env, messageId, btns);
-					lastSentMsgId = sent?.result?.message_id;
+
+					// Split long messages to respect Telegram's 4096 char limit
+					if (fullText.length > 3900) {
+						const chunks = splitMessage(fullText, 3900);
+						for (let i = 0; i < chunks.length; i++) {
+							const isLast = i === chunks.length - 1;
+							const sent = await telegram.sendMessage(chatId, threadId, chunks[i], env, i === 0 ? messageId : null, isLast ? btns : undefined);
+							if (isLast) lastSentMsgId = sent?.result?.message_id;
+						}
+					} else {
+						const sent = await telegram.sendMessage(chatId, threadId, fullText, env, messageId, btns);
+						lastSentMsgId = sent?.result?.message_id;
+					}
 				}
 			}
 		}

@@ -827,6 +827,18 @@ export default {
 			return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
 		}
 
+		if (request.method === "GET" && new URL(request.url).pathname === "/test-workflow") {
+			if (!env.MEMORY_WORKFLOW) return new Response(JSON.stringify({ error: 'MEMORY_WORKFLOW binding not found' }), { status: 500 });
+			const chatId = Number(env.OWNER_ID);
+			const instance = await env.MEMORY_WORKFLOW.create({
+				id: `test-${Date.now()}`,
+				params: { chatId }
+			});
+			return new Response(JSON.stringify({ status: 'triggered', instanceId: instance.id }), {
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
 		if (request.method === "GET" && new URL(request.url).pathname === "/reindex-vectors") {
 			const chatId = Number(env.OWNER_ID);
 			const allMemories = await memoryStore.getMemories(env, chatId, 200);

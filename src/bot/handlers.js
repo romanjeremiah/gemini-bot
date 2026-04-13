@@ -441,7 +441,19 @@ export async function handleMessage(msg, env) {
 		// Also skip cache when media is present, because the cache has codeExecution baked in
 		const cacheContext = hasMedia ? null : await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, textModel);
 		const fullSysPrompt = `${personaInstruction}\n\n${MENTAL_HEALTH_DIRECTIVE}\n\n${SECOND_BRAIN_DIRECTIVE}\n\n${FORMATTING_RULES}\n${dynamicContext}`;
-		const chat = await createChat(hist, fullSysPrompt, env, cacheContext, textModel, { skipCodeExecution: hasMedia });
+
+		let chat;
+		try {
+			chat = await createChat(hist, fullSysPrompt, env, cacheContext, textModel, { skipCodeExecution: hasMedia });
+		} catch (cacheErr) {
+			// If cache is stale (403), retry without cache
+			if (cacheErr.message?.includes('403') || cacheErr.message?.includes('CachedContent')) {
+				log.warn('cache_stale_retry', { msg: cacheErr.message });
+				chat = await createChat(hist, fullSysPrompt, env, null, textModel, { skipCodeExecution: hasMedia });
+			} else {
+				throw cacheErr;
+			}
+		}
 
 		let userParts = [];
 		if (cacheContext) {

@@ -108,17 +108,26 @@ const _cacheNames = new Map();
 async function getOrCreateCache(personaInstruction, formattingRules, env, model = PRIMARY_TEXT_MODEL) {
   const cacheKey = `gemini_cache_${model}_${hashStr(personaInstruction).slice(0, 16)}`;
 
-  if (_cacheNames.has(cacheKey)) return _cacheNames.get(cacheKey);
+  // Check in-memory cache first, but validate it's still alive on Google
+  if (_cacheNames.has(cacheKey)) {
+    try {
+      await getAIDirect(env).caches.get({ name: _cacheNames.get(cacheKey) });
+      return _cacheNames.get(cacheKey);
+    } catch {
+      console.log('🗑️ In-memory cache expired, clearing...');
+      _cacheNames.delete(cacheKey);
+    }
+  }
 
   const kvCacheName = await env.CHAT_KV.get(cacheKey);
   if (kvCacheName) {
     try {
-      // Use direct connection for cache management (Gateway doesn't proxy cache calls)
       await getAIDirect(env).caches.get({ name: kvCacheName });
       _cacheNames.set(cacheKey, kvCacheName);
       return kvCacheName;
     } catch {
-      console.log('🗑️ Cached content expired on Google side, recreating...');
+      console.log('🗑️ KV cache expired on Google side, recreating...');
+      await env.CHAT_KV.delete(cacheKey);
     }
   }
 

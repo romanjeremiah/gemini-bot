@@ -87,34 +87,9 @@ async function silentObservation(env, chatId, userText, botResponse) {
 	if (count >= 5) return;
 
 	try {
-		const response = await generateShortResponse(
-			`You just had this exchange with the user:
-
-USER: ${userText.slice(0, 500)}
-YOU: ${botResponse.slice(0, 300)}
-
-Quietly reflect: did you learn anything NEW about this person that is worth remembering? This could be:
-- An implicit preference they did not state directly (e.g. they always ask about food when stressed)
-- A behavioural pattern (e.g. they message late at night when anxious)
-- A new interest, goal, or life event they mentioned in passing
-- An emotional pattern (e.g. they deflect with humour when discussing relationships)
-- Something that changed from what you previously knew
-
-If you noticed something worth saving, respond with ONLY a single concise observation starting with "OBSERVATION:" (e.g. "OBSERVATION: User tends to message about coding when avoiding emotional topics").
-
-Additionally, extract any RELATIONAL TRIPLES that define lasting connections between people, activities, emotions, or conditions.
-Format each triple on its own line as: TRIPLE: Subject | Predicate | Object
-Examples:
-TRIPLE: Roman | has_condition | ADHD
-TRIPLE: Gym | reduces | Anxiety
-TRIPLE: Late_night_coding | triggers | Overwhelm
-TRIPLE: Quetiapine | improves | Sleep
-Only include triples you are confident about from the conversation.
-
-If nothing new was learned, respond with exactly: NOTHING_NEW`,
-			'You are a silent observer. Be concise. Only note genuinely new implicit information, not obvious facts already stated.',
-			env
-		);
+		// Use Cloudflare AI (free) instead of Gemini for background observation
+		const { extractObservation } = await import('../services/cfAi');
+		const response = await extractObservation(env, userText, botResponse);
 
 		if (response && response.includes('OBSERVATION:')) {
 			const obsMatch = response.match(/OBSERVATION:\s*(.+)/);
@@ -1459,6 +1434,17 @@ export async function handleCallback(callbackQuery, env) {
 			if (selected.length > 0) {
 				await moodStore.upsertEntry(env, chatId, today, 'evening', { emotions: JSON.stringify(selected) });
 				log.info('mood_emotions_logged', { chatId, emotions: selected });
+
+				// Background: auto-tag mood entry with clinical categories (CF AI, free)
+				import('../services/cfAi').then(async ({ tagMoodEntry }) => {
+					const todayEntry = await moodStore.getEntry(env, chatId, today, 'evening').catch(() => null);
+					const parsed = todayEntry?.data ? (typeof todayEntry.data === 'string' ? JSON.parse(todayEntry.data) : todayEntry.data) : {};
+					const tags = await tagMoodEntry(env, parsed.mood_score, selected, parsed.note);
+					if (tags) {
+						await moodStore.upsertEntry(env, chatId, today, 'evening', { clinical_tags: tags });
+						log.info('mood_tagged', { chatId, tags });
+					}
+				}).catch(e => console.error('Mood tagging error:', e.message));
 			}
 
 			// Clean up KV

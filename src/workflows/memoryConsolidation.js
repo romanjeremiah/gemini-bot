@@ -25,7 +25,29 @@ export class MemoryConsolidationWorkflow extends WorkflowEntrypoint {
 			return { status: 'skipped', reason: 'Not enough memories to consolidate', count: allMemories.length };
 		}
 
-		// Step 2: Call Gemini to consolidate (the expensive, retryable step)
+		// Step 2: First-pass deduplication using Cloudflare AI (free, saves Gemini tokens)
+		const dedupResult = await step.do('cf-ai-dedup', {
+			retries: { limit: 2, delay: '5 seconds', backoff: 'constant' },
+			timeout: '30 seconds',
+		}, async () => {
+			try {
+				const { deduplicateMemories } = await import('../services/cfAi');
+				return await deduplicateMemories(this.env, allMemories);
+			} catch (e) {
+				console.error('CF AI dedup failed, skipping:', e.message);
+				return { groups: [], duplicates: [] };
+			}
+		});
+
+		// Remove duplicates identified by CF AI before sending to Gemini
+		const duplicateIds = new Set();
+		for (const [, dupIdx] of dedupResult.duplicates) {
+			if (allMemories[dupIdx]) duplicateIds.add(allMemories[dupIdx].id);
+		}
+		const dedupedMemories = allMemories.filter(m => !duplicateIds.has(m.id));
+		console.log(`🧹 CF AI dedup: ${allMemories.length} → ${dedupedMemories.length} memories (removed ${duplicateIds.size} duplicates)`);
+
+		// Step 3: Call Gemini to consolidate (the expensive, retryable step)
 		const consolidated = await step.do('ai-consolidation', {
 			retries: { limit: 3, delay: '10 seconds', backoff: 'exponential' },
 			timeout: '120 seconds',
@@ -33,7 +55,7 @@ export class MemoryConsolidationWorkflow extends WorkflowEntrypoint {
 			const { GoogleGenAI } = await import('@google/genai');
 			const ai = new GoogleGenAI({ apiKey: this.env.GEMINI_API_KEY });
 
-			const rawText = allMemories.map(m => `[${m.category}] ${m.fact} (Score: ${m.importance_score})`).join('\n');
+			const rawText = dedupedMemories.map(m => `[${m.category}] ${m.fact} (Score: ${m.importance_score})`).join('\n');
 
 			const prompt = `You are performing memory consolidation for a therapeutic Second Brain.
 Here are the user's saved memories:

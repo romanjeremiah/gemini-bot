@@ -13,6 +13,11 @@ import * as vectorStore from './vectorStore';
 const THERAPEUTIC_CATEGORIES = ['pattern', 'trigger', 'avoidance', 'schema', 'growth', 'coping', 'insight', 'homework'];
 
 export async function saveMemory(env, chatId, category, fact, importance = 1) {
+	// Ensure user_profiles entry exists (prevents FOREIGN KEY constraint errors for new users)
+	await env.DB.prepare(
+		"INSERT OR IGNORE INTO user_profiles (chat_id) VALUES (?)"
+	).bind(chatId).run();
+
 	const result = await env.DB.prepare(
 		"INSERT INTO memories (chat_id, category, fact, importance_score) VALUES (?, ?, ?, ?)"
 	).bind(chatId, category.toLowerCase(), fact, importance).run();

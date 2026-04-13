@@ -138,6 +138,13 @@ export async function editMessageReplyMarkup(chatId, msgId, markup, env) {
 	return await tgApi("editMessageReplyMarkup", env, payload);
 }
 
+// ---- Answer Callback Query ----
+export async function answerCallbackQuery(callbackQueryId, env, text = null) {
+	const payload = { callback_query_id: callbackQueryId };
+	if (text) payload.text = text;
+	return await tgApi("answerCallbackQuery", env, payload);
+}
+
 // ---- Delete Message ----
 export async function deleteMessage(chatId, msgId, env) {
 	return await tgApi("deleteMessage", env, { chat_id: chatId, message_id: msgId });

@@ -139,9 +139,16 @@ async function handleHealthCheckIns(env) {
 		if (alreadyLogged) return;
 
 		await telegram.sendMessage(chatId, threadId,
-			`<b>Evening check-in.</b>\n\nWhere would you place yourself on the mood scale right now?\n\n🔴 <b>0-1: Severe Depression</b>\n<i>(Bleak, no movement, hopeless)</i>\n\n🟠 <b>2-3: Mild/Moderate</b>\n<i>(Struggle, anxious)</i>\n\n🟢 <b>4-6: Balanced</b>\n<i>(Good decisions, optimistic)</i>\n\n🟡 <b>7-8: Hypomania</b>\n<i>(Very productive, racing)</i>\n\n🔴 <b>9-10: Mania</b>\n<i>(Reckless, lost touch)</i>`,
+			`<b>Evening Check-in</b>\n\nTap each item to check it off, then select your mood score.\n\n🔴 <b>0-1:</b> Severe Depression\n🟠 <b>2-3:</b> Mild/Moderate\n🟢 <b>4-6:</b> Balanced\n🟡 <b>7-8:</b> Hypomania\n🔴 <b>9-10:</b> Mania`,
 			env, null, {
 				inline_keyboard: [
+					[{ text: '☐  Morning medication taken', callback_data: 'mchk|0|med_morning', style: 'success' }],
+					[{ text: '☐  ADHD medication taken', callback_data: 'mchk|1|med_adhd', style: 'success' }],
+					[{ text: '☐  Anxiety medication taken', callback_data: 'mchk|2|med_anxiety', style: 'success' }],
+					[{ text: '☐  Exercised today', callback_data: 'mchk|3|exercise', style: 'primary' }],
+					[{ text: '☐  Ate a proper meal', callback_data: 'mchk|4|meal', style: 'primary' }],
+					[{ text: '☐  Slept well last night', callback_data: 'mchk|5|sleep', style: 'primary' }],
+					[{ text: '───── Mood Scale ─────', callback_data: 'noop' }],
 					[{ text: '🔴 0-1', callback_data: 'mood_score_1', style: 'danger' }, { text: '🟠 2-3', callback_data: 'mood_score_3', style: 'danger' }],
 					[{ text: '🟢 4-6', callback_data: 'mood_score_5', style: 'success' }],
 					[{ text: '🟡 7-8', callback_data: 'mood_score_7', style: 'primary' }, { text: '🔴 9-10', callback_data: 'mood_score_9', style: 'danger' }]

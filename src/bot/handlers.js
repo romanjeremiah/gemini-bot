@@ -235,15 +235,26 @@ async function handleCommand(command, msg, env) {
 		}
 		case "/mood": {
 			await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 1800 });
+
+			// Build checklist-style mood check with toggleable items
+			const moodChecklistKb = {
+				inline_keyboard: [
+					[{ text: '☐  Morning medication taken', callback_data: 'mchk|0|med_morning', style: 'success' }],
+					[{ text: '☐  ADHD medication taken', callback_data: 'mchk|1|med_adhd', style: 'success' }],
+					[{ text: '☐  Anxiety medication taken', callback_data: 'mchk|2|med_anxiety', style: 'success' }],
+					[{ text: '☐  Exercised today', callback_data: 'mchk|3|exercise', style: 'primary' }],
+					[{ text: '☐  Ate a proper meal', callback_data: 'mchk|4|meal', style: 'primary' }],
+					[{ text: '☐  Slept well last night', callback_data: 'mchk|5|sleep', style: 'primary' }],
+					[{ text: '───── Mood Scale ─────', callback_data: 'noop' }],
+					[{ text: '🔴 0-1', callback_data: 'mood_score_1', style: 'danger' }, { text: '🟠 2-3', callback_data: 'mood_score_3', style: 'danger' }],
+					[{ text: '🟢 4-6', callback_data: 'mood_score_5', style: 'success' }],
+					[{ text: '🟡 7-8', callback_data: 'mood_score_7', style: 'primary' }, { text: '🔴 9-10', callback_data: 'mood_score_9', style: 'danger' }],
+				]
+			};
+
 			await telegram.sendMessage(chatId, threadId,
-				`<b>Mood check.</b>\n\nWhere would you place yourself on the scale right now?\n\n🔴 <b>0-1: Severe Depression</b>\n<i>(Bleak, hopeless)</i>\n\n🟠 <b>2-3: Mild/Moderate</b>\n<i>(Struggle, anxious)</i>\n\n🟢 <b>4-6: Balanced</b>\n<i>(Optimistic, sociable)</i>\n\n🟡 <b>7-8: Hypomania</b>\n<i>(Productive, racing)</i>\n\n🔴 <b>9-10: Mania</b>\n<i>(Reckless, delusions)</i>`,
-				env, null, {
-					inline_keyboard: [
-						[{ text: '🔴 0-1', callback_data: 'mood_score_1', style: 'danger' }, { text: '🟠 2-3', callback_data: 'mood_score_3', style: 'danger' }],
-						[{ text: '🟢 4-6', callback_data: 'mood_score_5', style: 'success' }],
-						[{ text: '🟡 7-8', callback_data: 'mood_score_7', style: 'primary' }, { text: '🔴 9-10', callback_data: 'mood_score_9', style: 'danger' }]
-					]
-				});
+				`<b>Mood Check-in</b>\n\nTap each item to check it off, then select your mood score.\n\n🔴 <b>0-1:</b> Severe Depression\n🟠 <b>2-3:</b> Mild/Moderate\n🟢 <b>4-6:</b> Balanced\n🟡 <b>7-8:</b> Hypomania\n🔴 <b>9-10:</b> Mania`,
+				env, null, moodChecklistKb);
 			return true;
 		}
 		case "/architect": {
@@ -614,6 +625,12 @@ export async function handleMessage(msg, env) {
 				.catch(e => console.error('Vectorize index error:', e.message));
 		}
 
+		// Index media in Vectorize for multimodal search (fire-and-forget)
+		if (uploadedImageBase64 && uploadedImageMime && fullText) {
+			vectorStore.indexMedia(env, chatId, 'image', uploadedImageBase64, uploadedImageMime, fullText.slice(0, 200), messageId)
+				.catch(e => console.error('Vectorize media index error:', e.message));
+		}
+
 		// Silent Observation: after substantive conversations, Xaridotis quietly reflects
 		// on what it learned about the user implicitly (not just what was explicitly saved)
 		if (userText.length > 30 && fullText.length > 50) {
@@ -690,6 +707,37 @@ export async function handleCallback(callbackQuery, env) {
 		await telegram.deleteMessage(chatId, msgId, env);
 	} else if (data === "action_dismiss_pr") {
 		await telegram.editMessage(chatId, msgId, "<i>Architecture suggestion dismissed.</i>", env);
+	} else if (data === 'noop') {
+		// Separator row, do nothing
+		await telegram.answerCallbackQuery(callbackQuery.id, env);
+	} else if (data.startsWith("mchk|")) {
+		// Mood checklist toggle
+		const parts = data.split("|");
+		const index = parseInt(parts[1]);
+		const markup = callbackQuery.message.reply_markup;
+		if (!markup?.inline_keyboard?.[index]?.[0]) return;
+		const button = markup.inline_keyboard[index][0];
+		if (button.text.startsWith("✅")) {
+			button.text = `☐  ${button.text.replace(/^✅\s+/, "")}`;
+		} else {
+			button.text = `✅  ${button.text.replace(/^☐\s+/, "")}`;
+		}
+
+		// Count checked items for progress
+		const checkableRows = markup.inline_keyboard.filter(row => row[0]?.callback_data?.startsWith('mchk|'));
+		const checked = checkableRows.filter(row => row[0].text.startsWith('✅')).length;
+		const total = checkableRows.length;
+		const bar = '▓'.repeat(Math.round((checked / total) * 10)) + '░'.repeat(10 - Math.round((checked / total) * 10));
+
+		const newText = `<b>Mood Check-in</b>\n\n${bar} ${checked}/${total} tracked\n\nTap each item to check it off, then select your mood score.\n\n🔴 <b>0-1:</b> Severe Depression\n🟠 <b>2-3:</b> Mild/Moderate\n🟢 <b>4-6:</b> Balanced\n🟡 <b>7-8:</b> Hypomania\n🔴 <b>9-10:</b> Mania`;
+		await telegram.editMessage(chatId, msgId, newText, env, markup);
+
+		// Save checked items to KV for later retrieval when mood score is submitted
+		const checkedItems = checkableRows
+			.filter(row => row[0].text.startsWith('✅'))
+			.map(row => row[0].callback_data.split('|')[2]);
+		await env.CHAT_KV.put(`mood_checklist_${chatId}`, JSON.stringify(checkedItems), { expirationTtl: 3600 });
+
 	} else if (data.startsWith("chk|")) {
 		const parts = data.split("|");
 		const index = parseInt(parts[1]);
@@ -754,12 +802,32 @@ export async function handleCallback(callbackQuery, env) {
 			const entry = await moodStore.upsertEntry(env, chatId, today, 'evening', { mood_score: score });
 			log.info('mood_score', { chatId, score });
 
+			// Retrieve any checklist items that were ticked before the score was submitted
+			const checklistRaw = await env.CHAT_KV.get(`mood_checklist_${chatId}`);
+			const checkedItems = checklistRaw ? JSON.parse(checklistRaw) : [];
+			if (checkedItems.length) {
+				// Save checklist data alongside the mood entry
+				await moodStore.upsertEntry(env, chatId, today, 'evening', {
+					med_morning: checkedItems.includes('med_morning'),
+					med_adhd: checkedItems.includes('med_adhd'),
+					med_anxiety: checkedItems.includes('med_anxiety'),
+					exercise: checkedItems.includes('exercise'),
+					meal: checkedItems.includes('meal'),
+					sleep_quality: checkedItems.includes('sleep') ? 'good' : null,
+				});
+				await env.CHAT_KV.delete(`mood_checklist_${chatId}`);
+			}
+
+			const checklistSummary = checkedItems.length
+				? `\nChecklist items completed: ${checkedItems.join(', ')}.`
+				: '';
+
 			if (score <= 1) {
-				contextPrompt = `The user logged their mood as ${score}/10 (severe depression). Respond with deep compassion. Mention Samaritans (116 123) and SHOUT (text 85258). Then gently ask what has been weighing on them.`;
+				contextPrompt = `The user logged their mood as ${score}/10 (severe depression).${checklistSummary} Respond with deep compassion. Mention Samaritans (116 123) and SHOUT (text 85258). Then gently ask what has been weighing on them.`;
 			} else if (score >= 9) {
-				contextPrompt = `The user logged their mood as ${score}/10 (mania). Acknowledge calmly. Then ask ONE question about their safety or sleep.`;
+				contextPrompt = `The user logged their mood as ${score}/10 (mania).${checklistSummary} Acknowledge calmly. Then ask ONE question about their safety or sleep.`;
 			} else {
-				contextPrompt = `The user logged their mood as ${score}/10 (${entry.mood_label || 'balanced'}). Acknowledge the score naturally and briefly. Then tell them to tap one of the buttons below to start logging emotions.`;
+				contextPrompt = `The user logged their mood as ${score}/10 (${entry.mood_label || 'balanced'}).${checklistSummary} Acknowledge the score naturally and briefly. If they checked medication or exercise items, give a brief nod of recognition. Then tell them to tap one of the buttons below to start logging emotions.`;
 			}
 
 			try {

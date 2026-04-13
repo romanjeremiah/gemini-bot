@@ -1,25 +1,62 @@
 /**
  * Vectorize Semantic Memory Service
- * Uses Cloudflare Workers AI for embeddings + Vectorize for semantic search.
- * Enhances the existing memoryStore with fuzzy "find conversations about topic X" capability.
+ * Uses Gemini Embedding 2 for multimodal embeddings + Cloudflare Vectorize for search.
+ * Supports text, images, audio, video, and documents in a unified embedding space.
  *
- * Embedding model: @cf/baai/bge-base-en-v1.5 (768 dimensions, cosine metric)
+ * Primary embedding: gemini-embedding-2-preview (768 dimensions via output_dimensionality)
+ * Fallback embedding: @cf/baai/bge-base-en-v1.5 (768 dimensions, text-only)
  * Reranker: @cf/baai/bge-reranker-base (cross-attention relevance scoring)
  */
 
-const EMBEDDING_MODEL = '@cf/baai/bge-base-en-v1.5';
+const FALLBACK_EMBEDDING_MODEL = '@cf/baai/bge-base-en-v1.5';
 const RERANKER_MODEL = '@cf/baai/bge-reranker-base';
-const MAX_TEXT_LENGTH = 512; // bge-base-en-v1.5 context window
+const GEMINI_EMBEDDING_MODEL = 'gemini-embedding-2-preview';
+const EMBEDDING_DIMS = 768;
+const MAX_TEXT_LENGTH = 8000; // Gemini Embedding 2 supports 8192 tokens
 
 /**
- * Generate embedding for a text string using Workers AI.
- * @param {Object} env - Worker env with AI binding
- * @param {string} text
- * @returns {Float32Array|number[]} 768-dim vector
+ * Generate embedding using Gemini Embedding 2 (multimodal).
+ * Falls back to Cloudflare Workers AI for text if Gemini is unavailable.
+ * @param {Object} env - Worker env with AI + GEMINI_API_KEY
+ * @param {string|Object} input - text string or { inlineData: { mimeType, data } } for media
+ * @returns {number[]} 768-dim vector
  */
-async function embed(env, text) {
-	const truncated = text.slice(0, MAX_TEXT_LENGTH);
-	const result = await env.AI.run(EMBEDDING_MODEL, { text: [truncated] });
+async function embed(env, input) {
+	// Try Gemini Embedding 2 first (supports multimodal)
+	if (env.GEMINI_API_KEY) {
+		try {
+			const { GoogleGenAI } = await import('@google/genai');
+			const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
+
+			let content;
+			if (typeof input === 'string') {
+				content = input.slice(0, MAX_TEXT_LENGTH);
+			} else if (input?.inlineData) {
+				// Multimodal: image/audio/video as inline data
+				content = [input];
+			} else {
+				content = String(input).slice(0, MAX_TEXT_LENGTH);
+			}
+
+			const result = await ai.models.embedContent({
+				model: GEMINI_EMBEDDING_MODEL,
+				contents: content,
+				config: { outputDimensionality: EMBEDDING_DIMS },
+			});
+
+			return result.embeddings?.[0]?.values || result.embedding?.values;
+		} catch (err) {
+			console.warn('⚠️ Gemini Embedding 2 failed, falling back to Workers AI:', err.message);
+		}
+	}
+
+	// Fallback: Cloudflare Workers AI (text-only)
+	if (typeof input !== 'string') {
+		console.warn('⚠️ Non-text input requires Gemini Embedding 2, skipping');
+		return null;
+	}
+	const truncated = input.slice(0, 512);
+	const result = await env.AI.run(FALLBACK_EMBEDDING_MODEL, { text: [truncated] });
 	return result.data[0];
 }
 
@@ -82,6 +119,40 @@ export async function indexMemory(env, chatId, category, fact, memoryId) {
 		console.log(`🧠 Vectorize indexed: mem_${chatId}_${memoryId}`);
 	} catch (err) {
 		console.error('⚠️ Vectorize index error:', err.message);
+	}
+}
+
+/**
+ * Index media (images, audio, video) for multimodal semantic search.
+ * Uses Gemini Embedding 2 to embed the media directly.
+ * @param {Object} env
+ * @param {number} chatId
+ * @param {string} mediaType - 'image', 'audio', 'video'
+ * @param {string} base64Data - base64-encoded media content
+ * @param {string} mimeType - e.g. 'image/jpeg', 'audio/ogg'
+ * @param {string} description - AI-generated description of the media
+ * @param {number} messageId - Telegram message ID for reference
+ */
+export async function indexMedia(env, chatId, mediaType, base64Data, mimeType, description, messageId) {
+	if (!env.VECTORIZE || !env.GEMINI_API_KEY) return;
+	try {
+		const vector = await embed(env, { inlineData: { mimeType, data: base64Data } });
+		if (!vector) return;
+
+		await env.VECTORIZE.upsert([{
+			id: `media_${chatId}_${messageId}`,
+			values: vector,
+			metadata: {
+				chatId: Number(chatId),
+				category: mediaType,
+				fact: `[${mediaType}] ${description || 'Media attachment'}`.slice(0, 200),
+				messageId: String(messageId),
+				mediaType,
+			},
+		}]);
+		console.log(`🖼️ Vectorize indexed media: ${mediaType} (msg ${messageId})`);
+	} catch (err) {
+		console.error('⚠️ Vectorize media index error:', err.message);
 	}
 }
 

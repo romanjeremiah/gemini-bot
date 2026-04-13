@@ -12,7 +12,7 @@ import { quoteTool } from './quote';
 import { effectTool } from './effect';
 import { saveTherapeuticNoteTool, getTherapeuticNotesTool } from './therapeutic';
 import { logMoodEntryTool, getMoodHistoryTool } from './mood';
-import { fetchTool } from './fetch';
+import { fetchTool, tavilySearchTool } from './fetch';
 import { scheduleTool } from './schedule';
 import { githubReadTool, githubPatchTool, githubExploreTool } from './github';
 import { cloudflareAdminTool } from './cloudflare';
@@ -38,6 +38,7 @@ export const toolRegistry = {
 	[logMoodEntryTool.definition.name]: logMoodEntryTool,
 	[getMoodHistoryTool.definition.name]: getMoodHistoryTool,
 	[fetchTool.definition.name]: fetchTool,
+	[tavilySearchTool.definition.name]: tavilySearchTool,
 	[cloudflareAdminTool.definition.name]: cloudflareAdminTool,
 	[scheduleTool.definition.name]: scheduleTool,
 	[githubReadTool.definition.name]: githubReadTool,

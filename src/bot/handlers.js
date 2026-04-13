@@ -536,13 +536,36 @@ async function handleCommand(command, msg, env) {
 			try {
 				const { ARCHITECTURE_SUMMARY } = await import('../config/architecture.js');
 
-				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Phase 2: Querying trusted sources and documentation...</i>", env);
+				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Phase 2: Searching across platforms and competitors...</i>", env);
+
+				// Use Tavily for deep, LLM-ready research (if available), fall back to Google Search
+				let researchContext = '';
+				if (env.TAVILY_API_KEY) {
+					const { tavilyMultiSearch, formatTavilyForContext } = await import('../services/tavily');
+					const tavilyResults = await tavilyMultiSearch([
+						'Telegram Bot API latest features 2026',
+						'Google Gemini API new features agents 2026',
+						'AI companion chatbot innovations therapeutic 2026',
+						'Cloudflare Workers AI new features 2026',
+						'best AI chatbot UX patterns mental health 2026',
+					], env, { depth: 'advanced', maxResults: 3, timeRange: 'month' });
+					researchContext = formatTavilyForContext(tavilyResults, 6000);
+				}
+
+				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Phase 3: Analysing gaps and generating proposals...</i>", env);
+
+				const researchSection = researchContext
+					? `\n\nRESEARCH FINDINGS (from live web search):\n${researchContext}`
+					: '';
 
 				const { text: suggestions } = await generateWithFallback(env,
 					[{ role: 'user', parts: [{ text: `You are a senior AI product strategist and innovation researcher. You are reviewing a Telegram AI companion chatbot called Xaridotis (TenonMind). Your mission is to find cutting-edge capabilities and ideas that would make this bot genuinely unique in the market.
 
+PROJECT REALITY: This is a pure JavaScript project on Cloudflare Workers. Do NOT suggest TypeScript, Python, or any non-JS solutions. All code must be .js files.
+
 CURRENT ARCHITECTURE:
 ${ARCHITECTURE_SUMMARY}
+${researchSection}
 
 COMPREHENSIVE RESEARCH TASK:
 
@@ -589,7 +612,7 @@ OUTPUT: Propose exactly 3 HIGH-IMPACT innovations. For each:
    e) What makes this a "must-have" not a "nice-to-have"
 
 Be bold. Think beyond incremental improvements. Reference actual file paths from the architecture.` }] }],
-					{ tools: [{ googleSearch: {} }], temperature: 0.7 }
+					{ tools: researchContext ? [] : [{ googleSearch: {} }], temperature: 0.7 }
 				);
 
 				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Phase 3: Analysing gaps and drafting suggestions...</i>", env);

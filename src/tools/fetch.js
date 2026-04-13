@@ -41,3 +41,45 @@ export const fetchTool = {
 		}
 	}
 };
+
+
+export const tavilySearchTool = {
+	definition: {
+		name: "web_search_tavily",
+		description: "Search the web for current, accurate information using Tavily's AI-optimised search. Returns clean, structured text with citations. Use this for any factual question, current events, latest developments, or research. Much better than raw Google Search for getting LLM-ready content.",
+		parameters: {
+			type: "OBJECT",
+			properties: {
+				query: { type: "STRING", description: "The search query" },
+				topic: { type: "STRING", enum: ["general", "news"], description: "Type of search. Use 'news' for current events." },
+				max_results: { type: "NUMBER", description: "Number of results (default 5, max 10)" }
+			},
+			required: ["query"]
+		}
+	},
+	async execute(args, env) {
+		if (!env.TAVILY_API_KEY) {
+			return { status: "error", message: "Tavily API key not configured. Use googleSearch instead." };
+		}
+		try {
+			const { tavilySearch } = await import('../services/tavily');
+			const result = await tavilySearch(args.query, env, {
+				topic: args.topic || 'general',
+				maxResults: Math.min(args.max_results || 5, 10),
+				depth: 'basic',
+			});
+			return {
+				status: "success",
+				answer: result.answer,
+				results: result.results.map(r => ({
+					title: r.title,
+					url: r.url,
+					content: r.content?.slice(0, 500),
+				})),
+				responseTime: result.responseTime,
+			};
+		} catch (e) {
+			return { status: "error", message: e.message };
+		}
+	}
+};

@@ -1111,25 +1111,55 @@ export async function handleCallback(callbackQuery, env) {
 			const recentEntries = await moodStore.getHistory(env, chatId, 30, 'evening').catch(() => []);
 			let pastContext = 'No previous check-ins found.';
 			if (recentEntries.length > 1) {
-				const summaries = recentEntries.slice(0, 10).map(e =>
-					`${e.date}: score ${e.mood_score ?? '?'}, emotions: ${e.emotions || 'none'}`
-				).join(' | ');
+				const summaries = recentEntries.slice(0, 10).map(e => {
+					const parsed = typeof e.data === 'string' ? JSON.parse(e.data || '{}') : (e.data || {});
+					return `${e.date}: score ${parsed.mood_score ?? '?'}, emotions: ${parsed.emotions || 'none'}`;
+				}).join(' | ');
 				pastContext = `Recent evening check-ins (up to 30 days): ${summaries}`;
 			}
 
-			const contextPrompt = `The user just completed their mood check-in.
-Mood score: ${selected.length > 0 ? 'already logged' : 'unknown'}
-Negative emotions: ${negSelected.length > 0 ? negSelected.join(', ') : 'none'}
-Positive emotions: ${posSelected.length > 0 ? posSelected.join(', ') : 'none'}
+			// Pull therapeutic notes for clinical depth
+			const therapeuticNotes = await env.DB.prepare(
+				`SELECT category, fact FROM memories WHERE chat_id = ? AND category IN ('pattern','trigger','schema','insight','homework','growth') ORDER BY created_at DESC LIMIT 10`
+			).bind(chatId).all().then(r => r.results || []).catch(() => []);
+			const clinicalCtx = therapeuticNotes.length
+				? 'Clinical notes:\n' + therapeuticNotes.map(n => `[${n.category}] ${n.fact}`).join('\n')
+				: '';
+
+			// Pull semantic context related to their current emotions
+			const emotionQuery = [...negSelected, ...posSelected].join(' ') || 'mood emotions feelings';
+			const semanticCtx = await vectorStore.getSemanticContext(env, chatId, emotionQuery).catch(() => '');
+
+			// Today's mood score (pull from the entry we just updated)
+			const todayEntry = await moodStore.getEntry(env, chatId, today, 'evening').catch(() => null);
+			const todayParsed = todayEntry?.data ? (typeof todayEntry.data === 'string' ? JSON.parse(todayEntry.data) : todayEntry.data) : {};
+			const todayScore = todayParsed.mood_score;
+
+			const contextPrompt = `The user just completed their full mood check-in. Analyse everything and give a meaningful therapeutic summary.
+
+TODAY'S CHECK-IN:
+Mood score: ${todayScore ?? 'not recorded'}/10
+Positive emotions: ${posSelected.length > 0 ? posSelected.join(', ') : 'none selected'}
+Negative emotions: ${negSelected.length > 0 ? negSelected.join(', ') : 'none selected'}
+
+RECENT MOOD HISTORY:
 ${pastContext}
 
-Give a brief, warm overview of what you notice in their emotional state today. If there are patterns compared to recent days, mention them naturally.
-Then ask: "Would you like to talk about any of this now, or shall we pick it up another time?"
-Be human. Be warm. No clinical jargon. 2-4 sentences max.`;
+${clinicalCtx}
+
+${semanticCtx}
+
+YOUR RESPONSE (follow this structure naturally, not as a list):
+1. Acknowledge what they shared today. Name the emotions they selected. If the mix of positive and negative is notable (e.g. "inspired but lonely"), explore that tension.
+2. Compare to recent days. Is the score trending up, down, or stable? Are certain emotions recurring? Note any patterns without being clinical.
+3. Draw one therapeutic observation. Connect today's emotions to known patterns, triggers, or schemas from the clinical notes. Use AEDP/IFS language gently (e.g. "sounds like a protector part is active" or "there might be some unprocessed grief underneath the boredom").
+4. End with ONE natural question that invites deeper conversation but doesn't pressure. Something like "What do you think is driving the loneliness today?" not "Would you like to explore this further?"
+
+Keep it warm, direct, and personal. 3-5 sentences. No bullet points. No clinical jargon unless it adds genuine insight. You know this person well.`;
 
 			try {
 				const response = await generateShortResponse(contextPrompt, personas.xaridotis.instruction, env);
-				await telegram.sendMessage(chatId, threadId, response || `Thank you for sharing. What has been driving those feelings today?`, env);
+				await telegram.sendMessage(chatId, threadId, response || `Thank you for sharing. What has been on your mind today?`, env);
 
 				const histKey = `chat_${chatId}_${threadId}`;
 				let hist = await env.CHAT_KV.get(histKey, { type: 'json' }) || [];

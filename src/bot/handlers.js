@@ -1025,25 +1025,48 @@ export async function handleCallback(callbackQuery, env) {
 		const num = parseInt(data.split('_').pop());
 		const indexMap = await env.CHAT_KV.get(`research_list_${chatId}`, { type: 'json' });
 		if (!indexMap || !indexMap[num]) {
-			await telegram.answerCallbackQuery(callbackQuery.id, env, { text: 'Research list expired. Ask again.' });
+			await telegram.answerCallbackQuery(callbackQuery.id, env, { text: 'List expired. Ask again.' }).catch(() => {});
 			return;
 		}
 		const topic = indexMap[num];
-		await telegram.answerCallbackQuery(callbackQuery.id, env, { text: isAudio ? 'Generating audio...' : 'Loading report...' });
+		await telegram.answerCallbackQuery(callbackQuery.id, env, { text: isAudio ? '🔊 Generating audio...' : '📝 Loading...' }).catch(() => {});
 		await telegram.sendChatAction(chatId, threadId, isAudio ? 'record_voice' : 'typing', env);
 
-		// Feed back to Gemini as a conversational request
-		const fakeMsg = {
-			message_id: msgId,
-			chat: { id: chatId },
-			message_thread_id: threadId !== 'default' ? Number(threadId) : undefined,
-			from: callbackQuery.from,
-			text: isAudio
-				? `Read me the full research report on "${topic}" as audio.`
-				: `Show me the full research report on "${topic}".`,
-			date: Math.floor(Date.now() / 1000),
-		};
-		await handleMessage(fakeMsg, env);
+		// Retrieve the report directly (no need to go through Gemini)
+		const { searchResearchTool } = await import('../tools/research');
+		const result = await searchResearchTool.execute(
+			{ action: 'full', topic, index: num },
+			env,
+			{ chatId, threadId }
+		);
+
+		if (result.status !== 'success' || !result.report) {
+			await telegram.sendMessage(chatId, threadId, `Could not retrieve the full report for "${topic}". ${result.message || ''}`, env);
+			return;
+		}
+
+		if (isAudio) {
+			// Generate voice using TTS
+			const { voiceTool } = await import('../tools/voice');
+			const voiceText = result.report.slice(0, 4000);
+			await voiceTool.execute(
+				{ text: voiceText },
+				env,
+				{ chatId, threadId, replyToMessageId: msgId }
+			);
+		} else {
+			// Send as text, split into chunks if needed
+			const report = `<b>Research: ${topic}</b>\n\n${result.report}`;
+			const chunks = splitMessage(report, 3900);
+			const btns = { inline_keyboard: [[
+				{ text: '🔊 Listen', callback_data: `research_audio_${num}` },
+				{ text: '🗑️ Delete', callback_data: 'action_delete_msg' }
+			]] };
+			for (let i = 0; i < chunks.length; i++) {
+				const isLast = i === chunks.length - 1;
+				await telegram.sendMessage(chatId, threadId, chunks[i], env, null, isLast ? btns : undefined);
+			}
+		}
 	} else if (data === 'noop') {
 		// Separator row, do nothing
 		await telegram.answerCallbackQuery(callbackQuery.id, env);

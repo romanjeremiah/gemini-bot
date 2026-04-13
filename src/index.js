@@ -1041,7 +1041,9 @@ export default {
 		else if (update.poll_answer) {
 			const pa = update.poll_answer;
 			log.info('poll_answer_received', { pollId: pa.poll_id, optionIds: pa.option_ids, userId: pa.user?.id });
+			// Check mood poll context
 			const pollCtx = await env.CHAT_KV.get(`mood_poll_${pa.poll_id}`, { type: 'json' });
+			log.info('poll_kv_lookup', { key: `mood_poll_${pa.poll_id}`, found: !!pollCtx });
 			if (pollCtx) {
 				const score = pa.option_ids?.[0]; // 0-10, maps directly to mood score
 				if (score != null) {
@@ -1055,6 +1057,9 @@ export default {
 					await telegram.sendMessage(testCtx.chatId, testCtx.threadId,
 						`✅ <b>Poll test passed.</b> Option: ${pa.option_ids?.[0]}`, env);
 					await env.CHAT_KV.delete(`poll_test_${pa.poll_id}`);
+				} else {
+					// No context found for this poll — log for debugging
+					log.warn('poll_answer_no_context', { pollId: pa.poll_id, userId: pa.user?.id });
 				}
 			}
 		}

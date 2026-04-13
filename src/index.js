@@ -1242,18 +1242,29 @@ export default {
 		// ---- Health check-ins: enqueue to task queue instead of running inline ----
 		if (env.OWNER_ID && env.TASK_QUEUE) {
 			try {
-				// Schedule checks are cheap (KV reads only). Enqueue if action is needed.
 				await enqueueHealthTasks(env);
 			} catch (e) { log.error('cron_enqueue', { msg: e.message }); }
 
-			try { await handleMemoryConsolidation(env); } catch (e) { log.error('cron_consolidation', { msg: e.message }); }
-			try { await handleSpontaneousOutreach(env); } catch (e) { log.error('cron_outreach', { msg: e.message }); }
+			// Run remaining tasks concurrently
+			const cronResults = await Promise.allSettled([
+				handleMemoryConsolidation(env),
+				handleSpontaneousOutreach(env),
+			]);
+			cronResults.forEach((r, i) => {
+				if (r.status === 'rejected') log.error('cron_task_failed', { task: i, msg: r.reason?.message });
+			});
 		} else if (env.OWNER_ID) {
-			// Fallback: run inline if queue not available
-			try { await handleHealthCheckIns(env); } catch (e) { log.error('cron_checkin', { msg: e.message }); }
-			try { await handleMedicationNudge(env); } catch (e) { log.error('cron_nudge', { msg: e.message }); }
-			try { await handleMemoryConsolidation(env); } catch (e) { log.error('cron_consolidation', { msg: e.message }); }
-			try { await handleSpontaneousOutreach(env); } catch (e) { log.error('cron_outreach', { msg: e.message }); }
+			// Fallback: run all tasks concurrently without queue
+			const cronResults = await Promise.allSettled([
+				handleHealthCheckIns(env),
+				handleMedicationNudge(env),
+				handleMemoryConsolidation(env),
+				handleSpontaneousOutreach(env),
+			]);
+			cronResults.forEach((r, i) => {
+				const names = ['checkin', 'nudge', 'consolidation', 'outreach'];
+				if (r.status === 'rejected') log.error(`cron_${names[i]}_failed`, { msg: r.reason?.message });
+			});
 		}
 
 		// ---- Reminders ----

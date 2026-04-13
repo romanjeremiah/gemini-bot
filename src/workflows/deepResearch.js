@@ -34,8 +34,8 @@ export class DeepResearchWorkflow extends WorkflowEntrypoint {
 
 		// Step 2: Poll for results (Deep Research can take 1-5 minutes)
 		const researchOutput = await step.do('poll-results', {
-			retries: { limit: 1 },
-			timeout: '600 seconds', // 10 minute max for deep research
+			retries: { limit: 2, delay: '30 seconds', backoff: 'linear' },
+			timeout: '10 minutes',
 		}, async () => {
 			const { GoogleGenAI } = await import('@google/genai');
 			const ai = new GoogleGenAI({ apiKey: this.env.GEMINI_API_KEY });

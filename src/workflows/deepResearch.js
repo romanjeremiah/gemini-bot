@@ -32,38 +32,43 @@ export class DeepResearchWorkflow extends WorkflowEntrypoint {
 			return interaction.id;
 		});
 
-		// Step 2: Poll for results (Deep Research can take 1-5 minutes)
-		const researchOutput = await step.do('poll-results', {
-			retries: { limit: 2, delay: '30 seconds', backoff: 'linear' },
-			timeout: '10 minutes',
-		}, async () => {
-			const { GoogleGenAI } = await import('@google/genai');
-			const ai = new GoogleGenAI({ apiKey: this.env.GEMINI_API_KEY });
-
-			const maxAttempts = 60; // 60 * 10s = 10 minutes
-			for (let i = 0; i < maxAttempts; i++) {
+		// Step 2: Poll for results using step.sleep between checks
+		// Deep Research can take 1-5 minutes. We poll every 15 seconds, up to 20 attempts (5 min).
+		let researchOutput = null;
+		for (let attempt = 0; attempt < 20; attempt++) {
+			const pollResult = await step.do(`check-status-${attempt}`, {
+				retries: { limit: 2, delay: '5 seconds', backoff: 'constant' },
+				timeout: '30 seconds',
+			}, async () => {
+				const { GoogleGenAI } = await import('@google/genai');
+				const ai = new GoogleGenAI({ apiKey: this.env.GEMINI_API_KEY });
 				const result = await ai.interactions.get(interactionId);
 
 				if (result.status === 'completed') {
-					// Extract text from the last output
 					const outputs = result.outputs || [];
 					const textOutput = outputs.find(o => o.type === 'text' || o.text);
 					const text = textOutput?.text || outputs[outputs.length - 1]?.text || '';
-					if (!text) throw new Error('Deep Research completed but returned no text');
-					console.log(`🔬 Deep Research completed (${i * 10}s, ${text.length} chars)`);
-					return text;
+					return { done: true, text };
 				}
-
 				if (result.status === 'failed') {
-					throw new Error(`Deep Research failed: ${result.error || 'unknown'}`);
+					return { done: true, error: result.error || 'unknown' };
 				}
+				return { done: false, status: result.status };
+			});
 
-				// Wait 10 seconds before polling again
-				await new Promise(resolve => setTimeout(resolve, 10000));
+			if (pollResult.done) {
+				if (pollResult.error) throw new Error(`Deep Research failed: ${pollResult.error}`);
+				if (!pollResult.text) throw new Error('Deep Research completed but returned no text');
+				researchOutput = pollResult.text;
+				console.log(`🔬 Deep Research completed (attempt ${attempt}, ${researchOutput.length} chars)`);
+				break;
 			}
 
-			throw new Error('Deep Research timed out after 10 minutes');
-		});
+			// Sleep between polls (durable, doesn't consume CPU)
+			await step.sleep(`wait-${attempt}`, '15 seconds');
+		}
+
+		if (!researchOutput) throw new Error('Deep Research timed out after 5 minutes');
 
 		// Step 3: Synthesise and save to memory
 		const savedInsight = await step.do('save-insight', async () => {

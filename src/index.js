@@ -50,13 +50,14 @@ function extractEffectEmoji(msg, effectId) {
 // ---- Health Check-in Scheduler ----
 // Runs inside the cron handler. Checks London time and sends check-ins as Nightfall.
 async function handleHealthCheckIns(env) {
-	const now = new Date();
-	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
-	const hour = londonTime.getHours();
-	const minute = londonTime.getMinutes();
 	const chatId = Number(env.OWNER_ID);
+	const userTz = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Europe/London';
+	const now = new Date();
+	const localTime = new Date(now.toLocaleString('en-US', { timeZone: userTz }));
+	const hour = localTime.getHours();
+	const minute = localTime.getMinutes();
 	const threadId = 'default';
-	const today = londonTime.toISOString().split('T')[0];
+	const today = localTime.toISOString().split('T')[0];
 	const currentMins = hour * 60 + minute;
 
 	// Load schedules
@@ -939,6 +940,78 @@ async function handleReactionFeedback(reaction, env) {
 	console.log(`✨ Reaction feedback: ${emoji} (${sig.sentiment}) for msg ${msgId}`);
 }
 
+// ---- Queue-based task enqueuing (decouples LLM calls from cron) ----
+async function enqueueHealthTasks(env) {
+	const now = new Date();
+	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: await getUserTimezone(env) }));
+	const hour = londonTime.getHours();
+	const minute = londonTime.getMinutes();
+	const chatId = Number(env.OWNER_ID);
+	const today = londonTime.toISOString().split('T')[0];
+	const currentMins = hour * 60 + minute;
+
+	const morning = await getSchedule(env, 'morning_checkin');
+	const midday = await getSchedule(env, 'midday_checkin');
+	const evening = await getSchedule(env, 'evening_checkin');
+	const morningMins = morning.hour * 60 + (morning.minute || 0);
+	const middayMins = midday.hour * 60 + (midday.minute || 0);
+	const eveningMins = evening.hour * 60 + (evening.minute || 0);
+
+	// Polite deferral
+	const lastSeenStr = await env.CHAT_KV.get(`last_seen_${chatId}`);
+	const lastSeen = lastSeenStr ? parseInt(lastSeenStr) : 0;
+	const isUserActive = (Date.now() - lastSeen) < 20 * 60 * 1000;
+
+	// Morning check-in
+	if (currentMins >= morningMins && currentMins < middayMins) {
+		const key = `health_checkin_morning_${today}`;
+		if (!(await env.CHAT_KV.get(key)) && !isUserActive) {
+			await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
+			if (!(await moodStore.hasCheckedInToday(env, chatId, 'morning'))) {
+				await env.TASK_QUEUE.send({ type: 'health_checkin', period: 'morning', chatId });
+			}
+		}
+	}
+	// Midday check-in
+	else if (currentMins >= middayMins && currentMins < eveningMins) {
+		const key = `health_checkin_midday_${today}`;
+		if (!(await env.CHAT_KV.get(key)) && !isUserActive) {
+			await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
+			if (!(await moodStore.hasCheckedInToday(env, chatId, 'midday'))) {
+				await env.TASK_QUEUE.send({ type: 'health_checkin', period: 'midday', chatId });
+			}
+		}
+	}
+	// Evening check-in
+	else if (currentMins >= eveningMins) {
+		const key = `health_checkin_evening_${today}`;
+		if (!(await env.CHAT_KV.get(key)) && !isUserActive) {
+			await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
+			if (!(await moodStore.hasCheckedInToday(env, chatId, 'evening'))) {
+				await env.TASK_QUEUE.send({ type: 'mood_poll', chatId });
+			}
+		}
+	}
+
+	// Medication nudge check
+	for (const type of ['morning', 'midday']) {
+		const nudgeKey = `nudge_pending_${type}_${chatId}`;
+		const pendingTime = await env.CHAT_KV.get(nudgeKey);
+		if (!pendingTime) continue;
+		if ((Date.now() - parseInt(pendingTime)) < 30 * 60 * 1000) continue;
+		const logged = await moodStore.hasCheckedInToday(env, chatId, type);
+		if (logged) { await env.CHAT_KV.delete(nudgeKey); continue; }
+		await env.TASK_QUEUE.send({ type: 'med_nudge', period: type, chatId });
+		await env.CHAT_KV.delete(nudgeKey);
+	}
+}
+
+// Get user timezone (stored in KV, defaults to Europe/London)
+async function getUserTimezone(env) {
+	const tz = await env.CHAT_KV.get('user_timezone');
+	return tz || 'Europe/London';
+}
+
 export default {
 	async fetch(request, env, ctx) {
 	  try {
@@ -1120,23 +1193,67 @@ export default {
 	  }
 	},
 
+	// ---- Queue Consumer: processes LLM-heavy tasks decoupled from cron ----
+	async queue(batch, env) {
+		for (const msg of batch.messages) {
+			const task = msg.body;
+			try {
+				const chatId = task.chatId || Number(env.OWNER_ID);
+				const threadId = 'default';
+
+				if (task.type === 'health_checkin') {
+					await env.CHAT_KV.put(`health_checkin_active_${chatId}`, task.period, { expirationTtl: 1800 });
+					const prompt = task.period === 'morning'
+						? `Generate a 1-2 sentence morning greeting for Roman. It is morning. Weave in a brief, natural reference to one of his interests. Ask how he slept and casually ask if he has taken his morning medication. Keep it warm and conversational.`
+						: `Generate a 1-2 sentence midday check-in for Roman. Casually ask if he has taken his meds. Keep it brief and natural.`;
+					const greeting = await generateShortResponse(prompt, personas.xaridotis.instruction, env)
+						|| (task.period === 'morning' ? 'Morning. How did you sleep? Have you taken your meds?' : 'Quick midday check. Have you taken your meds?');
+					await telegram.sendMessage(chatId, threadId, greeting, env);
+					await env.CHAT_KV.put(`med_pending_${chatId}`, task.period, { expirationTtl: 7200 });
+					await env.CHAT_KV.put(`nudge_pending_${task.period}_${chatId}`, String(Date.now()), { expirationTtl: 3600 });
+
+				} else if (task.type === 'mood_poll') {
+					await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 1800 });
+					await sendMoodPoll(chatId, threadId, env);
+					await env.CHAT_KV.put(`nudge_pending_evening_${chatId}`, String(Date.now()), { expirationTtl: 7200 });
+
+				} else if (task.type === 'med_nudge') {
+					const medPending = await env.CHAT_KV.get(`med_pending_${chatId}`);
+					if (medPending) {
+						const nudge = await generateShortResponse(
+							`You asked Roman about his medication earlier but he hasn't confirmed. Send a brief, gentle 1-sentence follow-up like a friend would.`,
+							personas.xaridotis.instruction, env
+						) || 'Just checking — did you manage to take your meds?';
+						await telegram.sendMessage(chatId, threadId, nudge, env);
+					}
+				}
+
+				msg.ack();
+				log.info('queue_task_done', { type: task.type, period: task.period });
+			} catch (e) {
+				log.error('queue_task_error', { type: task.type, msg: e.message });
+				msg.retry();
+			}
+		}
+	},
+
 	// eslint-disable-next-line no-unused-vars
 	async scheduled(_event, env, _ctx) {
-		// ---- Health check-ins (owner only, Nightfall persona) ----
-		if (env.OWNER_ID) {
+		// ---- Health check-ins: enqueue to task queue instead of running inline ----
+		if (env.OWNER_ID && env.TASK_QUEUE) {
+			try {
+				// Schedule checks are cheap (KV reads only). Enqueue if action is needed.
+				await enqueueHealthTasks(env);
+			} catch (e) { log.error('cron_enqueue', { msg: e.message }); }
+
+			try { await handleMemoryConsolidation(env); } catch (e) { log.error('cron_consolidation', { msg: e.message }); }
+			try { await handleSpontaneousOutreach(env); } catch (e) { log.error('cron_outreach', { msg: e.message }); }
+		} else if (env.OWNER_ID) {
+			// Fallback: run inline if queue not available
 			try { await handleHealthCheckIns(env); } catch (e) { log.error('cron_checkin', { msg: e.message }); }
 			try { await handleMedicationNudge(env); } catch (e) { log.error('cron_nudge', { msg: e.message }); }
 			try { await handleMemoryConsolidation(env); } catch (e) { log.error('cron_consolidation', { msg: e.message }); }
 			try { await handleSpontaneousOutreach(env); } catch (e) { log.error('cron_outreach', { msg: e.message }); }
-
-			// Disabled: these are now manual-only via /study, /research, /architect commands
-			// try { await handleWeeklyReport(env); } catch (e) { log.error('cron_report', { msg: e.message }); }
-			// try { await handleAccountabilityNudge(env); } catch (e) { log.error('cron_accountability', { msg: e.message }); }
-			// try { await handleCuriosityDigest(env); } catch (e) { log.error('cron_digest', { msg: e.message }); }
-			// try { await handleAutonomousResearch(env); } catch (e) { log.error('cron_research', { msg: e.message }); }
-			// try { await handleSelfImprovement(env); } catch (e) { log.error('cron_self_improve', { msg: e.message }); }
-			// try { await handleArchitectureEvolution(env); } catch (e) { log.error('cron_architecture', { msg: e.message }); }
-			// try { await handleDailyStudy(env); } catch (e) { log.error('cron_daily_study', { msg: e.message }); }
 		}
 
 		// ---- Reminders ----

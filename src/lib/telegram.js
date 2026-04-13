@@ -277,19 +277,12 @@ export async function downloadFile(fileId, env) {
 export async function registerCommands(env) {
 	return await tgApi("setMyCommands", env, {
 		commands: [
+			{ command: "mood", description: "Interactive mood check-in" },
 			{ command: "listen", description: "Deep listening mode (brain dump)" },
 			{ command: "done", description: "End listening mode and synthesise" },
-			{ command: "research", description: "Deep research on any topic" },
-			{ command: "researchhistory", description: "View past research summaries" },
-			{ command: "researchfull", description: "Read full research report" },
-			{ command: "architect", description: "Innovation and feature research" },
-			{ command: "schedule", description: "View and manage schedules" },
+			{ command: "architect", description: "Innovation research" },
 			{ command: "persona", description: "Switch AI personality" },
-			{ command: "model", description: "Choose AI model (Pro/Flash)" },
-			{ command: "mood", description: "Interactive mood check-in" },
-			{ command: "clear", description: "Reset conversation history" },
-			{ command: "memories", description: "View saved facts" },
-			{ command: "forget", description: "Delete all memories" },
+			{ command: "clear", description: "Reset conversation" },
 			{ command: "start", description: "Welcome message" }
 		]
 	});

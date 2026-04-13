@@ -305,6 +305,24 @@ async function handleCommand(command, msg, env) {
 			}
 			return true;
 		}
+		case "/timezone": {
+			const tz = (msg.text || '').replace('/timezone', '').trim();
+			if (!tz) {
+				const current = await env.CHAT_KV.get('user_timezone') || 'Europe/London';
+				await telegram.sendMessage(chatId, threadId,
+					`Current timezone: <b>${current}</b>\n\nTo change: <code>/timezone America/New_York</code>\n\nOr share your location and I will detect it automatically.`, env);
+				return true;
+			}
+			// Validate timezone
+			try {
+				new Date().toLocaleString('en-US', { timeZone: tz });
+				await env.CHAT_KV.put('user_timezone', tz);
+				await telegram.sendMessage(chatId, threadId, `Timezone updated to <b>${tz}</b>. All check-ins and schedules will use this timezone.`, env);
+			} catch {
+				await telegram.sendMessage(chatId, threadId, `Invalid timezone: "${tz}". Use IANA format, e.g. <code>Europe/London</code>, <code>America/New_York</code>, <code>Asia/Tokyo</code>`, env);
+			}
+			return true;
+		}
 		case "/testpoll": {
 			// Test whether poll_answer webhooks are received
 			const pollRes = await telegram.sendPoll(chatId, threadId,

@@ -50,6 +50,21 @@
 			"class_name": "DeepResearchWorkflow"
 		}
 	],
+	"queues": {
+		"producers": [
+			{
+				"queue": "gemini-bot-tasks",
+				"binding": "TASK_QUEUE"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "gemini-bot-tasks",
+				"max_batch_size": 1,
+				"max_batch_timeout": 5
+			}
+		]
+	},
 	"triggers": {
 		"crons": [
 			"* * * * *"

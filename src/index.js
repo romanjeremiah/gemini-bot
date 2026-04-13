@@ -3,6 +3,7 @@ import { handleInlineQuery } from './bot/inlineHandler';
 import * as reminderStore from './services/reminderStore';
 import * as moodStore from './services/moodStore';
 import * as memoryStore from './services/memoryStore';
+import * as vectorStore from './services/vectorStore';
 import * as telegram from './lib/telegram';
 import { generateSpeech } from './lib/tts';
 import { generateShortResponse, generateWithFallback } from './lib/ai/gemini';
@@ -811,6 +812,21 @@ export default {
 		if (request.method === "GET" && new URL(request.url).pathname === "/register-commands") {
 			const result = await telegram.registerCommands(env);
 			return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
+		}
+
+		if (request.method === "GET" && new URL(request.url).pathname === "/reindex-vectors") {
+			const chatId = Number(env.OWNER_ID);
+			const allMemories = await memoryStore.getMemories(env, chatId, 200);
+			let indexed = 0;
+			for (const m of allMemories) {
+				try {
+					await vectorStore.indexMemory(env, chatId, m.category, m.fact, m.id || Date.now());
+					indexed++;
+				} catch (e) { console.error(`Re-index error for ${m.id}:`, e.message); }
+			}
+			return new Response(JSON.stringify({ status: 'success', total: allMemories.length, indexed }), {
+				headers: { "Content-Type": "application/json" }
+			});
 		}
 
 		if (request.method === "GET" && new URL(request.url).pathname === "/setup-webhook") {

@@ -1086,14 +1086,26 @@ export default {
 		}
 
 		if (task) {
-			ctx.waitUntil(
-				task.catch(err => {
-					log.error('background_task_failed', { msg: err.message, stack: err.stack?.slice(0, 500) });
-					if (env.OWNER_ID) {
-						telegram.sendMessage(env.OWNER_ID, 'default', `⚠️ <b>Background Error:</b> <code>${(err.message || '').slice(0, 200)}</code>`, env).catch(() => {});
-					}
-				})
-			);
+			// For owner messages, await directly to avoid waitUntil timeout on complex tool chains
+			// For other users (future multi-user), use waitUntil to avoid blocking
+			const isOwnerMsg = update.message?.from?.id === Number(env.OWNER_ID) || update.callback_query?.from?.id === Number(env.OWNER_ID);
+			if (isOwnerMsg) {
+				try {
+					await task;
+				} catch (err) {
+					log.error('owner_task_failed', { msg: err.message, stack: err.stack?.slice(0, 500) });
+					await telegram.sendMessage(env.OWNER_ID, 'default', `⚠️ <b>Error:</b> <code>${(err.message || '').slice(0, 200)}</code>`, env).catch(() => {});
+				}
+			} else {
+				ctx.waitUntil(
+					task.catch(err => {
+						log.error('background_task_failed', { msg: err.message, stack: err.stack?.slice(0, 500) });
+						if (env.OWNER_ID) {
+							telegram.sendMessage(env.OWNER_ID, 'default', `⚠️ <b>Background Error:</b> <code>${(err.message || '').slice(0, 200)}</code>`, env).catch(() => {});
+						}
+					})
+				);
+			}
 		}
 		return new Response("OK");
 

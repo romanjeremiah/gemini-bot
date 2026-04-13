@@ -651,27 +651,29 @@ export async function handleMessage(msg, env) {
 		// Model routing: check for manual override in KV, otherwise default to Owner=Pro / Guest=Flash
 		const isOwner = env.OWNER_ID && String(msg.from.id) === String(env.OWNER_ID);
 		const modelOverride = await env.CHAT_KV.get(`model_override_${chatId}_${threadId}`);
+
+		// Check health check-in state early (needed for model selection + context gating)
+		const healthCheckin = isOwner ? await env.CHAT_KV.get(`health_checkin_active_${chatId}`) : null;
+
 		// Smart model selection: Pro for complex tasks, Flash for casual conversation
 		let textModel = modelOverride || FALLBACK_TEXT_MODEL; // Default: Flash for everyone
 		if (isOwner && !modelOverride) {
-			const needsPro = detectComplexTask(userText, activeCheckin);
+			const needsPro = detectComplexTask(userText, healthCheckin);
 			textModel = needsPro ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
 			if (needsPro) log.info('model_upgrade', { reason: 'complex_task', model: textModel });
 		}
 
 		// Unified persona: Xaridotis handles all tones naturally
-		const healthCheckin = isOwner ? await env.CHAT_KV.get(`health_checkin_active_${chatId}`) : null;
 		const effectivePersona = 'xaridotis';
 
 		// If the user is clearly NOT engaging with a health check-in, clear the flag
-		// so it doesn't pollute unrelated conversations
 		const isHealthRelated = /sleep|mood|medication|medic|anxious|anxiety|depressed|how.*feel|emotion|check.?in/i.test(userText);
 		if (healthCheckin && !isHealthRelated && userText.length > 10) {
 			await env.CHAT_KV.delete(`health_checkin_active_${chatId}`);
 			log.info('checkin_cleared', { chatId, reason: 'non_health_message', was: healthCheckin });
 		}
 
-		// Only inject check-in context if the flag survived (user is still engaging with health)
+		// Only inject check-in context if the flag survived
 		const activeCheckin = await env.CHAT_KV.get(`health_checkin_active_${chatId}`);
 
 		// Build dynamic journal roadmap for evening check-ins

@@ -43,6 +43,11 @@
 			"name": "memory-consolidation",
 			"binding": "MEMORY_WORKFLOW",
 			"class_name": "MemoryConsolidationWorkflow"
+		},
+		{
+			"name": "deep-research",
+			"binding": "RESEARCH_WORKFLOW",
+			"class_name": "DeepResearchWorkflow"
 		}
 	],
 	"triggers": {

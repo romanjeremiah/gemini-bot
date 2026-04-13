@@ -14,8 +14,9 @@ import { getSchedule, matchesSchedule } from './config/schedules';
 import { toolRegistry } from './tools/index';
 import { log } from './lib/logger';
 
-// Export Workflow class for Cloudflare Workflows binding
+// Export Workflow classes for Cloudflare Workflows binding
 export { MemoryConsolidationWorkflow } from './workflows/memoryConsolidation';
+export { DeepResearchWorkflow } from './workflows/deepResearch';
 
 const BIZ_CONN_TTL = 2592000; // 30 days
 
@@ -717,6 +718,18 @@ async function handleDailyStudy(env) {
 		const topic = studyTopics[Math.floor(Math.random() * studyTopics.length)];
 		log.info('daily_study_started', { topic: topic.slice(0, 50) });
 
+		// Use Deep Research Workflow if available, otherwise fall back to inline search
+		if (env.RESEARCH_WORKFLOW) {
+			await env.RESEARCH_WORKFLOW.create({
+				id: `study-${today}-${Date.now()}`,
+				params: { chatId, topic }
+			});
+			log.info('deep_research_triggered', { topic: topic.slice(0, 50) });
+			return; // Workflow handles everything: research → save → notify
+		}
+
+		// Fallback: inline search (original behaviour)
+
 		// Phase 1: Search
 		const { text: searchResult } = await generateWithFallback(env,
 			[{ role: 'user', parts: [{ text: `Research this topic deeply: "${topic}". Find the most authoritative and insightful source. Return the best URL on the first line, then a 3-4 sentence summary of the most useful and practical insight you found.` }] }],
@@ -835,6 +848,19 @@ export default {
 				params: { chatId }
 			});
 			return new Response(JSON.stringify({ status: 'triggered', instanceId: instance.id }), {
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
+		if (request.method === "GET" && new URL(request.url).pathname === "/test-research") {
+			if (!env.RESEARCH_WORKFLOW) return new Response(JSON.stringify({ error: 'RESEARCH_WORKFLOW binding not found' }), { status: 500 });
+			const chatId = Number(env.OWNER_ID);
+			const topic = new URL(request.url).searchParams.get('topic') || 'latest advancements in Cloudflare Workers and D1';
+			const instance = await env.RESEARCH_WORKFLOW.create({
+				id: `research-test-${Date.now()}`,
+				params: { chatId, topic }
+			});
+			return new Response(JSON.stringify({ status: 'triggered', instanceId: instance.id, topic }), {
 				headers: { 'Content-Type': 'application/json' }
 			});
 		}

@@ -10,7 +10,7 @@ import { WorkflowEntrypoint } from 'cloudflare:workers';
  */
 export class DeepResearchWorkflow extends WorkflowEntrypoint {
 	async run(event, step) {
-		const { chatId, topic } = event.payload;
+		const { chatId, topic, manual } = event.payload;
 		if (!chatId || !topic) throw new Error('Missing chatId or topic in workflow payload');
 
 		// Step 1: Start the Deep Research agent
@@ -109,19 +109,21 @@ Write as if noting this down for yourself.` }] }],
 			return { insight: truncated, category };
 		});
 
-		// Step 4: Optionally share with user (40% chance)
+		// Step 4: Share results (always for manual triggers, 40% for automatic)
 		await step.do('notify-user', async () => {
-			if (Math.random() > 0.40) return { shared: false };
+			if (!manual && Math.random() > 0.40) return { shared: false };
 
 			const { GoogleGenAI } = await import('@google/genai');
 			const ai = new GoogleGenAI({ apiKey: this.env.GEMINI_API_KEY });
 
+			const promptStyle = manual
+				? `You just completed deep research on "${topic}" that Roman requested. Share the key findings in 3-5 sentences. Be thorough since they asked for this. Include the most actionable or surprising insight.`
+				: `You just spent time doing deep research on: "${topic}". Send a casual 1-2 sentence text sharing the most interesting finding, like a friend who just read something cool. Do not ask a question.`;
+
 			const response = await ai.models.generateContent({
 				model: 'gemini-3-flash-preview',
-				contents: [{ role: 'user', parts: [{ text: `You just spent time doing deep research on: "${topic}".
-Here is what you learned: ${savedInsight.insight.slice(0, 300)}
-Send a casual 1-2 sentence text sharing the most interesting finding, like a friend who just read something cool. Do not ask a question.` }] }],
-				config: { temperature: 0.8 }
+				contents: [{ role: 'user', parts: [{ text: `${promptStyle}\n\nResearch findings: ${savedInsight.insight.slice(0, 500)}` }] }],
+				config: { temperature: manual ? 0.5 : 0.8 }
 			});
 
 			const msg = response.candidates?.[0]?.content?.parts?.[0]?.text;

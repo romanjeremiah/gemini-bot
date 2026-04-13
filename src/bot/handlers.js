@@ -340,7 +340,7 @@ async function handleCommand(command, msg, env) {
 				return true;
 			}
 			const instanceId = `research-${Date.now()}`;
-			await env.RESEARCH_WORKFLOW.create({ id: instanceId, params: { chatId, topic } });
+			await env.RESEARCH_WORKFLOW.create({ id: instanceId, params: { chatId, topic, manual: true } });
 			await telegram.sendMessage(chatId, threadId, `🔬 <b>Deep Research started</b>\n\nTopic: <i>${topic.slice(0, 200)}</i>\n\nThis will take 2-5 minutes. I will message you when the findings are ready.`, env);
 			return true;
 		}

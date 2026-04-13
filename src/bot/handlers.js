@@ -656,14 +656,13 @@ export async function handleMessage(msg, env) {
 		const healthCheckin = isOwner ? await env.CHAT_KV.get(`health_checkin_active_${chatId}`) : null;
 
 		// Smart model selection: Pro for complex tasks, Flash for casual conversation
-		let textModel = modelOverride || FALLBACK_TEXT_MODEL; // Default: Flash for everyone
+		let textModel = modelOverride || FALLBACK_TEXT_MODEL;
 		if (isOwner && !modelOverride) {
 			const needsPro = detectComplexTask(userText, healthCheckin);
 			textModel = needsPro ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
 			if (needsPro) log.info('model_upgrade', { reason: 'complex_task', model: textModel });
 		}
 
-		// Unified persona: Xaridotis handles all tones naturally
 		const effectivePersona = 'xaridotis';
 
 		// If the user is clearly NOT engaging with a health check-in, clear the flag
@@ -674,11 +673,11 @@ export async function handleMessage(msg, env) {
 		}
 
 		// Only inject check-in context if the flag survived
-		const activeCheckin = await env.CHAT_KV.get(`health_checkin_active_${chatId}`);
+		const currentCheckin = await env.CHAT_KV.get(`health_checkin_active_${chatId}`);
 
 		// Build dynamic journal roadmap for evening check-ins
 		let checkinProgress = '';
-		if (activeCheckin === 'evening') {
+		if (currentCheckin === 'evening') {
 			const roadmap = await getCheckinRoadmap(env, chatId);
 			if (roadmap.includes('All data collected')) {
 				checkinProgress = ` | ${roadmap}`;
@@ -686,8 +685,8 @@ export async function handleMessage(msg, env) {
 			} else {
 				checkinProgress = ` | ${roadmap}`;
 			}
-		} else if (activeCheckin) {
-			checkinProgress = ` | HEALTH CHECK-IN MODE (${activeCheckin}): Conduct the ${activeCheckin} check-in naturally. Use log_mood_entry to record data. If the user changes topic, drop the check-in and help with their request instead.`;
+		} else if (currentCheckin) {
+			checkinProgress = ` | HEALTH CHECK-IN MODE (${currentCheckin}): Conduct the ${currentCheckin} check-in naturally. Use log_mood_entry to record data. If the user changes topic, drop the check-in and help with their request instead.`;
 		}
 
 		let replyContext = "";

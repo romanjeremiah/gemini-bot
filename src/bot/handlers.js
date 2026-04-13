@@ -10,6 +10,7 @@ import { upsertUser, buildUserIdentity } from '../services/userStore';
 import { generateSpeech } from '../lib/tts';
 import { buildChecklistText } from '../tools/checklist';
 import * as moodStore from '../services/moodStore';
+import * as episodeStore from '../services/episodeStore';
 import { getAllSchedules, setSchedule, resetSchedule } from '../config/schedules';
 import { log } from '../lib/logger';
 
@@ -120,6 +121,37 @@ If nothing new was learned, respond with exactly: NOTHING_NEW`,
 				await env.CHAT_KV.put(countKey, String(count + 1), { expirationTtl: 86400 });
 				log.info('silent_observation', { chatId, observation: observation.slice(0, 80) });
 			}
+		}
+
+		// Auto-episode detection: was this conversation emotionally significant?
+		const isEmotional = /\b(anxious|depressed|panic|overwhelm|scared|lonely|empty|hopeless|angry|frustrated|sad|grief|trigger|suicid|self.?harm|crying|breakdown|manic|racing|numb)\b/i.test(userText);
+		const isBreakthrough = /\b(realise|realize|never thought|makes sense|finally understand|clicked|ah|insight|pattern|see it now)\b/i.test(userText);
+
+		if (isEmotional || isBreakthrough) {
+			try {
+				const episodeResponse = await generateShortResponse(
+					`You just had this emotionally significant exchange:
+USER: ${userText.slice(0, 400)}
+YOU: ${botResponse.slice(0, 400)}
+
+Create a structured episode record. Respond with ONLY valid JSON (no markdown):
+{"type":"${isBreakthrough ? 'breakthrough' : 'conversation'}","trigger":"what prompted this (1 sentence)","emotions":["emotion1","emotion2"],"intervention":"what you did/suggested (1 sentence)","outcome":"positive|negative|neutral|pending","lesson":"what to remember for next time (1 sentence)"}`,
+					'You are an episode logger. Return only valid JSON, no explanation.', env
+				);
+				if (episodeResponse) {
+					const cleaned = episodeResponse.replace(/```json|```/g, '').trim();
+					const ep = JSON.parse(cleaned);
+					await episodeStore.saveEpisode(env, chatId, {
+						type: ep.type || 'conversation',
+						trigger: ep.trigger,
+						emotions: ep.emotions || [],
+						intervention: ep.intervention,
+						outcome: ep.outcome,
+						lesson: ep.lesson,
+					});
+					log.info('auto_episode_saved', { chatId, type: ep.type, trigger: ep.trigger?.slice(0, 60) });
+				}
+			} catch { /* episode creation is best-effort */ }
 		}
 	} catch { /* silent fail - this is background enrichment, not critical */ }
 }
@@ -728,7 +760,15 @@ export async function handleMessage(msg, env) {
 		}
 		const daysKnown = Math.floor((Date.now() - parseInt(firstSeen)) / 86400000);
 
-		const dynamicContext = `[Context] Current speaker: ${userIdentity} | London Time: ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London" })} | Unix: ${Math.floor(Date.now() / 1000)}${weatherCtx ? ` | ${weatherCtx}` : ''} | Relationship: ${daysKnown} days${checkinProgress}\n\nMEMORY:\n${memCtx}${semanticCtx}`;
+		// CoALA reflection step: retrieve relevant episodes for emotional messages
+		let episodeCtx = '';
+		const isEmotionalMsg = /\b(anxious|depressed|panic|overwhelm|scared|lonely|empty|hopeless|angry|frustrated|sad|grief|trigger|manic|racing|numb|crying|breakdown|struggling|worried|stressed)\b/i.test(userText);
+		if (isEmotionalMsg) {
+			const episodes = await episodeStore.getRecentEpisodes(env, chatId, 5).catch(() => []);
+			episodeCtx = episodeStore.formatEpisodesForContext(episodes);
+		}
+
+		const dynamicContext = `[Context] Current speaker: ${userIdentity} | London Time: ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London" })} | Unix: ${Math.floor(Date.now() / 1000)}${weatherCtx ? ` | ${weatherCtx}` : ''} | Relationship: ${daysKnown} days${checkinProgress}\n\nMEMORY:\n${memCtx}${semanticCtx}${episodeCtx ? `\n\n${episodeCtx}` : ''}`;
 
 		// Skip code execution when media is present (incompatible with audio/video inline data)
 		// Also skip cache when media is present, because the cache has codeExecution baked in
@@ -1336,6 +1376,13 @@ export async function handleCallback(callbackQuery, env) {
 			const emotionQuery = [...negSelected, ...posSelected].join(' ') || 'mood emotions feelings';
 			const semanticCtx = await vectorStore.getSemanticContext(env, chatId, emotionQuery).catch(() => '');
 
+			// Pull relevant past episodes (CoALA episodic memory)
+			const allEmotions = [...negSelected, ...posSelected];
+			const relevantEpisodes = allEmotions.length
+				? await episodeStore.getEpisodesByEmotion(env, chatId, allEmotions, 5).catch(() => [])
+				: await episodeStore.getRecentEpisodes(env, chatId, 5).catch(() => []);
+			const episodeCtx = episodeStore.formatEpisodesForContext(relevantEpisodes);
+
 			// Today's mood score (pull from the entry we just updated)
 			const todayEntry = await moodStore.getEntry(env, chatId, today, 'evening').catch(() => null);
 			const todayParsed = todayEntry?.data ? (typeof todayEntry.data === 'string' ? JSON.parse(todayEntry.data) : todayEntry.data) : {};
@@ -1353,13 +1400,16 @@ ${pastContext}
 
 ${clinicalCtx}
 
+${episodeCtx}
+
 ${semanticCtx}
 
 YOUR RESPONSE (follow this structure naturally, not as a list):
 1. Acknowledge what they shared today. Name the emotions they selected. If the mix of positive and negative is notable (e.g. "inspired but lonely"), explore that tension.
 2. Compare to recent days. Is the score trending up, down, or stable? Are certain emotions recurring? Note any patterns without being clinical.
-3. Draw one therapeutic observation. Connect today's emotions to known patterns, triggers, or schemas from the clinical notes. Use AEDP/IFS language gently (e.g. "sounds like a protector part is active" or "there might be some unprocessed grief underneath the boredom").
-4. End with ONE natural question that invites deeper conversation but doesn't pressure. Something like "What do you think is driving the loneliness today?" not "Would you like to explore this further?"
+3. If past episodes are available, reference what happened in similar emotional states before. What helped? What didn't? Use this to inform your suggestion.
+4. Draw one therapeutic observation. Connect today's emotions to known patterns, triggers, or schemas from the clinical notes. Use AEDP/IFS language gently.
+5. End with ONE natural question that invites deeper conversation but doesn't pressure.
 
 Keep it warm, direct, and personal. 3-5 sentences. No bullet points. No clinical jargon unless it adds genuine insight. You know this person well.`;
 

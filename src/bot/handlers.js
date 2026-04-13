@@ -325,6 +325,38 @@ async function handleCommand(command, msg, env) {
 			}
 			return true;
 		}
+		case "/researchhistory": {
+			if (!env.OWNER_ID || String(msg.from.id) !== String(env.OWNER_ID)) {
+				await telegram.sendMessage(chatId, threadId, "This command is owner-only.", env);
+				return true;
+			}
+			try {
+				const { results } = await env.DB.prepare(
+					`SELECT fact, category, created_at FROM memories WHERE chat_id = ? AND fact LIKE 'Deep Research%' ORDER BY created_at DESC LIMIT 10`
+				).bind(chatId).all();
+
+				if (!results?.length) {
+					await telegram.sendMessage(chatId, threadId, "No deep research results found yet. Use <code>/research your topic</code> to start one.", env);
+					return true;
+				}
+
+				let text = `<b>Deep Research History</b> (${results.length} results)\n\n`;
+				for (const r of results) {
+					const date = new Date(r.created_at + 'Z').toLocaleDateString('en-GB', { timeZone: 'Europe/London', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+					const topicMatch = r.fact.match(/^Deep Research \(([^)]+)\):/);
+					const topic = topicMatch ? topicMatch[1] : 'Unknown';
+					const summary = r.fact.replace(/^Deep Research \([^)]+\):\s*/, '').slice(0, 200);
+					text += `<b>${date}</b> [${r.category}]\n<i>${topic}</i>\n${summary}${summary.length >= 200 ? '...' : ''}\n\n`;
+				}
+
+				// Safety: truncate if too long for Telegram
+				if (text.length > 4000) text = text.slice(0, 3900) + '\n\n<i>...truncated</i>';
+				await telegram.sendMessage(chatId, threadId, text, env);
+			} catch (e) {
+				await telegram.sendMessage(chatId, threadId, `Error fetching research history: ${e.message?.slice(0, 100)}`, env);
+			}
+			return true;
+		}
 		case "/research": {
 			if (!env.OWNER_ID || String(msg.from.id) !== String(env.OWNER_ID)) {
 				await telegram.sendMessage(chatId, threadId, "This command is owner-only.", env);

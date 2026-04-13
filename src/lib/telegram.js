@@ -280,6 +280,7 @@ export async function registerCommands(env) {
 			{ command: "listen", description: "Deep listening mode (brain dump)" },
 			{ command: "done", description: "End listening mode and synthesise" },
 			{ command: "research", description: "Deep research on any topic" },
+			{ command: "researchhistory", description: "View past research results" },
 			{ command: "architect", description: "Innovation and feature research" },
 			{ command: "schedule", description: "View and manage schedules" },
 			{ command: "persona", description: "Switch AI personality" },

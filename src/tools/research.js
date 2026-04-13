@@ -18,6 +18,12 @@ export const searchResearchTool = {
 	async execute(args, env, context) {
 		const chatId = context.chatId;
 
+		// Sanitise topic: strip special chars, limit length for D1 LIKE queries
+		const cleanTopic = (args.topic || '')
+			.replace(/[%_\\'";\n\r]/g, '')
+			.trim()
+			.split(/\s+/).slice(0, 6).join(' ');
+
 		if (args.action === 'list') {
 			let query = `SELECT fact, category, created_at FROM memories WHERE chat_id = ? AND fact LIKE 'Deep Research%' ORDER BY created_at DESC LIMIT 10`;
 			const { results } = await env.DB.prepare(query).bind(chatId).all();
@@ -36,14 +42,14 @@ export const searchResearchTool = {
 		}
 
 		if (args.action === 'full') {
-			if (!args.topic) return { status: "error", message: "Please specify a topic to retrieve the full report." };
+			if (!cleanTopic) return { status: "error", message: "Please specify a topic keyword to retrieve the full report." };
 
 			// Find the R2 reference
 			const { results } = await env.DB.prepare(
 				`SELECT fact FROM memories WHERE chat_id = ? AND category = 'research_ref' AND fact LIKE ? ORDER BY created_at DESC LIMIT 1`
-			).bind(chatId, `%${args.topic}%`).all();
+			).bind(chatId, `%${cleanTopic}%`).all();
 
-			if (!results?.length) return { status: "not_found", message: `No full report found matching "${args.topic}". Try a broader search term.` };
+			if (!results?.length) return { status: "not_found", message: `No full report found matching "${cleanTopic}". Use action 'list' first to see available topics.` };
 
 			const keyMatch = results[0].fact.match(/\[R2:([^\]]+)\]/);
 			if (!keyMatch || !env.MEDIA_BUCKET) return { status: "error", message: "Full report reference not available." };

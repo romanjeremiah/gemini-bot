@@ -69,7 +69,7 @@ async function embed(env, input) {
  * @returns {Array} reranked results sorted by relevance
  */
 async function rerank(env, query, results) {
-	if (!env.AI || !results.length) return results;
+	if (!env.AI || !results.length || !query?.trim()) return results;
 	try {
 		const contexts = results.map(r => r.metadata?.fact || r.metadata?.preview || '').filter(Boolean);
 		if (!contexts.length) return results;

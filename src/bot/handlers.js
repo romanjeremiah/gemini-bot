@@ -760,15 +760,22 @@ export async function handleMessage(msg, env) {
 
 		// Model routing: check for manual override in KV, otherwise default to Owner=Pro / Guest=Flash
 		const isOwner = env.OWNER_ID && String(msg.from.id) === String(env.OWNER_ID);
-		const modelOverride = await env.CHAT_KV.get(`model_override_${chatId}_${threadId}`);
 
 		// Check health check-in state early (needed for model selection + context gating)
 		const healthCheckin = isOwner ? await env.CHAT_KV.get(`health_checkin_active_${chatId}`) : null;
 
 		// Smart model selection: Pro for complex tasks, Flash for casual conversation
-		let textModel = modelOverride || FALLBACK_TEXT_MODEL;
+		// modelOverride from /model command only applies to the NEXT message, then clears
+		const modelOverride = await env.CHAT_KV.get(`model_override_${chatId}_${threadId}`);
+		if (modelOverride) await env.CHAT_KV.delete(`model_override_${chatId}_${threadId}`); // One-shot override
+
+		let textModel = FALLBACK_TEXT_MODEL;
 		let taskThinkingLevel = 'low';
-		if (isOwner && !modelOverride) {
+		if (modelOverride) {
+			textModel = modelOverride === 'pro' ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
+			taskThinkingLevel = modelOverride === 'pro' ? 'medium' : 'low';
+			log.info('model_override_applied', { model: textModel });
+		} else if (isOwner) {
 			const complexity = detectComplexTask(userText, healthCheckin);
 			textModel = complexity.needsPro ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
 			taskThinkingLevel = complexity.thinkingLevel;

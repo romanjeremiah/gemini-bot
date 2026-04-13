@@ -483,7 +483,15 @@ export async function handleMessage(msg, env) {
 				}
 
 				if (media.mimeHint.startsWith("image/")) { uploadedImageBase64 = base64; uploadedImageMime = media.mimeHint; }
-				if (userParts.length === 0 || (!userText && !replyContext && !cacheContext)) userParts.unshift({ text: "Describe or respond to this media." });
+				if (userParts.length === 0 || (!userText && !replyContext && !cacheContext)) {
+					if (media.mimeHint.startsWith("video/")) {
+						userParts.unshift({ text: "Analyse this video. Comment on composition, lighting, pacing, and any specific content. If it looks like a drone or creative project, suggest editing techniques to improve it." });
+					} else if (media.mimeHint.startsWith("audio/")) {
+						userParts.unshift({ text: "Transcribe and respond to this audio message." });
+					} else {
+						userParts.unshift({ text: "Describe or respond to this media." });
+					}
+				}
 				// Store media in R2 (fire-and-forget) — pass raw buffer, no decoding
 				if (env.MEDIA_BUCKET) {
 					const mediaType = media.mimeHint.split('/')[0];

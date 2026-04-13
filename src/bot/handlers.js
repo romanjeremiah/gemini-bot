@@ -297,6 +297,26 @@ async function handleCommand(command, msg, env) {
 				env, null, moodChecklistKb);
 			return true;
 		}
+		case "/testpoll": {
+			// Test whether poll_answer webhooks are received
+			const pollRes = await telegram.sendPoll(chatId, threadId,
+				'Poll Test: How do you feel right now?',
+				[
+					'0-1: Bleak, no hope',
+					'2-3: Struggling, anxious',
+					'4-6: Balanced, steady',
+					'7-8: Buzzing, racing',
+					'9-10: Out of control'
+				],
+				env, { is_anonymous: false }
+			);
+			if (pollRes?.ok) {
+				const pollId = pollRes.result.poll.id;
+				await env.CHAT_KV.put(`poll_test_${pollId}`, JSON.stringify({ chatId, threadId, type: 'mood_test' }), { expirationTtl: 3600 });
+				log.info('test_poll_sent', { chatId, pollId });
+			}
+			return true;
+		}
 		case "/research": {
 			if (!env.OWNER_ID || String(msg.from.id) !== String(env.OWNER_ID)) {
 				await telegram.sendMessage(chatId, threadId, "This command is owner-only.", env);

@@ -892,7 +892,7 @@ export default {
 			const workerUrl = `${url.protocol}//${url.host}/`;
 			const body = {
 				url: workerUrl,
-				allowed_updates: ['message', 'callback_query', 'inline_query', 'message_reaction', 'business_connection', 'business_message'],
+				allowed_updates: ['message', 'callback_query', 'inline_query', 'message_reaction', 'poll_answer', 'business_connection', 'business_message'],
 			};
 			if (env.WEBHOOK_SECRET) body.secret_token = env.WEBHOOK_SECRET;
 			const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/setWebhook`, {
@@ -946,6 +946,18 @@ export default {
 			task = handleMessage(bizMsg, env);
 		}
 		else if (update.inline_query) task = handleInlineQuery(update.inline_query, env);
+		else if (update.poll_answer) {
+			const pa = update.poll_answer;
+			log.info('poll_answer_received', { pollId: pa.poll_id, optionIds: pa.option_ids, userId: pa.user?.id });
+			// Look up poll context from KV
+			const pollCtx = await env.CHAT_KV.get(`poll_test_${pa.poll_id}`, { type: 'json' });
+			if (pollCtx) {
+				const selectedOption = pa.option_ids?.[0];
+				await telegram.sendMessage(pollCtx.chatId, pollCtx.threadId,
+					`✅ <b>Poll answer received!</b>\n\nOption selected: ${selectedOption}\nPoll ID: ${pa.poll_id}\nUser: ${pa.user?.first_name || 'Unknown'}\n\n<i>poll_answer webhook is working correctly.</i>`, env);
+				await env.CHAT_KV.delete(`poll_test_${pa.poll_id}`);
+			}
+		}
 		else if (update.callback_query) task = handleCallback(update.callback_query, env);
 		else if (update.message) {
 			if (update.message.effect_id) {

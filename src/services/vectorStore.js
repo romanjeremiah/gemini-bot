@@ -4,9 +4,11 @@
  * Enhances the existing memoryStore with fuzzy "find conversations about topic X" capability.
  *
  * Embedding model: @cf/baai/bge-base-en-v1.5 (768 dimensions, cosine metric)
+ * Reranker: @cf/baai/bge-reranker-base (cross-attention relevance scoring)
  */
 
 const EMBEDDING_MODEL = '@cf/baai/bge-base-en-v1.5';
+const RERANKER_MODEL = '@cf/baai/bge-reranker-base';
 const MAX_TEXT_LENGTH = 512; // bge-base-en-v1.5 context window
 
 /**
@@ -19,6 +21,35 @@ async function embed(env, text) {
 	const truncated = text.slice(0, MAX_TEXT_LENGTH);
 	const result = await env.AI.run(EMBEDDING_MODEL, { text: [truncated] });
 	return result.data[0];
+}
+
+/**
+ * Rerank search results using cross-attention for higher precision.
+ * Takes Vectorize results and re-scores them against the original query.
+ * @param {Object} env - Worker env with AI binding
+ * @param {string} query - the user's message
+ * @param {Array} results - Vectorize search results with metadata
+ * @returns {Array} reranked results sorted by relevance
+ */
+async function rerank(env, query, results) {
+	if (!env.AI || !results.length) return results;
+	try {
+		const documents = results.map(r => r.metadata?.fact || r.metadata?.preview || '').filter(Boolean);
+		if (!documents.length) return results;
+
+		const reranked = await env.AI.run(RERANKER_MODEL, { query, documents });
+		if (!reranked?.data?.length) return results;
+
+		// Map reranker scores back to original results
+		const scored = reranked.data
+			.map((item, idx) => ({ ...results[idx], rerankerScore: item.score }))
+			.sort((a, b) => b.rerankerScore - a.rerankerScore);
+
+		return scored;
+	} catch (err) {
+		console.error('⚠️ Reranker error:', err.message);
+		return results; // Fallback to original Vectorize ordering
+	}
 }
 
 /**
@@ -208,20 +239,26 @@ export async function getSemanticContext(env, chatId, userMessage) {
 
 		if (!allResults.length) return '';
 
+		// Rerank: use cross-attention model to find the most precisely relevant results
+		const reranked = await rerank(env, userMessage, allResults);
+		const topResults = reranked.slice(0, 5);
+
 		let ctx = '\nSemantic recall (related past context):\n';
 		let criticalAlert = '';
 
-		for (const r of allResults) {
+		for (const r of topResults) {
 			const meta = r.metadata;
+			const relevance = r.rerankerScore != null ? `rerank: ${(r.rerankerScore * 100).toFixed(0)}%` : `${(r.score * 100).toFixed(0)}%`;
 			if (meta.fact) {
-				ctx += `- [${meta.category}] ${meta.fact} (relevance: ${(r.score * 100).toFixed(0)}%)\n`;
+				ctx += `- [${meta.category}] ${meta.fact} (${relevance})\n`;
 
 				// TRIGGER INTERCEPTION: if the message strongly matches a known trigger, schema, or avoidance pattern
-				if (r.score > 0.75 && ['trigger', 'schema', 'avoidance'].includes(meta.category)) {
+				const isHighRelevance = (r.rerankerScore != null ? r.rerankerScore > 0.8 : r.score > 0.75);
+				if (isHighRelevance && ['trigger', 'schema', 'avoidance'].includes(meta.category)) {
 					criticalAlert += `\nCLINICAL ALERT: The user's current message strongly matches a known ${meta.category.toUpperCase()}: "${meta.fact}". Adjust your response to gently deploy coping strategies, validate the trigger, or explore this schema with care. Do not ignore this context.\n`;
 				}
 			} else if (meta.preview) {
-				ctx += `- Past conversation: ${meta.preview} (relevance: ${(r.score * 100).toFixed(0)}%)\n`;
+				ctx += `- Past conversation: ${meta.preview} (${relevance})\n`;
 			}
 		}
 		return criticalAlert + ctx;

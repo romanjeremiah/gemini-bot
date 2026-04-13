@@ -192,7 +192,7 @@ async function handleCommand(command, msg, env) {
 			return true;
 		}
 		case "/forget":
-			await telegram.sendMessage(chatId, threadId, "⚠️ Delete all saved memories?", env, null, { inline_keyboard: [[{ text: "✅ Yes, delete all", callback_data: "confirm_forget" }, { text: "❌ Cancel", callback_data: "cancel_forget" }]] });
+			await telegram.sendMessage(chatId, threadId, "⚠️ Delete all saved memories?", env, null, { inline_keyboard: [[{ text: "✅ Yes, delete all", callback_data: "confirm_forget", style: "danger" }, { text: "❌ Cancel", callback_data: "cancel_forget", style: "success" }]] });
 			return true;
 		case "/model":
 			await telegram.sendMessage(chatId, threadId,
@@ -239,9 +239,9 @@ async function handleCommand(command, msg, env) {
 				`<b>Mood check.</b>\n\nWhere would you place yourself on the scale right now?\n\n🔴 <b>0-1: Severe Depression</b>\n<i>(Bleak, hopeless)</i>\n\n🟠 <b>2-3: Mild/Moderate</b>\n<i>(Struggle, anxious)</i>\n\n🟢 <b>4-6: Balanced</b>\n<i>(Optimistic, sociable)</i>\n\n🟡 <b>7-8: Hypomania</b>\n<i>(Productive, racing)</i>\n\n🔴 <b>9-10: Mania</b>\n<i>(Reckless, delusions)</i>`,
 				env, null, {
 					inline_keyboard: [
-						[{ text: '🔴 0-1', callback_data: 'mood_score_1' }, { text: '🟠 2-3', callback_data: 'mood_score_3' }],
-						[{ text: '🟢 4-6', callback_data: 'mood_score_5' }],
-						[{ text: '🟡 7-8', callback_data: 'mood_score_7' }, { text: '🔴 9-10', callback_data: 'mood_score_9' }]
+						[{ text: '🔴 0-1', callback_data: 'mood_score_1', style: 'danger' }, { text: '🟠 2-3', callback_data: 'mood_score_3', style: 'danger' }],
+						[{ text: '🟢 4-6', callback_data: 'mood_score_5', style: 'success' }],
+						[{ text: '🟡 7-8', callback_data: 'mood_score_7', style: 'primary' }, { text: '🔴 9-10', callback_data: 'mood_score_9', style: 'danger' }]
 					]
 				});
 			return true;
@@ -763,8 +763,8 @@ export async function handleCallback(callbackQuery, env) {
 				// Always show emotion buttons for normal range scores (2-8)
 				const btns = (score >= 2 && score <= 8) ? {
 					inline_keyboard: [[
-						{ text: '☀️ Positive', callback_data: 'mood_cat_positive' },
-						{ text: '🌧 Negative', callback_data: 'mood_cat_negative' }
+						{ text: '☀️ Positive', callback_data: 'mood_cat_positive', style: 'success' },
+						{ text: '🌧 Negative', callback_data: 'mood_cat_negative', style: 'danger' }
 					]]
 				} : undefined;
 
@@ -781,8 +781,8 @@ export async function handleCallback(callbackQuery, env) {
 				// Fallback: send buttons even if AI response fails
 				await telegram.sendMessage(chatId, threadId, 'How are your emotions today?', env, null, {
 					inline_keyboard: [[
-						{ text: '☀️ Positive', callback_data: 'mood_cat_positive' },
-						{ text: '🌧 Negative', callback_data: 'mood_cat_negative' }
+						{ text: '☀️ Positive', callback_data: 'mood_cat_positive', style: 'success' },
+						{ text: '🌧 Negative', callback_data: 'mood_cat_negative', style: 'danger' }
 					]]
 				});
 			}

@@ -91,8 +91,8 @@ async function handleHealthCheckIns(env) {
 
 		await telegram.sendMessage(chatId, threadId, morningGreeting, env, null, {
 			inline_keyboard: [[
-				{ text: '💊 Taken', callback_data: 'mood_med_yes_morning' },
-				{ text: '⏰ Not yet', callback_data: 'mood_med_no_morning' },
+				{ text: '💊 Taken', callback_data: 'mood_med_yes_morning', style: 'success' },
+				{ text: '⏰ Not yet', callback_data: 'mood_med_no_morning', style: 'danger' },
 			]]
 		});
 		await env.CHAT_KV.put(`nudge_pending_morning_${chatId}`, String(Date.now()), { expirationTtl: 3600 });
@@ -117,9 +117,9 @@ async function handleHealthCheckIns(env) {
 
 		await telegram.sendMessage(chatId, threadId, middayGreeting, env, null, {
 			inline_keyboard: [[
-				{ text: '✅ Both taken', callback_data: 'mood_med_yes_midday' },
-				{ text: '💊 ADHD only', callback_data: 'mood_med_partial_midday' },
-				{ text: '❌ Not yet', callback_data: 'mood_med_no_midday' },
+				{ text: '✅ Both taken', callback_data: 'mood_med_yes_midday', style: 'success' },
+				{ text: '💊 ADHD only', callback_data: 'mood_med_partial_midday', style: 'primary' },
+				{ text: '❌ Not yet', callback_data: 'mood_med_no_midday', style: 'danger' },
 			]]
 		});
 		await env.CHAT_KV.put(`nudge_pending_midday_${chatId}`, String(Date.now()), { expirationTtl: 3600 });
@@ -141,9 +141,9 @@ async function handleHealthCheckIns(env) {
 			`<b>Evening check-in.</b>\n\nWhere would you place yourself on the mood scale right now?\n\n🔴 <b>0-1: Severe Depression</b>\n<i>(Bleak, no movement, hopeless)</i>\n\n🟠 <b>2-3: Mild/Moderate</b>\n<i>(Struggle, anxious)</i>\n\n🟢 <b>4-6: Balanced</b>\n<i>(Good decisions, optimistic)</i>\n\n🟡 <b>7-8: Hypomania</b>\n<i>(Very productive, racing)</i>\n\n🔴 <b>9-10: Mania</b>\n<i>(Reckless, lost touch)</i>`,
 			env, null, {
 				inline_keyboard: [
-					[{ text: '🔴 0-1', callback_data: 'mood_score_1' }, { text: '🟠 2-3', callback_data: 'mood_score_3' }],
-					[{ text: '🟢 4-6', callback_data: 'mood_score_5' }],
-					[{ text: '🟡 7-8', callback_data: 'mood_score_7' }, { text: '🔴 9-10', callback_data: 'mood_score_9' }]
+					[{ text: '🔴 0-1', callback_data: 'mood_score_1', style: 'danger' }, { text: '🟠 2-3', callback_data: 'mood_score_3', style: 'danger' }],
+					[{ text: '🟢 4-6', callback_data: 'mood_score_5', style: 'success' }],
+					[{ text: '🟡 7-8', callback_data: 'mood_score_7', style: 'primary' }, { text: '🔴 9-10', callback_data: 'mood_score_9', style: 'danger' }]
 				]
 			});
 		await env.CHAT_KV.put(`nudge_pending_evening_${chatId}`, String(Date.now()), { expirationTtl: 7200 });

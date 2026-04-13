@@ -138,22 +138,8 @@ async function handleHealthCheckIns(env) {
 		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'evening');
 		if (alreadyLogged) return;
 
-		await telegram.sendMessage(chatId, threadId,
-			`<b>Evening Check-in</b>\n\nTap each item to check it off, then select your mood score.\n\n🔴 <b>0-1:</b> Severe Depression\n🟠 <b>2-3:</b> Mild/Moderate\n🟢 <b>4-6:</b> Balanced\n🟡 <b>7-8:</b> Hypomania\n🔴 <b>9-10:</b> Mania`,
-			env, null, {
-				inline_keyboard: [
-					[{ text: '☐  Morning medication taken', callback_data: 'mchk|0|med_morning', style: 'success' }],
-					[{ text: '☐  ADHD medication taken', callback_data: 'mchk|1|med_adhd', style: 'success' }],
-					[{ text: '☐  Anxiety medication taken', callback_data: 'mchk|2|med_anxiety', style: 'success' }],
-					[{ text: '☐  Exercised today', callback_data: 'mchk|3|exercise', style: 'primary' }],
-					[{ text: '☐  Ate a proper meal', callback_data: 'mchk|4|meal', style: 'primary' }],
-					[{ text: '☐  Slept well last night', callback_data: 'mchk|5|sleep', style: 'primary' }],
-					[{ text: '───── Mood Scale ─────', callback_data: 'noop' }],
-					[{ text: '🔴 0-1', callback_data: 'mood_score_1', style: 'danger' }, { text: '🟠 2-3', callback_data: 'mood_score_3', style: 'danger' }],
-					[{ text: '🟢 4-6', callback_data: 'mood_score_5', style: 'success' }],
-					[{ text: '🟡 7-8', callback_data: 'mood_score_7', style: 'primary' }, { text: '🔴 9-10', callback_data: 'mood_score_9', style: 'danger' }]
-				]
-			});
+		// Send mood poll instead of checklist buttons
+		await sendMoodPoll(chatId, threadId, env);
 		await env.CHAT_KV.put(`nudge_pending_evening_${chatId}`, String(Date.now()), { expirationTtl: 7200 });
 	}
 }
@@ -333,6 +319,112 @@ async function handleMemoryConsolidation(env) {
 		}
 	} catch (e) {
 		log.error('consolidation_error', { msg: e.message });
+	}
+}
+
+// ---- Mood Poll System ----
+// Condensed 0-10 bipolar mood scale descriptions (max 100 chars per option)
+const MOOD_POLL_OPTIONS = [
+	'0: Crisis. Suicidal thoughts, no movement, total despair.',
+	'1: Severe. Hopeless, guilt, feels impossible to function.',
+	'2: Low. Persistent sadness, withdrawn, little motivation.',
+	'3: Struggling. Anxious, irritable, getting through the day.',
+	'4: Below average. Flat mood, low energy but managing.',
+	'5: Neutral. Neither good nor bad, steady baseline.',
+	'6: Good. Positive outlook, engaged, making good choices.',
+	'7: Very good. Productive, social, optimistic and sharp.',
+	'8: Elevated. High energy, racing thoughts, reduced sleep.',
+	'9: Hypomanic. Impulsive, grandiose, poor judgement.',
+	'10: Manic. Reckless, detached from reality, dangerous.',
+];
+
+async function sendMoodPoll(chatId, threadId, env) {
+	const pollRes = await telegram.sendPoll(chatId, threadId,
+		'How do you feel right now?',
+		MOOD_POLL_OPTIONS,
+		env, { is_anonymous: false }
+	);
+	if (pollRes?.ok) {
+		const pollId = pollRes.result.poll.id;
+		await env.CHAT_KV.put(`mood_poll_${pollId}`, JSON.stringify({
+			chatId, threadId, type: 'mood_checkin', sentAt: Date.now()
+		}), { expirationTtl: 86400 });
+		log.info('mood_poll_sent', { chatId, pollId });
+	}
+	return pollRes;
+}
+
+async function handleMoodPollAnswer(chatId, threadId, score, env) {
+	const today = new Date().toISOString().split('T')[0];
+	log.info('mood_poll_score', { chatId, score });
+
+	// Save mood score
+	await moodStore.upsertEntry(env, chatId, today, 'evening', { mood_score: score });
+
+	// Build context-aware response using recent mood history and memories
+	const moodHistory = await moodStore.getRecentEntries(env, chatId, 30);
+	const memoryCtx = await memoryStore.getFormattedContext(env, chatId);
+	const semanticCtx = await vectorStore.getSemanticContext(env, chatId, `mood score ${score} how I feel`);
+	const therapeuticNotes = await env.DB.prepare(
+		`SELECT category, fact FROM memories WHERE chat_id = ? AND category IN ('pattern','trigger','schema','insight','homework') ORDER BY created_at DESC LIMIT 10`
+	).bind(chatId).all().then(r => r.results || []);
+
+	const recentScores = moodHistory.slice(0, 7).map(e =>
+		`${e.date}: ${e.mood_score}/10 ${e.emotions?.length ? '(' + e.emotions.join(', ') + ')' : ''}`
+	).join('\n');
+
+	const clinicalNotes = therapeuticNotes.map(n => `[${n.category}] ${n.fact}`).join('\n');
+
+	let contextPrompt;
+	if (score <= 1) {
+		contextPrompt = `CRISIS RESPONSE. The user scored ${score}/10 (severe depression/crisis).
+Recent mood history:\n${recentScores}
+Clinical notes:\n${clinicalNotes}
+${semanticCtx}
+
+Respond with deep compassion. Mention Samaritans (116 123) and SHOUT (text 85258). Gently ask what has been weighing on them. Reference any relevant patterns from their history.`;
+	} else if (score >= 9) {
+		contextPrompt = `MANIA ALERT. The user scored ${score}/10 (mania/hypomania).
+Recent mood history:\n${recentScores}
+Clinical notes:\n${clinicalNotes}
+${semanticCtx}
+
+Acknowledge calmly without amplifying the energy. Ask ONE question about sleep or safety. Note any escalating pattern from recent scores.`;
+	} else {
+		contextPrompt = `The user scored ${score}/10 on their mood check-in today.
+Recent mood history (last 7 days):\n${recentScores}
+Clinical notes:\n${clinicalNotes}
+${semanticCtx}
+
+Respond naturally:
+1. Acknowledge the score briefly.
+2. Compare to recent days. Note any trends (improving, declining, stable).
+3. From a therapeutic perspective, share one observation about their recent pattern.
+4. Ask them to tap the emotion buttons below to log how they are feeling.
+Keep it warm, concise, and clinically aware. Do not list every data point. Synthesise.`;
+	}
+
+	try {
+		const response = await generateShortResponse(contextPrompt, personas.xaridotis.instruction, env);
+		const aiMsg = response || 'Tap below to tell me about your emotions.';
+
+		// Show emotion buttons for normal range (2-8)
+		const btns = (score >= 2 && score <= 8) ? {
+			inline_keyboard: [[
+				{ text: '☀️ Positive', callback_data: 'mood_cat_positive', style: 'success' },
+				{ text: '🌧 Negative', callback_data: 'mood_cat_negative', style: 'danger' }
+			]]
+		} : undefined;
+
+		await telegram.sendMessage(chatId, threadId, aiMsg, env, null, btns);
+	} catch (e) {
+		log.error('mood_poll_response_error', { msg: e.message });
+		await telegram.sendMessage(chatId, threadId, 'How are your emotions today?', env, null, {
+			inline_keyboard: [[
+				{ text: '☀️ Positive', callback_data: 'mood_cat_positive', style: 'success' },
+				{ text: '🌧 Negative', callback_data: 'mood_cat_negative', style: 'danger' }
+			]]
+		});
 	}
 }
 
@@ -949,13 +1041,21 @@ export default {
 		else if (update.poll_answer) {
 			const pa = update.poll_answer;
 			log.info('poll_answer_received', { pollId: pa.poll_id, optionIds: pa.option_ids, userId: pa.user?.id });
-			// Look up poll context from KV
-			const pollCtx = await env.CHAT_KV.get(`poll_test_${pa.poll_id}`, { type: 'json' });
+			const pollCtx = await env.CHAT_KV.get(`mood_poll_${pa.poll_id}`, { type: 'json' });
 			if (pollCtx) {
-				const selectedOption = pa.option_ids?.[0];
-				await telegram.sendMessage(pollCtx.chatId, pollCtx.threadId,
-					`✅ <b>Poll answer received!</b>\n\nOption selected: ${selectedOption}\nPoll ID: ${pa.poll_id}\nUser: ${pa.user?.first_name || 'Unknown'}\n\n<i>poll_answer webhook is working correctly.</i>`, env);
-				await env.CHAT_KV.delete(`poll_test_${pa.poll_id}`);
+				const score = pa.option_ids?.[0]; // 0-10, maps directly to mood score
+				if (score != null) {
+					task = handleMoodPollAnswer(pollCtx.chatId, pollCtx.threadId, score, env);
+				}
+				await env.CHAT_KV.delete(`mood_poll_${pa.poll_id}`);
+			} else {
+				// Check for test polls
+				const testCtx = await env.CHAT_KV.get(`poll_test_${pa.poll_id}`, { type: 'json' });
+				if (testCtx) {
+					await telegram.sendMessage(testCtx.chatId, testCtx.threadId,
+						`✅ <b>Poll test passed.</b> Option: ${pa.option_ids?.[0]}`, env);
+					await env.CHAT_KV.delete(`poll_test_${pa.poll_id}`);
+				}
 			}
 		}
 		else if (update.callback_query) task = handleCallback(update.callback_query, env);

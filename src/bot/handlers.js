@@ -276,25 +276,33 @@ async function handleCommand(command, msg, env) {
 		case "/mood": {
 			await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 1800 });
 
-			// Build checklist-style mood check with toggleable items
-			const moodChecklistKb = {
-				inline_keyboard: [
-					[{ text: '☐  Morning medication taken', callback_data: 'mchk|0|med_morning', style: 'success' }],
-					[{ text: '☐  ADHD medication taken', callback_data: 'mchk|1|med_adhd', style: 'success' }],
-					[{ text: '☐  Anxiety medication taken', callback_data: 'mchk|2|med_anxiety', style: 'success' }],
-					[{ text: '☐  Exercised today', callback_data: 'mchk|3|exercise', style: 'primary' }],
-					[{ text: '☐  Ate a proper meal', callback_data: 'mchk|4|meal', style: 'primary' }],
-					[{ text: '☐  Slept well last night', callback_data: 'mchk|5|sleep', style: 'primary' }],
-					[{ text: '───── Mood Scale ─────', callback_data: 'noop' }],
-					[{ text: '🔴 0-1', callback_data: 'mood_score_1', style: 'danger' }, { text: '🟠 2-3', callback_data: 'mood_score_3', style: 'danger' }],
-					[{ text: '🟢 4-6', callback_data: 'mood_score_5', style: 'success' }],
-					[{ text: '🟡 7-8', callback_data: 'mood_score_7', style: 'primary' }, { text: '🔴 9-10', callback_data: 'mood_score_9', style: 'danger' }],
-				]
-			};
+			// Send mood poll (0-10 bipolar scale)
+			const moodOptions = [
+				'0: Crisis. Suicidal thoughts, total despair.',
+				'1: Severe. Hopeless, guilt, can\'t function.',
+				'2: Low. Persistent sadness, withdrawn.',
+				'3: Struggling. Anxious, irritable.',
+				'4: Below average. Flat, low energy.',
+				'5: Neutral. Steady baseline.',
+				'6: Good. Positive, engaged.',
+				'7: Very good. Productive, optimistic.',
+				'8: Elevated. Racing thoughts, less sleep.',
+				'9: Hypomanic. Impulsive, grandiose.',
+				'10: Manic. Reckless, detached.',
+			];
 
-			await telegram.sendMessage(chatId, threadId,
-				`<b>Mood Check-in</b>\n\nTap each item to check it off, then select your mood score.\n\n🔴 <b>0-1:</b> Severe Depression\n🟠 <b>2-3:</b> Mild/Moderate\n🟢 <b>4-6:</b> Balanced\n🟡 <b>7-8:</b> Hypomania\n🔴 <b>9-10:</b> Mania`,
-				env, null, moodChecklistKb);
+			const pollRes = await telegram.sendPoll(chatId, threadId,
+				'How do you feel right now?',
+				moodOptions,
+				env, { is_anonymous: false }
+			);
+
+			if (pollRes?.ok) {
+				const pollId = pollRes.result.poll.id;
+				await env.CHAT_KV.put(`mood_poll_${pollId}`, JSON.stringify({
+					chatId, threadId, type: 'mood_checkin', sentAt: Date.now()
+				}), { expirationTtl: 86400 });
+			}
 			return true;
 		}
 		case "/testpoll": {

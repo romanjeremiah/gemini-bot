@@ -18,7 +18,7 @@ import { githubReadTool, githubPatchTool, githubExploreTool } from './github';
 import { cloudflareAdminTool } from './cloudflare';
 import { timezoneTool } from './timezone';
 import { searchResearchTool, startResearchTool } from './research';
-import { episodeTool } from './episode';
+import { episodeTool, updateEpisodeOutcomeTool } from './episode';
 
 export const toolRegistry = {
 	[reminderTool.definition.name]: reminderTool,
@@ -47,6 +47,7 @@ export const toolRegistry = {
 	[searchResearchTool.definition.name]: searchResearchTool,
 	[startResearchTool.definition.name]: startResearchTool,
 	[episodeTool.definition.name]: episodeTool,
+	[updateEpisodeOutcomeTool.definition.name]: updateEpisodeOutcomeTool,
 };
 
 export const toolDefinitions = Object.values(toolRegistry).map(t => t.definition);

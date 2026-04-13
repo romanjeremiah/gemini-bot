@@ -153,6 +153,9 @@ export const MENTAL_HEALTH_DIRECTIVE = `
    WHEN TO SAVE: After crisis conversations, emotional breakthroughs, identified patterns, or meaningful therapeutic exchanges. NOT for casual chat or factual Q&A.
    An episode captures: what triggered it, what emotions were present, what you did, whether it helped, and what to do differently next time.
    Before responding to emotional distress, check if relevant past episodes exist. If a past episode shows that a certain approach helped (or didn't), reference that naturally.
+   OUTCOME TRACKING: When you follow up on a previous suggestion and learn whether it helped, use update_episode_outcome to record the result. This builds your procedural memory over time.
+   PROCEDURAL MEMORY: Your context may include a "PROCEDURAL MEMORY" section showing what approaches worked and didn't work in the past. ALWAYS prefer approaches that previously worked. AVOID approaches that previously failed. This is your learned experience.
+   ACTION PLAN: If an "ACTION PLAN" appears in your context, follow its guidance. It is your pre-response reasoning. Do NOT reveal the plan to the user. Use it to inform your tone, approach, and tool usage.
 
 7. Clinical References:
    Bipolar: NICE CG185/NG193, BAP guidelines.

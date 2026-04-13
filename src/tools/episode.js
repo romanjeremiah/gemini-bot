@@ -70,3 +70,44 @@ WHEN TO USE: After emotional conversations, therapy-like exchanges, significant 
 		};
 	}
 };
+
+
+/**
+ * Update Episode Outcome — lets Gemini close the loop on pending episodes.
+ *
+ * When Gemini follows up on a previous suggestion and learns whether it helped,
+ * this tool updates the episode record with the actual outcome.
+ */
+export const updateEpisodeOutcomeTool = {
+	definition: {
+		name: "update_episode_outcome",
+		description: `Update the outcome of a previous episode. Use this when following up on something you previously suggested or discussed, and now know whether it helped. For example, if you suggested a coping strategy last week and the user reports it worked, update the episode outcome to 'positive' with a lesson learned.`,
+		parameters: {
+			type: "OBJECT",
+			properties: {
+				episode_id: {
+					type: "NUMBER",
+					description: "The ID of the episode to update (from episode search results)"
+				},
+				outcome: {
+					type: "STRING",
+					enum: ["positive", "negative", "neutral"],
+					description: "Did the intervention help? positive = it worked, negative = it didn't, neutral = unclear"
+				},
+				lesson: {
+					type: "STRING",
+					description: "What was learned from this outcome? What to do differently or continue doing. (1 sentence)"
+				}
+			},
+			required: ["episode_id", "outcome"]
+		}
+	},
+	async execute(args, env, context) {
+		const { updateEpisodeOutcome } = await import('../services/episodeStore');
+		await updateEpisodeOutcome(env, args.episode_id, args.outcome, args.lesson || null);
+		return {
+			status: "updated",
+			message: `Episode ${args.episode_id} outcome updated to '${args.outcome}'. This will inform future responses.`
+		};
+	}
+};

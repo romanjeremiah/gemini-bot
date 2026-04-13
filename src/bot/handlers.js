@@ -768,7 +768,23 @@ export async function handleMessage(msg, env) {
 			episodeCtx = episodeStore.formatEpisodesForContext(episodes);
 		}
 
-		const dynamicContext = `[Context] Current speaker: ${userIdentity} | London Time: ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London" })} | Unix: ${Math.floor(Date.now() / 1000)}${weatherCtx ? ` | ${weatherCtx}` : ''} | Relationship: ${daysKnown} days${checkinProgress}\n\nMEMORY:\n${memCtx}${semanticCtx}${episodeCtx ? `\n\n${episodeCtx}` : ''}`;
+		// CoALA Phase 2: Planning step for emotional/complex messages
+		// Generates an explicit plan before responding (what approach to take, what to avoid)
+		let planCtx = '';
+		if (isEmotionalMsg && isOwner) {
+			const { generatePlan } = await import('../services/planner');
+			const plan = await generatePlan(env, chatId, userText, null).catch(() => null);
+			if (plan) planCtx = `\nACTION PLAN (your internal reasoning, do NOT share this with the user):\n${plan}`;
+		}
+
+		// CoALA Phase 3: Procedural memory (what approaches worked/didn't)
+		let proceduralCtx = '';
+		if (isEmotionalMsg) {
+			const insights = await episodeStore.getProceduralInsights(env, chatId).catch(() => ({ worked: [], didntWork: [] }));
+			proceduralCtx = episodeStore.formatProceduralContext(insights);
+		}
+
+		const dynamicContext = `[Context] Current speaker: ${userIdentity} | London Time: ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London" })} | Unix: ${Math.floor(Date.now() / 1000)}${weatherCtx ? ` | ${weatherCtx}` : ''} | Relationship: ${daysKnown} days${checkinProgress}\n\nMEMORY:\n${memCtx}${semanticCtx}${episodeCtx ? `\n\n${episodeCtx}` : ''}${proceduralCtx ? `\n\n${proceduralCtx}` : ''}${planCtx}`;
 
 		// Skip code execution when media is present (incompatible with audio/video inline data)
 		// Also skip cache when media is present, because the cache has codeExecution baked in

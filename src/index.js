@@ -1168,10 +1168,12 @@ export default {
 		}
 
 		if (task) {
-			// For owner messages, await directly to avoid waitUntil timeout on complex tool chains
-			// For other users (future multi-user), use waitUntil to avoid blocking
+			// Long-running commands (/architect) must use waitUntil to avoid Telegram webhook timeout retries
+			const msgText = update.message?.text || '';
+			const isLongRunning = /^\/(architect|research)\b/.test(msgText);
 			const isOwnerMsg = update.message?.from?.id === Number(env.OWNER_ID) || update.callback_query?.from?.id === Number(env.OWNER_ID);
-			if (isOwnerMsg) {
+
+			if (isOwnerMsg && !isLongRunning) {
 				try {
 					await task;
 				} catch (err) {

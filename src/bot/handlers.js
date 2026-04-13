@@ -530,7 +530,15 @@ async function handleCommand(command, msg, env) {
 				return true;
 			}
 
-			const statusRes = await telegram.sendMessage(chatId, threadId, "⚙️ <b>Architecture Review</b>\n<i>Phase 1: Initialising search parameters...</i>", env);
+			// Deduplication: prevent concurrent /architect runs
+			const architectLock = await env.CHAT_KV.get(`architect_lock_${chatId}`);
+			if (architectLock) {
+				await telegram.sendMessage(chatId, threadId, "Architecture review is already running. Please wait.", env);
+				return true;
+			}
+			await env.CHAT_KV.put(`architect_lock_${chatId}`, '1', { expirationTtl: 300 }); // 5 min lock
+
+			const statusRes = await telegram.sendMessage(chatId, threadId, "⚙️ <b>Architecture Review</b>\n<i>Starting research...</i>", env);
 			const statusMsgId = statusRes?.result?.message_id;
 
 			try {
@@ -643,6 +651,8 @@ Be bold. Think beyond incremental improvements. Reference actual file paths from
 				console.error('Architect error:', e.message);
 				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, `⚙️ <b>Architecture Review Failed</b>\n<i>${e.message?.slice(0, 100)}</i>`, env);
 				else await telegram.sendMessage(chatId, threadId, `Architecture review failed: ${e.message?.slice(0, 100)}`, env);
+			} finally {
+				await env.CHAT_KV.delete(`architect_lock_${chatId}`);
 			}
 			return true;
 		}

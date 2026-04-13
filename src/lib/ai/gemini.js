@@ -177,15 +177,23 @@ function hashStr(str) {
 
 function buildConfig(systemInstruction, opts = {}) {
   const tools = [{ functionDeclarations: normalizedTools }, { googleSearch: {} }];
-  // Code execution is incompatible with audio/video inline data
   if (!opts.skipCodeExecution) tools.push({ codeExecution: {} });
-  return {
+
+  const config = {
     systemInstruction,
     tools,
     toolConfig: { includeServerSideToolInvocations: true },
     temperature: 1.0,
     maxOutputTokens: 8192,
   };
+
+  // Test-Time Compute: adjust thinking depth based on message complexity
+  // 'high' for complex/emotional, 'low' for casual chat
+  if (opts.thinkingLevel) {
+    config.thinkingConfig = { thinkingBudget: opts.thinkingLevel === 'high' ? 2048 : 512 };
+  }
+
+  return config;
 }
 
 function buildCachedConfig(cacheName) {
@@ -200,7 +208,7 @@ export async function createChat(history, systemInstruction, env, cacheContext =
   const useModel = model || PRIMARY_TEXT_MODEL;
   const config = cacheContext?.cacheName
     ? buildCachedConfig(cacheContext.cacheName)
-    : buildConfig(systemInstruction, opts);
+    : buildConfig(systemInstruction, { ...opts, thinkingLevel: opts.thinkingLevel });
 
   console.log(`🤖 Model: ${useModel}`);
   return getAI(env).chats.create({

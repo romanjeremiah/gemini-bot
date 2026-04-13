@@ -153,6 +153,31 @@ Create a structured episode record. Respond with ONLY valid JSON (no markdown):
 				}
 			} catch { /* episode creation is best-effort */ }
 		}
+
+		// GraphRAG: extract relationship triples from the conversation
+		try {
+			const tripleResponse = await generateShortResponse(
+				`Extract factual relationship triples from this exchange. Return ONLY valid JSON array (no markdown).
+USER: ${userText.slice(0, 300)}
+ASSISTANT: ${botResponse.slice(0, 200)}
+
+Format: [{"subject":"X","predicate":"Y","object":"Z"}]
+Examples: [{"subject":"Roman","predicate":"enjoys","object":"drone videography"},{"subject":"coffee","predicate":"is","object":"stimulant"}]
+Only extract concrete, factual relationships. If nothing new, return [].`,
+				'You extract knowledge graph triples. Return only valid JSON array.', env
+			);
+			if (tripleResponse && tripleResponse.startsWith('[')) {
+				const triples = JSON.parse(tripleResponse.replace(/```json|```/g, '').trim());
+				const { saveTriple } = await import('../services/knowledgeGraph');
+				for (const t of triples.slice(0, 5)) {
+					if (t.subject && t.predicate && t.object) {
+						await saveTriple(env, chatId, t.subject, t.predicate, t.object, null, 'conversation');
+					}
+				}
+				if (triples.length) log.info('graph_triples_extracted', { chatId, count: triples.length });
+			}
+		} catch { /* triple extraction is best-effort */ }
+
 	} catch { /* silent fail - this is background enrichment, not critical */ }
 }
 
@@ -817,7 +842,24 @@ export async function handleMessage(msg, env) {
 			proceduralCtx = episodeStore.formatProceduralContext(insights);
 		}
 
-		const dynamicContext = `[Context] Current speaker: ${userIdentity} | London Time: ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London" })} | Unix: ${Math.floor(Date.now() / 1000)}${weatherCtx ? ` | ${weatherCtx}` : ''} | Relationship: ${daysKnown} days${checkinProgress}\n\nMEMORY:\n${memCtx}${semanticCtx}${episodeCtx ? `\n\n${episodeCtx}` : ''}${proceduralCtx ? `\n\n${proceduralCtx}` : ''}${planCtx}`;
+		// GraphRAG: query knowledge graph for relational context
+		let graphCtx = '';
+		if (isEmotionalMsg && userText.length > 10) {
+			const { queryRelated, formatGraphContext } = await import('../services/knowledgeGraph');
+			// Extract key concepts from the message to query the graph
+			const keywords = userText.match(/\b[A-Za-z]{4,}\b/g)?.slice(0, 3) || [];
+			const graphResults = [];
+			for (const kw of keywords) {
+				const triples = await queryRelated(env, chatId, kw, 5).catch(() => []);
+				graphResults.push(...triples);
+			}
+			// Deduplicate by ID
+			const seen = new Set();
+			const unique = graphResults.filter(t => { if (seen.has(t.id)) return false; seen.add(t.id); return true; });
+			graphCtx = formatGraphContext(unique);
+		}
+
+		const dynamicContext = `[Context] Current speaker: ${userIdentity} | London Time: ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London" })} | Unix: ${Math.floor(Date.now() / 1000)}${weatherCtx ? ` | ${weatherCtx}` : ''} | Relationship: ${daysKnown} days${checkinProgress}\n\nMEMORY:\n${memCtx}${semanticCtx}${episodeCtx ? `\n\n${episodeCtx}` : ''}${proceduralCtx ? `\n\n${proceduralCtx}` : ''}${graphCtx ? `\n\n${graphCtx}` : ''}${planCtx}`;
 
 		// Skip code execution when media is present (incompatible with audio/video inline data)
 		// Also skip cache when media is present, because the cache has codeExecution baked in
@@ -825,13 +867,16 @@ export async function handleMessage(msg, env) {
 		const fullSysPrompt = `${personaInstruction}\n\n${MENTAL_HEALTH_DIRECTIVE}\n\n${SECOND_BRAIN_DIRECTIVE}\n\n${FORMATTING_RULES}\n${dynamicContext}`;
 
 		let chat;
+		// Test-Time Compute: high thinking for emotional/complex, none for casual
+		const thinkingLevel = isEmotionalMsg ? 'high' : null;
+
 		try {
-			chat = await createChat(hist, fullSysPrompt, env, cacheContext, textModel, { skipCodeExecution: hasMedia });
+			chat = await createChat(hist, fullSysPrompt, env, cacheContext, textModel, { skipCodeExecution: hasMedia, thinkingLevel });
 		} catch (cacheErr) {
 			// If cache is stale (403), retry without cache
 			if (cacheErr.message?.includes('403') || cacheErr.message?.includes('CachedContent')) {
 				log.warn('cache_stale_retry', { msg: cacheErr.message });
-				chat = await createChat(hist, fullSysPrompt, env, null, textModel, { skipCodeExecution: hasMedia });
+				chat = await createChat(hist, fullSysPrompt, env, null, textModel, { skipCodeExecution: hasMedia, thinkingLevel });
 			} else {
 				throw cacheErr;
 			}

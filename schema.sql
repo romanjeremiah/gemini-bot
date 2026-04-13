@@ -76,3 +76,22 @@ CREATE TABLE IF NOT EXISTS episodes (
 CREATE INDEX IF NOT EXISTS idx_episodes_chat ON episodes(chat_id);
 CREATE INDEX IF NOT EXISTS idx_episodes_type ON episodes(chat_id, episode_type);
 CREATE INDEX IF NOT EXISTS idx_episodes_date ON episodes(chat_id, created_at);
+
+-- 6. KNOWLEDGE GRAPH (GraphRAG — relational triples for reasoning)
+-- Stores Subject-Predicate-Object relationships enabling multi-hop reasoning:
+-- "Roman enjoys coffee" + "coffee is stimulant" = context about overstimulation
+CREATE TABLE IF NOT EXISTS knowledge_graph (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    subject TEXT NOT NULL,           -- e.g., 'Roman', 'coffee', 'ADHD medication'
+    predicate TEXT NOT NULL,         -- e.g., 'enjoys', 'causes', 'helps with'
+    object TEXT NOT NULL,            -- e.g., 'drone videography', 'insomnia', 'focus'
+    context TEXT,                    -- optional metadata or source sentence
+    confidence REAL DEFAULT 1.0,    -- 0.0 to 1.0 confidence score
+    source TEXT,                     -- 'observation', 'conversation', 'consolidation'
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_kg_subject ON knowledge_graph(chat_id, subject);
+CREATE INDEX IF NOT EXISTS idx_kg_object ON knowledge_graph(chat_id, object);
+CREATE INDEX IF NOT EXISTS idx_kg_predicate ON knowledge_graph(chat_id, predicate);

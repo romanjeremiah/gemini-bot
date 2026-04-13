@@ -362,16 +362,18 @@ async function handleMoodPollAnswer(chatId, threadId, score, env) {
 	await moodStore.upsertEntry(env, chatId, today, 'evening', { mood_score: score });
 
 	// Build context-aware response using recent mood history and memories
-	const moodHistory = await moodStore.getRecentEntries(env, chatId, 30);
+	const moodHistory = await moodStore.getHistory(env, chatId, 30);
 	const memoryCtx = await memoryStore.getFormattedContext(env, chatId);
 	const semanticCtx = await vectorStore.getSemanticContext(env, chatId, `mood score ${score} how I feel`);
 	const therapeuticNotes = await env.DB.prepare(
 		`SELECT category, fact FROM memories WHERE chat_id = ? AND category IN ('pattern','trigger','schema','insight','homework') ORDER BY created_at DESC LIMIT 10`
 	).bind(chatId).all().then(r => r.results || []);
 
-	const recentScores = moodHistory.slice(0, 7).map(e =>
-		`${e.date}: ${e.mood_score}/10 ${e.emotions?.length ? '(' + e.emotions.join(', ') + ')' : ''}`
-	).join('\n');
+	const recentScores = moodHistory.slice(0, 7).map(e => {
+		const parsed = typeof e.data === 'string' ? JSON.parse(e.data || '{}') : (e.data || {});
+		const emotions = parsed.emotions?.length ? '(' + parsed.emotions.join(', ') + ')' : '';
+		return `${e.date}: ${parsed.mood_score ?? '?'}/10 ${emotions}`;
+	}).join('\n');
 
 	const clinicalNotes = therapeuticNotes.map(n => `[${n.category}] ${n.fact}`).join('\n');
 

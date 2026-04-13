@@ -468,6 +468,9 @@ export async function handleMessage(msg, env) {
 	const chatId = msg.chat.id, messageId = msg.message_id, threadId = msg.message_thread_id || "default";
 	const replyToMessageId = msg.reply_to_message?.message_id || null;
 
+	// Skip messages from bots (including our own)
+	if (msg.from?.is_bot) return;
+
 	try {
 		const firstName = msg.from.first_name || "User", userText = msg.text || msg.caption || "";
 		log.info('message_received', { chatId, from: firstName, len: userText.length, hasMedia: !!getMediaFromMessage(msg) });

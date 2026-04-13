@@ -14,6 +14,9 @@ import { getSchedule, matchesSchedule } from './config/schedules';
 import { toolRegistry } from './tools/index';
 import { log } from './lib/logger';
 
+// Export Workflow class for Cloudflare Workflows binding
+export { MemoryConsolidationWorkflow } from './workflows/memoryConsolidation';
+
 const BIZ_CONN_TTL = 2592000; // 30 days
 
 // Known effect IDs to emoji mapping (for discovery logging)
@@ -307,11 +310,21 @@ async function handleMemoryConsolidation(env) {
 	await env.CHAT_KV.put(runKey, '1', { expirationTtl: 86400 * 5 });
 
 	try {
-		await memoryStore.consolidateMemories(env, chatId);
-		await telegram.sendMessage(chatId, 'default',
-			'<i>Did some deep memory consolidation overnight. Your saved memories are organised and ready for the new month.</i>', env);
+		// Trigger the durable Workflow instead of running inline
+		if (env.MEMORY_WORKFLOW) {
+			await env.MEMORY_WORKFLOW.create({
+				id: `rem-sleep-${month}`,
+				params: { chatId }
+			});
+			log.info('workflow_triggered', { workflow: 'memory-consolidation', month });
+		} else {
+			// Fallback: run inline if Workflow binding not available
+			await memoryStore.consolidateMemories(env, chatId);
+			await telegram.sendMessage(chatId, 'default',
+				'<i>Did some deep memory consolidation overnight. Your saved memories are organised and ready for the new month.</i>', env);
+		}
 	} catch (e) {
-		console.error('Consolidation error:', e.message);
+		log.error('consolidation_error', { msg: e.message });
 	}
 }
 

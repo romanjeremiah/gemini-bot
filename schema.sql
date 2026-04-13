@@ -53,3 +53,26 @@ CREATE TABLE IF NOT EXISTS chat_summaries (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(chat_id) REFERENCES user_profiles(chat_id)
 );
+
+-- 5. EPISODES (CoALA episodic memory — structured records of significant interactions)
+-- Captures: what triggered the episode, what emotions were present, what intervention was tried,
+-- what the outcome was, and what lesson was learned. This enables Xaridotis to recall
+-- "last time this happened, we tried X and it worked/didn't work."
+CREATE TABLE IF NOT EXISTS episodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    episode_type TEXT NOT NULL,        -- 'crisis', 'breakthrough', 'pattern', 'checkin', 'conversation'
+    trigger_context TEXT,              -- what prompted this episode
+    emotions TEXT,                     -- JSON array of emotions present
+    intervention TEXT,                 -- what Xaridotis did/suggested
+    outcome TEXT,                      -- how it resolved (positive/negative/neutral/pending)
+    lesson TEXT,                       -- what was learned for future reference
+    mood_score INTEGER,                -- mood score at time of episode (if available)
+    related_memory_ids TEXT,           -- JSON array of memory IDs referenced
+    metadata TEXT,                     -- JSON for any additional structured data
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_episodes_chat ON episodes(chat_id);
+CREATE INDEX IF NOT EXISTS idx_episodes_type ON episodes(chat_id, episode_type);
+CREATE INDEX IF NOT EXISTS idx_episodes_date ON episodes(chat_id, created_at);

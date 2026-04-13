@@ -4,6 +4,7 @@ import * as reminderStore from './services/reminderStore';
 import * as moodStore from './services/moodStore';
 import * as memoryStore from './services/memoryStore';
 import * as vectorStore from './services/vectorStore';
+import * as episodeStore from './services/episodeStore';
 import * as telegram from './lib/telegram';
 import { generateSpeech } from './lib/tts';
 import { generateShortResponse, generateWithFallback } from './lib/ai/gemini';
@@ -388,32 +389,40 @@ async function handleMoodPollAnswer(chatId, threadId, score, env) {
 
 	const clinicalNotes = therapeuticNotes.map(n => `[${n.category}] ${n.fact}`).join('\n');
 
+	// Retrieve relevant past episodes (CoALA episodic memory)
+	const relevantEpisodes = await episodeStore.getRecentEpisodes(env, chatId, 5, score <= 3 ? 'crisis' : null).catch(() => []);
+	const episodeCtx = episodeStore.formatEpisodesForContext(relevantEpisodes);
+
 	let contextPrompt;
 	if (score <= 1) {
 		contextPrompt = `CRISIS RESPONSE. The user scored ${score}/10 (severe depression/crisis).
 Recent mood history:\n${recentScores}
 Clinical notes:\n${clinicalNotes}
+${episodeCtx}
 ${semanticCtx}
 
-Respond with deep compassion. Mention Samaritans (116 123) and SHOUT (text 85258). Gently ask what has been weighing on them. Reference any relevant patterns from their history.`;
+Respond with deep compassion. Mention Samaritans (116 123) and SHOUT (text 85258). If past episodes show what helped before, reference that gently. Ask what has been weighing on them.`;
 	} else if (score >= 9) {
 		contextPrompt = `MANIA ALERT. The user scored ${score}/10 (mania/hypomania).
 Recent mood history:\n${recentScores}
 Clinical notes:\n${clinicalNotes}
+${episodeCtx}
 ${semanticCtx}
 
-Acknowledge calmly without amplifying the energy. Ask ONE question about sleep or safety. Note any escalating pattern from recent scores.`;
+Acknowledge calmly without amplifying the energy. Ask ONE question about sleep or safety. Note any escalating pattern. If past episodes show precedent, reference it.`;
 	} else {
 		contextPrompt = `The user scored ${score}/10 on their mood check-in today.
 Recent mood history (last 7 days):\n${recentScores}
 Clinical notes:\n${clinicalNotes}
+${episodeCtx}
 ${semanticCtx}
 
 Respond naturally:
 1. Acknowledge the score briefly.
 2. Compare to recent days. Note any trends (improving, declining, stable).
-3. From a therapeutic perspective, share one observation about their recent pattern.
-4. Ask them to tap the emotion buttons below to log how they are feeling.
+3. If past episodes are available, reference what worked or didn't work in similar situations.
+4. From a therapeutic perspective, share one observation about their recent pattern.
+5. Ask them to tap the emotion buttons below to log how they are feeling.
 Keep it warm, concise, and clinically aware. Do not list every data point. Synthesise.`;
 	}
 

@@ -71,10 +71,10 @@ async function embed(env, input) {
 async function rerank(env, query, results) {
 	if (!env.AI || !results.length) return results;
 	try {
-		const documents = results.map(r => r.metadata?.fact || r.metadata?.preview || '').filter(Boolean);
-		if (!documents.length) return results;
+		const contexts = results.map(r => r.metadata?.fact || r.metadata?.preview || '').filter(Boolean);
+		if (!contexts.length) return results;
 
-		const reranked = await env.AI.run(RERANKER_MODEL, { query, documents });
+		const reranked = await env.AI.run(RERANKER_MODEL, { query, contexts });
 		if (!reranked?.data?.length) return results;
 
 		// Map reranker scores back to original results

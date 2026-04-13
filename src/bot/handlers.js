@@ -19,6 +19,46 @@ const DRAFT_THROTTLE_MS = 500; // minimum ms between sendMessageDraft calls
 
 const THERAPEUTIC_CATEGORIES = ['pattern', 'trigger', 'avoidance', 'schema', 'growth', 'coping', 'insight', 'homework'];
 
+/**
+ * Detect whether a message requires the Pro model (complex reasoning)
+ * or can be handled by Flash (casual conversation, simple questions).
+ *
+ * Pro triggers:
+ * - Code/architecture discussions (mentions code, file paths, functions, debugging)
+ * - Mental health conversations (active check-in, emotional language, therapy terms)
+ * - Complex requests (analysis, comparison, deep explanation, research)
+ * - Tool-heavy requests (reminders with complex timing, image generation prompts)
+ *
+ * Flash handles:
+ * - Casual chat, greetings, small talk
+ * - Simple questions, quick lookups
+ * - Short responses, confirmations
+ */
+function detectComplexTask(text, activeCheckin) {
+	if (!text) return false;
+	const lower = text.toLowerCase();
+
+	// Active health check-in always uses Pro
+	if (activeCheckin) return true;
+
+	// Code/technical patterns
+	if (/\b(code|function|bug|error|deploy|refactor|implement|architecture|PR|pull request|commit|git|webpack|npm|wrangler|api|endpoint|database|query|sql|schema|migration)\b/i.test(text)) return true;
+	if (/\.(js|ts|py|json|css|html|jsx|mjs)\b/.test(text)) return true;
+	if (/```/.test(text)) return true;
+
+	// Mental health / emotional depth
+	if (/\b(anxious|depressed|panic|overwhelm|trigger|dissociat|suicid|self.?harm|therapy|therapist|schema|attachment|ifs|dbt|aedp|emotion|mood|bipolar|mania|hypo)\b/i.test(text)) return true;
+
+	// Complex requests
+	if (/\b(analyse|analyze|compare|explain.*detail|research|deep dive|break down|pros and cons|trade.?off|strategy|plan)\b/i.test(text)) return true;
+
+	// Long messages (>300 chars) likely need deeper reasoning
+	if (text.length > 300) return true;
+
+	// Default: Flash is sufficient
+	return false;
+}
+
 // Silent Observation: Xaridotis quietly reflects on conversations to learn about the user
 // implicitly. Runs in the background after substantive exchanges. Throttled to max 5/day.
 async function silentObservation(env, chatId, userText, botResponse) {
@@ -401,7 +441,13 @@ export async function handleMessage(msg, env) {
 		// Model routing: check for manual override in KV, otherwise default to Owner=Pro / Guest=Flash
 		const isOwner = env.OWNER_ID && String(msg.from.id) === String(env.OWNER_ID);
 		const modelOverride = await env.CHAT_KV.get(`model_override_${chatId}_${threadId}`);
-		const textModel = modelOverride || (isOwner ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL);
+		// Smart model selection: Pro for complex tasks, Flash for casual conversation
+		let textModel = modelOverride || FALLBACK_TEXT_MODEL; // Default: Flash for everyone
+		if (isOwner && !modelOverride) {
+			const needsPro = detectComplexTask(userText, activeCheckin);
+			textModel = needsPro ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
+			if (needsPro) log.info('model_upgrade', { reason: 'complex_task', model: textModel });
+		}
 
 		// Unified persona: Xaridotis handles all tones naturally
 		const healthCheckin = isOwner ? await env.CHAT_KV.get(`health_checkin_active_${chatId}`) : null;
@@ -707,6 +753,20 @@ export async function handleCallback(callbackQuery, env) {
 		await telegram.deleteMessage(chatId, msgId, env);
 	} else if (data === "action_dismiss_pr") {
 		await telegram.editMessage(chatId, msgId, "<i>Architecture suggestion dismissed.</i>", env);
+	} else if (data === "approve_pr") {
+		// Extract the suggestion text from the message and send it to the chat as a new message
+		// so Xaridotis can act on it with its tools (patch_repo_file etc.)
+		const originalText = callbackQuery.message.text || '';
+		await telegram.editMessage(chatId, msgId, `<b>Architecture Suggestion Approved</b>\n\n<i>Implementing...</i>`, env);
+		// Feed the suggestion back to Xaridotis as an instruction to implement
+		const fakeMsg = {
+			message_id: msgId,
+			chat: { id: chatId },
+			from: callbackQuery.from,
+			text: `I approve this architecture suggestion. Apply it now using patch_repo_file:\n\n${originalText.slice(0, 2000)}`,
+			date: Math.floor(Date.now() / 1000),
+		};
+		await handleMessage(fakeMsg, env);
 	} else if (data === 'noop') {
 		// Separator row, do nothing
 		await telegram.answerCallbackQuery(callbackQuery.id, env);

@@ -646,8 +646,8 @@ Keep it under 500 words. End with: "Awaiting your manual review."` }] }],
 		if (prText && !prText.includes('NO_PR_NEEDED') && prText.length > 50) {
 			await telegram.sendMessage(chatId, 'default', `<b>Architecture Deep Search</b>\n\n${prText}`, env, null, {
 				inline_keyboard: [[
-					{ text: '💬 Discuss', callback_data: 'discuss_pr' },
-					{ text: '❌ Dismiss', callback_data: 'action_dismiss_pr' }
+					{ text: '✅ Approve', callback_data: 'approve_pr', style: 'success' },
+					{ text: '❌ Dismiss', callback_data: 'action_dismiss_pr', style: 'danger' }
 				]]
 			});
 			await memoryStore.saveMemory(env, chatId, 'discovery', `Architecture PR (${randomTech}): ${prText.slice(0, 300)}`, 1, chatId);
@@ -985,15 +985,17 @@ export default {
 		if (env.OWNER_ID) {
 			try { await handleHealthCheckIns(env); } catch (e) { log.error('cron_checkin', { msg: e.message }); }
 			try { await handleMedicationNudge(env); } catch (e) { log.error('cron_nudge', { msg: e.message }); }
-			try { await handleWeeklyReport(env); } catch (e) { log.error('cron_report', { msg: e.message }); }
-			try { await handleAccountabilityNudge(env); } catch (e) { log.error('cron_accountability', { msg: e.message }); }
 			try { await handleMemoryConsolidation(env); } catch (e) { log.error('cron_consolidation', { msg: e.message }); }
 			try { await handleSpontaneousOutreach(env); } catch (e) { log.error('cron_outreach', { msg: e.message }); }
-			try { await handleCuriosityDigest(env); } catch (e) { log.error('cron_digest', { msg: e.message }); }
-			try { await handleAutonomousResearch(env); } catch (e) { log.error('cron_research', { msg: e.message }); }
-			try { await handleSelfImprovement(env); } catch (e) { log.error('cron_self_improve', { msg: e.message }); }
-			try { await handleArchitectureEvolution(env); } catch (e) { log.error('cron_architecture', { msg: e.message }); }
-			try { await handleDailyStudy(env); } catch (e) { log.error('cron_daily_study', { msg: e.message }); }
+
+			// Disabled: these are now manual-only via /study, /research, /architect commands
+			// try { await handleWeeklyReport(env); } catch (e) { log.error('cron_report', { msg: e.message }); }
+			// try { await handleAccountabilityNudge(env); } catch (e) { log.error('cron_accountability', { msg: e.message }); }
+			// try { await handleCuriosityDigest(env); } catch (e) { log.error('cron_digest', { msg: e.message }); }
+			// try { await handleAutonomousResearch(env); } catch (e) { log.error('cron_research', { msg: e.message }); }
+			// try { await handleSelfImprovement(env); } catch (e) { log.error('cron_self_improve', { msg: e.message }); }
+			// try { await handleArchitectureEvolution(env); } catch (e) { log.error('cron_architecture', { msg: e.message }); }
+			// try { await handleDailyStudy(env); } catch (e) { log.error('cron_daily_study', { msg: e.message }); }
 		}
 
 		// ---- Reminders ----

@@ -325,6 +325,79 @@ async function handleCommand(command, msg, env) {
 			}
 			return true;
 		}
+		case "/researchfull": {
+			if (!env.OWNER_ID || String(msg.from.id) !== String(env.OWNER_ID)) {
+				await telegram.sendMessage(chatId, threadId, "This command is owner-only.", env);
+				return true;
+			}
+			const searchTopic = (msg.text || '').replace('/researchfull', '').trim();
+			try {
+				// Find research references in D1
+				let query = `SELECT fact FROM memories WHERE chat_id = ? AND category = 'research_ref'`;
+				const params = [chatId];
+				if (searchTopic) {
+					query += ` AND fact LIKE ?`;
+					params.push(`%${searchTopic}%`);
+				}
+				query += ` ORDER BY created_at DESC LIMIT 5`;
+
+				const { results } = await env.DB.prepare(query).bind(...params).all();
+				if (!results?.length) {
+					await telegram.sendMessage(chatId, threadId, searchTopic
+						? `No research found matching "${searchTopic}". Try <code>/researchfull</code> to see all.`
+						: 'No research reports saved yet.', env);
+					return true;
+				}
+
+				if (!searchTopic && results.length > 1) {
+					// Show list for selection
+					let text = '<b>Available Research Reports</b>\n\nSpecify a topic to read the full report:\n\n';
+					for (const r of results) {
+						const topicMatch = r.fact.match(/Topic:\s*(.+)$/);
+						const topic = topicMatch ? topicMatch[1] : 'Unknown';
+						text += `<code>/researchfull ${topic.slice(0, 40)}</code>\n`;
+					}
+					await telegram.sendMessage(chatId, threadId, text, env);
+					return true;
+				}
+
+				// Get the R2 key from the first match
+				const keyMatch = results[0].fact.match(/\[R2:([^\]]+)\]/);
+				if (!keyMatch || !env.MEDIA_BUCKET) {
+					await telegram.sendMessage(chatId, threadId, 'Full report not available (R2 storage reference missing).', env);
+					return true;
+				}
+
+				const obj = await env.MEDIA_BUCKET.get(keyMatch[1]);
+				if (!obj) {
+					await telegram.sendMessage(chatId, threadId, 'Full report not found in storage. It may have been cleaned up.', env);
+					return true;
+				}
+
+				const fullReport = await obj.text();
+				// Split into chunks if too long for Telegram (4096 char limit)
+				const chunks = [];
+				const topicLabel = results[0].fact.match(/Topic:\s*(.+)$/)?.[1] || 'Research';
+				const header = `<b>Full Research Report</b>\n<i>${topicLabel}</i>\n\n`;
+				let remaining = fullReport;
+				let isFirst = true;
+				while (remaining.length > 0) {
+					const maxLen = isFirst ? (4000 - header.length) : 4000;
+					chunks.push((isFirst ? header : '') + remaining.slice(0, maxLen));
+					remaining = remaining.slice(maxLen);
+					isFirst = false;
+				}
+				for (const chunk of chunks.slice(0, 5)) { // Max 5 messages
+					await telegram.sendMessage(chatId, threadId, chunk, env);
+				}
+				if (chunks.length > 5) {
+					await telegram.sendMessage(chatId, threadId, `<i>...report truncated (${chunks.length} parts, showing first 5)</i>`, env);
+				}
+			} catch (e) {
+				await telegram.sendMessage(chatId, threadId, `Error: ${e.message?.slice(0, 100)}`, env);
+			}
+			return true;
+		}
 		case "/researchhistory": {
 			if (!env.OWNER_ID || String(msg.from.id) !== String(env.OWNER_ID)) {
 				await telegram.sendMessage(chatId, threadId, "This command is owner-only.", env);

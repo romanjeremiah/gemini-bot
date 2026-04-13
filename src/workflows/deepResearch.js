@@ -70,7 +70,19 @@ export class DeepResearchWorkflow extends WorkflowEntrypoint {
 
 		if (!researchOutput) throw new Error('Deep Research timed out after 5 minutes');
 
-		// Step 3: Synthesise and save to memory
+		// Step 3: Save the full report to R2 for later retrieval
+		const reportKey = await step.do('save-full-report', async () => {
+			const key = `research/${chatId}/${Date.now()}_${topic.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 50)}.txt`;
+			if (this.env.MEDIA_BUCKET) {
+				await this.env.MEDIA_BUCKET.put(key, researchOutput, {
+					customMetadata: { chatId: String(chatId), topic, createdAt: new Date().toISOString() }
+				});
+				console.log(`📄 Full research report saved to R2: ${key}`);
+			}
+			return key;
+		});
+
+		// Step 4: Synthesise and save summary to memory
 		const savedInsight = await step.do('save-insight', async () => {
 			const { GoogleGenAI } = await import('@google/genai');
 			const ai = new GoogleGenAI({ apiKey: this.env.GEMINI_API_KEY });
@@ -105,8 +117,13 @@ Write as if noting this down for yourself.` }] }],
 				'INSERT INTO memories (chat_id, category, fact, importance_score) VALUES (?, ?, ?, ?)'
 			).bind(chatId, category, truncated, 2).run();
 
+			// Also save the R2 key reference so we can find the full report
+			await this.env.DB.prepare(
+				'INSERT INTO memories (chat_id, category, fact, importance_score) VALUES (?, ?, ?, ?)'
+			).bind(chatId, 'research_ref', `[R2:${reportKey}] Topic: ${topic}`, 0).run();
+
 			console.log(`🧠 Deep Research insight saved: ${category}`);
-			return { insight: truncated, category };
+			return { insight: truncated, category, reportKey };
 		});
 
 		// Step 4: Share results (always for manual triggers, 40% for automatic)

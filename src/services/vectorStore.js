@@ -94,35 +94,62 @@ export async function indexConversation(env, chatId, userText, aiSummary, messag
  * @param {number} chatId
  * @param {string} query - natural language query
  * @param {number} topK - max results (default 5)
- * @param {string|null} type - filter: 'memory' | 'conversation' | null (both)
+ * @param {Object} opts - options: { categories: string[], minScore: number }
  * @returns {Array<{ id: string, score: number, metadata: Object }>}
  */
-export async function semanticSearch(env, chatId, query, topK = 5, type = null) {
+export async function semanticSearch(env, chatId, query, topK = 5, opts = {}) {
 	if (!env.VECTORIZE || !env.AI) {
 		console.log('⚠️ Vectorize/AI not bound — semantic search unavailable');
 		return [];
 	}
 	try {
 		const vector = await embed(env, query);
-		const filter = { chatId: Number(chatId) };
-		if (type === 'memory') filter.category = { $ne: undefined };
-		if (type === 'conversation') filter.type = 'conversation';
+		const filter = { chatId: { $eq: Number(chatId) } };
+
+		// Use $in for multi-category filtering (e.g. all therapeutic categories at once)
+		if (opts.categories?.length) {
+			filter.category = { $in: opts.categories };
+		}
 
 		const results = await env.VECTORIZE.query(vector, {
 			topK,
-			filter: { chatId: { $eq: Number(chatId) } },
+			filter,
 			returnMetadata: 'all',
 		});
 
-		return (results.matches || []).map(m => ({
-			id: m.id,
-			score: m.score,
-			metadata: m.metadata,
-		}));
+		const minScore = opts.minScore || 0;
+		return (results.matches || [])
+			.filter(m => m.score >= minScore)
+			.map(m => ({
+				id: m.id,
+				score: m.score,
+				metadata: m.metadata,
+			}));
 	} catch (err) {
 		console.error('⚠️ Vectorize search error:', err.message);
 		return [];
 	}
+}
+
+/**
+ * Search specifically across therapeutic memories (triggers, schemas, patterns, avoidance, growth).
+ * Uses $in filter to sweep all clinical categories in a single query.
+ */
+export async function therapeuticSearch(env, chatId, query, topK = 5) {
+	return semanticSearch(env, chatId, query, topK, {
+		categories: ['trigger', 'schema', 'avoidance', 'pattern', 'growth', 'coping', 'insight', 'homework'],
+		minScore: 0.6,
+	});
+}
+
+/**
+ * Search specifically across learning/discovery memories.
+ */
+export async function knowledgeSearch(env, chatId, query, topK = 5) {
+	return semanticSearch(env, chatId, query, topK, {
+		categories: ['discovery', 'growth'],
+		minScore: 0.5,
+	});
 }
 
 /**
@@ -163,16 +190,28 @@ export async function getSemanticContext(env, chatId, userMessage) {
 	if (!userMessage || userMessage.length < 5) return '';
 
 	try {
-		const results = await semanticSearch(env, chatId, userMessage, 3);
-		if (!results.length) return '';
+		// Run two searches in parallel: general recall + therapeutic pattern matching
+		const [generalResults, therapeuticResults] = await Promise.all([
+			semanticSearch(env, chatId, userMessage, 3, { minScore: 0.65 }),
+			therapeuticSearch(env, chatId, userMessage, 3),
+		]);
 
-		const relevant = results.filter(r => r.score > 0.65);
-		if (!relevant.length) return '';
+		// Deduplicate by ID
+		const seen = new Set();
+		const allResults = [];
+		for (const r of [...therapeuticResults, ...generalResults]) {
+			if (!seen.has(r.id)) {
+				seen.add(r.id);
+				allResults.push(r);
+			}
+		}
+
+		if (!allResults.length) return '';
 
 		let ctx = '\nSemantic recall (related past context):\n';
 		let criticalAlert = '';
 
-		for (const r of relevant) {
+		for (const r of allResults) {
 			const meta = r.metadata;
 			if (meta.fact) {
 				ctx += `- [${meta.category}] ${meta.fact} (relevance: ${(r.score * 100).toFixed(0)}%)\n`;

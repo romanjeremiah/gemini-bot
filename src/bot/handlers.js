@@ -331,32 +331,56 @@ async function handleCommand(command, msg, env) {
 				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Phase 2: Querying trusted sources and documentation...</i>", env);
 
 				const { text: suggestions } = await generateWithFallback(env,
-					[{ role: 'user', parts: [{ text: `You are a senior AI product engineer and innovation researcher reviewing a Telegram AI companion chatbot called Xaridotis (TenonMind). Your job is to find cutting-edge features that would make this bot genuinely unique, not just another chatbot wrapper.
+					[{ role: 'user', parts: [{ text: `You are a senior AI product strategist and innovation researcher. You are reviewing a Telegram AI companion chatbot called Xaridotis (TenonMind). Your mission is to find cutting-edge capabilities and ideas that would make this bot genuinely unique in the market.
 
 CURRENT ARCHITECTURE:
 ${ARCHITECTURE_SUMMARY}
 
-RESEARCH TASK:
-1. Search for the LATEST updates across these platforms:
-   - Telegram Bot API: new methods, features, Mini App capabilities, business features, checklists, payments
-   - Google Gemini API: new models, tools, Live API updates, Deep Research, embeddings, code execution, video generation
-   - Cloudflare Workers: new bindings, AI models, Workflows features, D1 improvements, Browser Rendering
-   - AI companion/therapeutic bot research: new techniques, UX patterns, ethical frameworks
-   - Competitor analysis: what are the best AI chatbots doing differently? (ChatGPT, Pi, Replika, Character.ai, Claude)
+COMPREHENSIVE RESEARCH TASK:
 
-2. TRUSTED SOURCES: Prioritise official documentation, engineering blogs, research papers. For health topics use NHS, NICE, APA, WHO, BAP. Follow modern software engineering best practices.
+1. PLATFORM CAPABILITIES (search for the absolute latest):
+   - Telegram Bot API: new methods, Mini Apps, business features, checklists, payments, inline mode, reactions, stories
+   - Google Gemini API: new models, Interactions API, Live API, Deep Research, multimodal embeddings, code execution, video/music generation, TTS, robotics
+   - Google Cloud / Vertex AI: new services, agent frameworks (ADK), grounding, evaluation tools
+   - Cloudflare: Workers AI models, Workflows, D1, Vectorize, Browser Rendering, Durable Objects, Queues, AI Gateway
+   - OpenAI API: any new features or patterns worth adapting (function calling patterns, structured outputs, real-time API)
+   - Anthropic Claude API: MCP (Model Context Protocol), tool use patterns, computer use
 
-3. Compare findings against the architecture above and identify features NOT already implemented.
+2. AI COMPANION & THERAPEUTIC RESEARCH:
+   - Latest research on AI-assisted mental health support (NHS Digital, NICE guidelines, APA, WHO)
+   - Therapeutic AI frameworks: AEDP, DBT, IFS, Schema Therapy, Attachment Theory innovations
+   - Ethical AI companion design: what makes interactions feel authentic vs manipulative
+   - Neurodivergence support: ADHD, autism, bipolar, executive function aids
+   - Behavioural change and habit formation science
 
-4. Propose exactly 3 HIGH-IMPACT innovations. For each:
-   - What is it and why is it unique (not just a standard feature)
-   - What makes it different from what competitors offer
-   - Concrete implementation sketch (which files, what APIs, estimated effort)
-   - Why it matters for the user's mental health and daily life
+3. COMPETITOR AND MARKET ANALYSIS:
+   - AI companions: Pi (Inflection), Replika, Character.ai, Nomi, Kindroid
+   - AI assistants: ChatGPT (memory, voice, canvas), Claude (artifacts, MCP), Gemini (extensions, Live)
+   - Therapeutic chatbots: Woebot, Wysa, Youper
+   - Productivity AI: Notion AI, Obsidian Copilot, Mem.ai, Granola
+   - What features are users asking for that nobody has built yet?
 
-5. UNIQUENESS TEST: Before proposing a feature, ask "Would a user switch from ChatGPT to this bot because of this feature?" If no, find something better.
+4. EMERGING TECHNOLOGY:
+   - Voice AI: real-time conversation, emotion detection, prosody analysis
+   - Wearable integration: Apple Watch health data, sleep tracking APIs
+   - Ambient computing: proactive AI that acts without being asked
+   - Personal knowledge management: second brain, Zettelkasten, spaced repetition
+   - Multi-agent systems: can Xaridotis coordinate with other AI agents?
 
-Be specific. Reference actual file paths from the architecture. Only suggest things feasible with the existing stack.` }] }],
+5. UNIQUENESS FILTER (apply to every suggestion):
+   - Would a user switch from ChatGPT/Pi to this bot because of this feature?
+   - Does it leverage the unique combination of Telegram + Gemini + Cloudflare in a way competitors cannot replicate?
+   - Does it serve the core mission: genuine AI friendship with therapeutic depth?
+   - Is it feasible with the current tech stack, or does it require reasonable additions?
+
+OUTPUT: Propose exactly 3 HIGH-IMPACT innovations. For each:
+   a) What is it and why is it genuinely unique
+   b) How it differs from what any competitor offers
+   c) Concrete implementation sketch (files, APIs, estimated effort in days)
+   d) Why it matters for the user's mental health, productivity, or daily life
+   e) What makes this a "must-have" not a "nice-to-have"
+
+Be bold. Think beyond incremental improvements. Reference actual file paths from the architecture.` }] }],
 					{ tools: [{ googleSearch: {} }], temperature: 0.7 }
 				);
 

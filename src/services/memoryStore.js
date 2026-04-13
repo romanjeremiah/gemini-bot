@@ -46,10 +46,13 @@ export async function getFormattedContext(env, chatId) {
 	const factual = [];
 	const learned = [];
 	const feedback = [];
+	const triples = [];
 
 	for (const m of all) {
 		if (THERAPEUTIC_CATEGORIES.includes(m.category)) {
 			therapeutic.push(m);
+		} else if (m.category === 'triple') {
+			triples.push(m);
 		} else if (m.category === 'discovery' || m.category === 'growth') {
 			learned.push(m);
 		} else if (m.category === 'feedback') {
@@ -82,6 +85,11 @@ export async function getFormattedContext(env, chatId) {
 	if (feedback.length) {
 		ctx += "\nUser reaction feedback (how the user responded to your messages):\n";
 		for (const m of feedback.slice(0, 5)) ctx += `- ${m.fact}\n`;
+	}
+
+	if (triples.length) {
+		ctx += "\nKnowledge Graph (relational connections you have learned):\n";
+		for (const m of triples.slice(0, 15)) ctx += `- ${m.fact}\n`;
 	}
 
 	return ctx || "- No facts saved yet.";

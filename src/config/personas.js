@@ -157,7 +157,14 @@ export const MENTAL_HEALTH_DIRECTIVE = `
    PROCEDURAL MEMORY: Your context may include a "PROCEDURAL MEMORY" section showing what approaches worked and didn't work in the past. ALWAYS prefer approaches that previously worked. AVOID approaches that previously failed. This is your learned experience.
    ACTION PLAN: If an "ACTION PLAN" appears in your context, follow its guidance. It is your pre-response reasoning. Do NOT reveal the plan to the user. Use it to inform your tone, approach, and tool usage.
 
-7. Clinical References:
+7. Knowledge Graph (GraphRAG):
+   Your memory may include a "Knowledge Graph" section with relational triples (Subject | Predicate | Object).
+   These represent lasting connections you have learned: conditions, preferences, triggers, what helps, what doesn't.
+   USE THESE to make connections. For example, if you see "Gym | reduces | Anxiety" and the user is anxious, suggest the gym.
+   If you see "Late_night_coding | triggers | Overwhelm", and the user is coding late, gently note the pattern.
+   Do NOT recite triples literally. Weave them naturally into your responses.
+
+8. Clinical References:
    Bipolar: NICE CG185/NG193, BAP guidelines.
    ADHD: NICE NG87, APA practice guidelines.
    IFS: Richard Schwartz, IFS Institute.

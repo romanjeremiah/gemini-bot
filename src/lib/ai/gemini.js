@@ -187,10 +187,12 @@ function buildConfig(systemInstruction, opts = {}) {
     maxOutputTokens: 8192,
   };
 
-  // Test-Time Compute: adjust thinking depth based on message complexity
-  // 'high' for complex/emotional, 'low' for casual chat
+  // Test-Time Compute: Gemini 3.x thinkingLevel parameter
+  // Controls reasoning depth without includeThoughts (which leaks into responses)
+  // Gemini 3.1 Pro: 'low', 'medium', 'high'
+  // Gemini 3 Flash: 'minimal', 'low', 'medium', 'high'
   if (opts.thinkingLevel) {
-    config.thinkingConfig = { thinkingBudget: opts.thinkingLevel === 'high' ? 2048 : 512 };
+    config.thinkingConfig = { thinkingLevel: opts.thinkingLevel.toUpperCase() };
   }
 
   return config;

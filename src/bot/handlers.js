@@ -43,46 +43,38 @@ function splitMessage(text, maxLen = 3900) {
 const THERAPEUTIC_CATEGORIES = ['pattern', 'trigger', 'avoidance', 'schema', 'growth', 'coping', 'insight', 'homework'];
 
 /**
- * Detect whether a message requires the Pro model (complex reasoning)
- * or can be handled by Flash (casual conversation, simple questions).
+ * Detect task complexity and return { needsPro, thinkingLevel }.
+ * Maps message content to model selection AND thinking depth.
  *
- * Pro triggers:
- * - Code/architecture discussions (mentions code, file paths, functions, debugging)
- * - Mental health conversations (active check-in, emotional language, therapy terms)
- * - Complex requests (analysis, comparison, deep explanation, research)
- * - Tool-heavy requests (reminders with complex timing, image generation prompts)
- *
- * Flash handles:
- * - Casual chat, greetings, small talk
- * - Simple questions, quick lookups
- * - Short responses, confirmations
+ * Thinking levels (Gemini 3.x):
+ * - Pro:   LOW (casual), MEDIUM (standard), HIGH (deep reasoning)
+ * - Flash: MINIMAL (greetings), LOW (casual), MEDIUM (moderate)
  */
 function detectComplexTask(text, activeCheckin) {
-	if (!text) return false;
-	const lower = text.toLowerCase();
+	if (!text) return { needsPro: false, thinkingLevel: 'low' };
 
-	// Active health check-in always uses Pro
-	if (activeCheckin) return true;
+	// Active health check-in: Pro + HIGH thinking
+	if (activeCheckin) return { needsPro: true, thinkingLevel: 'high' };
 
-	// Code/technical patterns
-	if (/\b(code|function|bug|error|deploy|refactor|implement|architecture|PR|pull request|commit|git|webpack|npm|wrangler|api|endpoint|database|query|sql|schema|migration)\b/i.test(text)) return true;
-	if (/\.(js|ts|py|json|css|html|jsx|mjs)\b/.test(text)) return true;
-	if (/```/.test(text)) return true;
+	// Code/architecture: Pro + HIGH
+	if (/\b(code|function|bug|error|deploy|refactor|implement|architecture|PR|pull request|commit|git|webpack|npm|wrangler|api|endpoint|database|query|sql|schema|migration)\b/i.test(text)) return { needsPro: true, thinkingLevel: 'high' };
+	if (/\.(js|ts|py|json|css|html|jsx|mjs)\b/.test(text)) return { needsPro: true, thinkingLevel: 'high' };
+	if (/```/.test(text)) return { needsPro: true, thinkingLevel: 'high' };
 
-	// Mental health / emotional depth
-	if (/\b(anxious|depressed|panic|overwhelm|trigger|dissociat|suicid|self.?harm|therapy|therapist|schema|attachment|ifs|dbt|aedp|emotion|mood|bipolar|mania|hypo)\b/i.test(text)) return true;
+	// Mental health / emotional depth: Pro + MEDIUM
+	if (/\b(anxious|depressed|panic|overwhelm|trigger|dissociat|suicid|self.?harm|therapy|therapist|schema|attachment|ifs|dbt|aedp|emotion|mood|bipolar|mania|hypo)\b/i.test(text)) return { needsPro: true, thinkingLevel: 'medium' };
 
-	// Complex requests (but NOT simple retrieval like "show me my research")
-	if (/\b(analyse|analyze|compare|explain.*detail|deep dive|break down|pros and cons|trade.?off|strategy|plan)\b/i.test(text)) return true;
+	// Complex analytical requests: Pro + MEDIUM
+	if (/\b(analyse|analyze|compare|explain.*detail|deep dive|break down|pros and cons|trade.?off|strategy|plan)\b/i.test(text)) return { needsPro: true, thinkingLevel: 'medium' };
 
-	// "research" only triggers Pro when asking to DO research, not to VIEW past results
-	if (/\b(research|investigate|look into)\b/i.test(text) && !/\b(show|list|recent|history|results|previous|past|full report)\b/i.test(text)) return true;
+	// Research triggers (doing, not viewing): Pro + MEDIUM
+	if (/\b(research|investigate|look into)\b/i.test(text) && !/\b(show|list|recent|history|results|previous|past|full report)\b/i.test(text)) return { needsPro: true, thinkingLevel: 'medium' };
 
-	// Long messages (>300 chars) likely need deeper reasoning
-	if (text.length > 300) return true;
+	// Long messages: Pro + MEDIUM
+	if (text.length > 300) return { needsPro: true, thinkingLevel: 'medium' };
 
-	// Default: Flash is sufficient
-	return false;
+	// Default: Flash + LOW
+	return { needsPro: false, thinkingLevel: 'low' };
 }
 
 // Silent Observation: Xaridotis quietly reflects on conversations to learn about the user
@@ -109,17 +101,45 @@ Quietly reflect: did you learn anything NEW about this person that is worth reme
 - Something that changed from what you previously knew
 
 If you noticed something worth saving, respond with ONLY a single concise observation starting with "OBSERVATION:" (e.g. "OBSERVATION: User tends to message about coding when avoiding emotional topics").
+
+Additionally, extract any RELATIONAL TRIPLES that define lasting connections between people, activities, emotions, or conditions.
+Format each triple on its own line as: TRIPLE: Subject | Predicate | Object
+Examples:
+TRIPLE: Roman | has_condition | ADHD
+TRIPLE: Gym | reduces | Anxiety
+TRIPLE: Late_night_coding | triggers | Overwhelm
+TRIPLE: Quetiapine | improves | Sleep
+Only include triples you are confident about from the conversation.
+
 If nothing new was learned, respond with exactly: NOTHING_NEW`,
 			'You are a silent observer. Be concise. Only note genuinely new implicit information, not obvious facts already stated.',
 			env
 		);
 
-		if (response && response.startsWith('OBSERVATION:')) {
-			const observation = response.replace('OBSERVATION:', '').trim();
-			if (observation.length > 10) {
+		if (response && response.includes('OBSERVATION:')) {
+			const obsMatch = response.match(/OBSERVATION:\s*(.+)/);
+			if (obsMatch && obsMatch[1].trim().length > 10) {
+				const observation = obsMatch[1].trim();
 				await memoryStore.saveMemory(env, chatId, 'insight', `Implicit: ${observation}`, 1, chatId);
 				await env.CHAT_KV.put(countKey, String(count + 1), { expirationTtl: 86400 });
 				log.info('silent_observation', { chatId, observation: observation.slice(0, 80) });
+			}
+		}
+
+		// GraphRAG: extract relational triples (Subject | Predicate | Object)
+		if (response) {
+			const tripleMatches = response.matchAll(/TRIPLE:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+)/g);
+			for (const match of tripleMatches) {
+				const [, subject, predicate, object] = match;
+				const triple = `${subject.trim()} | ${predicate.trim()} | ${object.trim()}`;
+				// Avoid duplicates: check if this triple already exists
+				const existing = await env.DB.prepare(
+					`SELECT id FROM memories WHERE chat_id = ? AND category = 'triple' AND fact = ? LIMIT 1`
+				).bind(chatId, triple).first();
+				if (!existing) {
+					await memoryStore.saveMemory(env, chatId, 'triple', triple, 1, chatId);
+					log.info('triple_extracted', { chatId, triple });
+				}
 			}
 		}
 
@@ -772,10 +792,12 @@ export async function handleMessage(msg, env) {
 
 		// Smart model selection: Pro for complex tasks, Flash for casual conversation
 		let textModel = modelOverride || FALLBACK_TEXT_MODEL;
+		let taskThinkingLevel = 'low';
 		if (isOwner && !modelOverride) {
-			const needsPro = detectComplexTask(userText, healthCheckin);
-			textModel = needsPro ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
-			if (needsPro) log.info('model_upgrade', { reason: 'complex_task', model: textModel });
+			const complexity = detectComplexTask(userText, healthCheckin);
+			textModel = complexity.needsPro ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
+			taskThinkingLevel = complexity.thinkingLevel;
+			if (complexity.needsPro) log.info('model_upgrade', { reason: 'complex_task', model: textModel, thinking: taskThinkingLevel });
 		}
 
 		const effectivePersona = 'xaridotis';
@@ -871,12 +893,12 @@ export async function handleMessage(msg, env) {
 		const thinkingLevel = isEmotionalMsg ? 'high' : null;
 
 		try {
-			chat = await createChat(hist, fullSysPrompt, env, cacheContext, textModel, { skipCodeExecution: hasMedia, thinkingLevel });
+			chat = await createChat(hist, fullSysPrompt, env, cacheContext, textModel, { skipCodeExecution: hasMedia, thinkingLevel: taskThinkingLevel });
 		} catch (cacheErr) {
 			// If cache is stale (403), retry without cache
 			if (cacheErr.message?.includes('403') || cacheErr.message?.includes('CachedContent')) {
 				log.warn('cache_stale_retry', { msg: cacheErr.message });
-				chat = await createChat(hist, fullSysPrompt, env, null, textModel, { skipCodeExecution: hasMedia, thinkingLevel });
+				chat = await createChat(hist, fullSysPrompt, env, null, textModel, { skipCodeExecution: hasMedia, thinkingLevel: taskThinkingLevel });
 			} else {
 				throw cacheErr;
 			}

@@ -1,4 +1,5 @@
 import * as telegram from '../lib/telegram';
+import { safeLike } from '../lib/db';
 
 /**
  * Research Tool — lets Gemini search, list, and retrieve deep research results conversationally.
@@ -34,11 +35,8 @@ export const searchResearchTool = {
 		const chatId = context.chatId;
 		const threadId = context.threadId || 'default';
 
-		// Sanitise topic: strip ALL non-alphanumeric chars, limit to 4 words for D1 LIKE safety
-		const cleanTopic = (args.topic || '')
-			.replace(/[^a-zA-Z0-9\s]/g, '')
-			.trim()
-			.split(/\s+/).slice(0, 4).join(' ');
+		// Sanitise topic for D1 LIKE query safety
+		const cleanTopic = safeLike(args.topic);
 
 		if (args.action === 'list') {
 			const { results } = await env.DB.prepare(
@@ -95,7 +93,7 @@ export const searchResearchTool = {
 			if (!searchTopic) return { status: "error", message: "Please specify which research topic, or say a number from the list." };
 
 			// Sanitise for LIKE query
-			const safeTopic = searchTopic.replace(/[%_\\'";\n\r]/g, '').split(/\s+/).slice(0, 6).join(' ');
+			const safeTopic = safeLike(searchTopic);
 
 			// Try R2 full report first
 			const { results: refs } = await env.DB.prepare(

@@ -26,13 +26,17 @@ export async function saveTriple(env, chatId, subject, predicate, object, contex
 }
 
 
+import { safeLike } from '../lib/db';
+
 /**
  * Query triples by subject — "What do we know about X?"
  */
 export async function queryBySubject(env, chatId, subject, limit = 10) {
+	const safe = safeLike(subject);
+	if (!safe) return [];
 	const { results } = await env.DB.prepare(
 		`SELECT * FROM knowledge_graph WHERE chat_id = ? AND subject LIKE ? ORDER BY created_at DESC LIMIT ?`
-	).bind(chatId, `%${subject}%`, limit).all();
+	).bind(chatId, `%${safe}%`, limit).all();
 	return results || [];
 }
 
@@ -40,9 +44,11 @@ export async function queryBySubject(env, chatId, subject, limit = 10) {
  * Query triples by object — "What relates to X?"
  */
 export async function queryByObject(env, chatId, object, limit = 10) {
+	const safe = safeLike(object);
+	if (!safe) return [];
 	const { results } = await env.DB.prepare(
 		`SELECT * FROM knowledge_graph WHERE chat_id = ? AND object LIKE ? ORDER BY created_at DESC LIMIT ?`
-	).bind(chatId, `%${object}%`, limit).all();
+	).bind(chatId, `%${safe}%`, limit).all();
 	return results || [];
 }
 
@@ -51,7 +57,8 @@ export async function queryByObject(env, chatId, object, limit = 10) {
  * This is the main retrieval function for GraphRAG.
  */
 export async function queryRelated(env, chatId, concept, limit = 15) {
-	const safe = concept.replace(/[%_\\'";\n\r]/g, '').slice(0, 50);
+	const safe = safeLike(concept);
+	if (!safe) return [];
 	const { results } = await env.DB.prepare(
 		`SELECT * FROM knowledge_graph WHERE chat_id = ? AND (subject LIKE ? OR object LIKE ?)
 		ORDER BY confidence DESC, created_at DESC LIMIT ?`

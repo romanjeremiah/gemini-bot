@@ -65,7 +65,9 @@ export async function getRecentEpisodes(env, chatId, limit = 10, type = null) {
  * Search episodes by keyword in trigger, intervention, or lesson.
  */
 export async function searchEpisodes(env, chatId, keyword, limit = 5) {
-	const safe = keyword.replace(/[%_\\'";\n\r]/g, '').slice(0, 50);
+	const { safeLike } = await import('../lib/db');
+	const safe = safeLike(keyword);
+	if (!safe) return [];
 	const { results } = await env.DB.prepare(`
 		SELECT * FROM episodes WHERE chat_id = ?
 		AND (trigger_context LIKE ? OR intervention LIKE ? OR lesson LIKE ? OR emotions LIKE ?)

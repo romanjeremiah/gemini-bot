@@ -1180,13 +1180,15 @@ export async function handleCallback(callbackQuery, env) {
 			return;
 		}
 		const topic = indexMap[num];
+		// Sanitise topic for D1 LIKE query safety
+		const safeTopic = topic.replace(/[^a-zA-Z0-9\s]/g, '').trim().split(/\s+/).slice(0, 4).join(' ');
 		await telegram.answerCallbackQuery(callbackQuery.id, env, { text: isAudio ? '🔊 Generating audio...' : '📝 Loading...' }).catch(() => {});
 		await telegram.sendChatAction(chatId, threadId, isAudio ? 'record_voice' : 'typing', env);
 
 		// Retrieve the report directly (no need to go through Gemini)
 		const { searchResearchTool } = await import('../tools/research');
 		const result = await searchResearchTool.execute(
-			{ action: 'full', topic, index: num },
+			{ action: 'full', topic: safeTopic, index: num },
 			env,
 			{ chatId, threadId }
 		);

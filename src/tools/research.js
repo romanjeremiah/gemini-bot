@@ -34,11 +34,11 @@ export const searchResearchTool = {
 		const chatId = context.chatId;
 		const threadId = context.threadId || 'default';
 
-		// Sanitise topic input for D1 LIKE queries
+		// Sanitise topic: strip ALL non-alphanumeric chars, limit to 4 words for D1 LIKE safety
 		const cleanTopic = (args.topic || '')
-			.replace(/[%_\\'";\n\r]/g, '')
+			.replace(/[^a-zA-Z0-9\s]/g, '')
 			.trim()
-			.split(/\s+/).slice(0, 6).join(' ');
+			.split(/\s+/).slice(0, 4).join(' ');
 
 		if (args.action === 'list') {
 			const { results } = await env.DB.prepare(

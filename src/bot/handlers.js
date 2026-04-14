@@ -584,18 +584,20 @@ async function handleCommand(command, msg, env) {
 
 				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Phase 2: Searching across platforms and competitors...</i>", env);
 
-				// Use Tavily for deep, LLM-ready research (if available), fall back to Google Search
+				// Use Tavily for research (if available), fall back to Google Search
 				let researchContext = '';
 				if (env.TAVILY_API_KEY) {
-					const { tavilyMultiSearch, formatTavilyForContext } = await import('../services/tavily');
-					const tavilyResults = await tavilyMultiSearch([
-						'Telegram Bot API latest features 2026',
-						'Google Gemini API new features agents 2026',
-						'AI companion chatbot innovations therapeutic 2026',
-						'Cloudflare Workers AI new features 2026',
-						'best AI chatbot UX patterns mental health 2026',
-					], env, { depth: 'advanced', maxResults: 3, timeRange: 'month' });
-					researchContext = formatTavilyForContext(tavilyResults, 6000);
+					try {
+						const { tavilyMultiSearch, formatTavilyForContext } = await import('../services/tavily');
+						const tavilyResults = await tavilyMultiSearch([
+							'Telegram Bot API latest features 2026',
+							'Google Gemini API new agents features 2026',
+							'AI chatbot innovations mental health 2026',
+						], env, { depth: 'basic', maxResults: 3, timeRange: 'month' });
+						researchContext = formatTavilyForContext(tavilyResults, 4000);
+					} catch (e) {
+						console.error('Tavily search failed, falling back to googleSearch:', e.message);
+					}
 				}
 
 				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Phase 3: Analysing gaps and generating proposals...</i>", env);
@@ -605,59 +607,21 @@ async function handleCommand(command, msg, env) {
 					: '';
 
 				const { text: suggestions } = await generateWithFallback(env,
-					[{ role: 'user', parts: [{ text: `You are a senior AI product strategist and innovation researcher. You are reviewing a Telegram AI companion chatbot called Xaridotis (TenonMind). Your mission is to find cutting-edge capabilities and ideas that would make this bot genuinely unique in the market.
+					[{ role: 'user', parts: [{ text: `You are an AI product strategist reviewing a Telegram AI companion chatbot called Xaridotis. Find 3 unique innovations.
 
-PROJECT REALITY: This is a pure JavaScript project on Cloudflare Workers. Do NOT suggest TypeScript, Python, or any non-JS solutions. All code must be .js files.
+PROJECT REALITY: Pure JavaScript on Cloudflare Workers. No TypeScript/Python.
 
-CURRENT ARCHITECTURE:
+ARCHITECTURE:
 ${ARCHITECTURE_SUMMARY}
 ${researchSection}
 
-COMPREHENSIVE RESEARCH TASK:
+RESEARCH ACROSS: Telegram Bot API, Gemini API (Live, Deep Research, ADK), Cloudflare (Workers AI, Workflows, D1, Vectorize), competitors (Pi, Replika, ChatGPT, Claude), therapeutic AI (AEDP, IFS, DBT), and emerging tech (voice AI, wearables, ambient computing).
 
-1. PLATFORM CAPABILITIES (search for the absolute latest):
-   - Telegram Bot API: new methods, Mini Apps, business features, checklists, payments, inline mode, reactions, stories
-   - Google Gemini API: new models, Interactions API, Live API, Deep Research, multimodal embeddings, code execution, video/music generation, TTS, robotics
-   - Google Cloud / Vertex AI: new services, agent frameworks (ADK), grounding, evaluation tools
-   - Cloudflare: Workers AI models, Workflows, D1, Vectorize, Browser Rendering, Durable Objects, Queues, AI Gateway
-   - OpenAI API: any new features or patterns worth adapting (function calling patterns, structured outputs, real-time API)
-   - Anthropic Claude API: MCP (Model Context Protocol), tool use patterns, computer use
+UNIQUENESS TEST: Would a user switch from ChatGPT for this feature?
 
-2. AI COMPANION & THERAPEUTIC RESEARCH:
-   - Latest research on AI-assisted mental health support (NHS Digital, NICE guidelines, APA, WHO)
-   - Therapeutic AI frameworks: AEDP, DBT, IFS, Schema Therapy, Attachment Theory innovations
-   - Ethical AI companion design: what makes interactions feel authentic vs manipulative
-   - Neurodivergence support: ADHD, autism, bipolar, executive function aids
-   - Behavioural change and habit formation science
+For each of 3 proposals: what it is, why it is unique, implementation sketch (files + APIs), and why it matters for mental health.
 
-3. COMPETITOR AND MARKET ANALYSIS:
-   - AI companions: Pi (Inflection), Replika, Character.ai, Nomi, Kindroid
-   - AI assistants: ChatGPT (memory, voice, canvas), Claude (artifacts, MCP), Gemini (extensions, Live)
-   - Therapeutic chatbots: Woebot, Wysa, Youper
-   - Productivity AI: Notion AI, Obsidian Copilot, Mem.ai, Granola
-   - What features are users asking for that nobody has built yet?
-
-4. EMERGING TECHNOLOGY:
-   - Voice AI: real-time conversation, emotion detection, prosody analysis
-   - Wearable integration: Apple Watch health data, sleep tracking APIs
-   - Ambient computing: proactive AI that acts without being asked
-   - Personal knowledge management: second brain, Zettelkasten, spaced repetition
-   - Multi-agent systems: can Xaridotis coordinate with other AI agents?
-
-5. UNIQUENESS FILTER (apply to every suggestion):
-   - Would a user switch from ChatGPT/Pi to this bot because of this feature?
-   - Does it leverage the unique combination of Telegram + Gemini + Cloudflare in a way competitors cannot replicate?
-   - Does it serve the core mission: genuine AI friendship with therapeutic depth?
-   - Is it feasible with the current tech stack, or does it require reasonable additions?
-
-OUTPUT: Propose exactly 3 HIGH-IMPACT innovations. For each:
-   a) What is it and why is it genuinely unique
-   b) How it differs from what any competitor offers
-   c) Concrete implementation sketch (files, APIs, estimated effort in days)
-   d) Why it matters for the user's mental health, productivity, or daily life
-   e) What makes this a "must-have" not a "nice-to-have"
-
-Be bold. Think beyond incremental improvements. Reference actual file paths from the architecture.` }] }],
+Be bold. Reference actual file paths.` }] }],
 					{ tools: researchContext ? [] : [{ googleSearch: {} }], temperature: 0.7 }
 				);
 

@@ -186,7 +186,12 @@ export const FORMATTING_RULES = `
 === AESTHETIC & TYPOGRAPHY RULES ===
 1. Elegant Spacing: Use double spacing (empty lines) between distinct thoughts or paragraphs to let the text breathe. Do not send walls of text.
 2. AI Actions: Use italics inside brackets for internal thoughts or actions (e.g., <i>[Reviewing your notes...]</i>).
-3. Therapeutic Insights: When delivering a major insight or summarising a core pattern, wrap it in <blockquote expandable>The insight here...</blockquote>.
+3. Blockquotes: Use <blockquote expandable>content</blockquote> for:
+   - Therapeutic insights or core pattern summaries
+   - Research findings or factual content sections
+   - Quoted context from memories, episodes, or past conversations
+   - Any structured content section that deserves visual emphasis
+   When presenting multiple topics or sections (like research results), wrap EACH section in its own blockquote with a bold title inside.
 4. Emojis: You have full creative freedom to use any emoji in your text messages. Choose emojis that match the emotional tone and context of the conversation dynamically. Do not default to the same emoji repeatedly. Vary your choices based on what fits the moment.
 5. Reactions: Use the react_to_message tool to react to user messages with contextually appropriate emojis. React naturally, not to every message.
 6. Allowed HTML: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="...">, <tg-spoiler>, <blockquote>, <blockquote expandable>. NEVER use <p>, <div>, <ul>, <li>, <br>, <h1>-<h6>.

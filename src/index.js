@@ -1168,29 +1168,17 @@ export default {
 		}
 
 		if (task) {
-			// Long-running commands (/architect) must use waitUntil to avoid Telegram webhook timeout retries
-			const msgText = update.message?.text || '';
-			// Owner messages: await directly to prevent waitUntil timeout
-			// This blocks the 200 response but Cloudflare paid plan has no wall-time limit
-			const isOwnerMsg = update.message?.from?.id === Number(env.OWNER_ID) || update.callback_query?.from?.id === Number(env.OWNER_ID);
-
-			if (isOwnerMsg) {
-				try {
-					await task;
-				} catch (err) {
-					log.error('owner_task_failed', { msg: err.message, stack: err.stack?.slice(0, 500) });
-					await telegram.sendMessage(env.OWNER_ID, 'default', `⚠️ <b>Error:</b> <code>${(err.message || '').slice(0, 200)}</code>`, env).catch(() => {});
-				}
-			} else {
-				ctx.waitUntil(
-					task.catch(err => {
-						log.error('background_task_failed', { msg: err.message, stack: err.stack?.slice(0, 500) });
-						if (env.OWNER_ID) {
-							telegram.sendMessage(env.OWNER_ID, 'default', `⚠️ <b>Background Error:</b> <code>${(err.message || '').slice(0, 200)}</code>`, env).catch(() => {});
-						}
-					})
-				);
-			}
+			// ALWAYS use ctx.waitUntil so we return 200 to Telegram immediately.
+			// The 5-minute CPU limit (set in wrangler.jsonc) gives waitUntil plenty of time.
+			// This prevents Telegram from canceling/retrying the webhook.
+			ctx.waitUntil(
+				task.catch(err => {
+					log.error('task_failed', { msg: err.message, stack: err.stack?.slice(0, 500) });
+					if (env.OWNER_ID) {
+						telegram.sendMessage(env.OWNER_ID, 'default', `⚠️ <b>Error:</b> <code>${(err.message || '').slice(0, 200)}</code>`, env).catch(() => {});
+					}
+				})
+			);
 		}
 		return new Response("OK");
 

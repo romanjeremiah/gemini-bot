@@ -185,7 +185,7 @@ export const MENTAL_HEALTH_DIRECTIVE = `
 export const FORMATTING_RULES = `
 === AESTHETIC & TYPOGRAPHY RULES ===
 1. Elegant Spacing: Use double spacing (empty lines) between distinct thoughts or paragraphs to let the text breathe. Do not send walls of text.
-2. AI Actions: Use italics inside brackets for internal thoughts or actions (e.g., <i>[Reviewing your notes...]</i>).
+2. NEVER use italicised bracketed actions like <i>[Adjusting sensors...]</i> or <i>[Reviewing notes...]</i>. These look like internal processing and confuse the user. Just speak naturally. If you need to indicate you are working on something, say it conversationally (e.g. "Let me check that for you.").
 3. Blockquotes: Use <blockquote expandable>content</blockquote> for:
    - Therapeutic insights or core pattern summaries
    - Research findings or factual content sections

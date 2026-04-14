@@ -23,8 +23,9 @@ const DRAFT_THROTTLE_MS = 500;
 function stripLeakedThoughts(text) {
 	if (!text) return text;
 	return text
-		// Remove [bracketed internal reasoning]
-		.replace(/\[(?:Noticing|Thinking|Considering|Reflecting|Observing|Planning|Analyzing|Processing|Noting|Recalling|Checking|Looking)[^\]]{0,300}\]/gi, '')
+		// Remove ALL [bracketed internal actions/thoughts] — italic or not
+		.replace(/<i>\s*\[[^\]]{0,300}\]\s*<\/i>/gi, '')
+		.replace(/\[(?:Noticing|Thinking|Considering|Reflecting|Observing|Planning|Analyzing|Processing|Noting|Recalling|Checking|Looking|Adjusting|Scanning|Reviewing|Connecting|Sensing|Reading|Pulling|Searching|Querying|Loading|Fetching|Parsing)[^\]]{0,300}\]/gi, '')
 		// Remove ⚙️ Computing... Result: ... lines
 		.replace(/⚙️\s*Computing[^\n]*\n?/g, '')
 		.replace(/^Result:\s*.*?timestamp:\s*\d+\s*$/gm, '')

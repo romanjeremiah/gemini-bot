@@ -581,35 +581,40 @@ async function handleCommand(command, msg, env) {
 
 			try {
 				const { ARCHITECTURE_SUMMARY } = await import('../config/architecture.js');
+				const update = (text) => statusMsgId ? telegram.editMessage(chatId, statusMsgId, `⚙️ <b>Architecture Review</b>\n\n${text}`, env) : null;
 
-				// Wrap entire architect flow in a 45-second timeout
 				const architectPromise = (async () => {
-					if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Searching platforms and competitors...</i>", env);
-
-				// Use Tavily for research (if available), fall back to Google Search
-				let researchContext = '';
-				if (env.TAVILY_API_KEY) {
-					try {
-						const { tavilyMultiSearch, formatTavilyForContext } = await import('../services/tavily');
-						const tavilyResults = await tavilyMultiSearch([
-							'Telegram Bot API latest features 2026',
-							'Google Gemini API new agents features 2026',
-							'AI chatbot innovations mental health 2026',
-						], env, { depth: 'basic', maxResults: 3, timeRange: 'month' });
-						researchContext = formatTavilyForContext(tavilyResults, 4000);
-					} catch (e) {
-						console.error('Tavily search failed, falling back to googleSearch:', e.message);
+					// Step 1: Research
+					let researchContext = '';
+					if (env.TAVILY_API_KEY) {
+						await update('<i>Step 1/4: Searching Telegram, Gemini, and AI companion platforms via Tavily...</i>');
+						try {
+							const { tavilyMultiSearch, formatTavilyForContext } = await import('../services/tavily');
+							const tavilyResults = await tavilyMultiSearch([
+								'Telegram Bot API latest features 2026',
+								'Google Gemini API new agents features 2026',
+								'AI chatbot innovations mental health 2026',
+							], env, { depth: 'basic', maxResults: 3, timeRange: 'month' });
+							researchContext = formatTavilyForContext(tavilyResults, 4000);
+							const sourceCount = tavilyResults.results?.length || 0;
+							await update(`<i>Step 1/4: ✅ Found ${sourceCount} sources across 3 searches.</i>`);
+						} catch (e) {
+							console.error('Tavily failed:', e.message);
+							await update('<i>Step 1/4: ⚠️ Tavily unavailable, will use Google Search instead.</i>');
+						}
+					} else {
+						await update('<i>Step 1/4: No Tavily key. Will use Gemini Google Search.</i>');
 					}
-				}
 
-				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Phase 3: Analysing gaps and generating proposals...</i>", env);
+					// Step 2: Generate proposals
+					await update(`<i>Step 2/4: Generating innovation proposals with Gemini Pro...\n(This is the longest step, ~15-25 seconds)</i>`);
 
-				const researchSection = researchContext
-					? `\n\nRESEARCH FINDINGS (from live web search):\n${researchContext}`
-					: '';
+					const researchSection = researchContext
+						? `\n\nRESEARCH FINDINGS (from live web search):\n${researchContext}`
+						: '';
 
-				const { text: suggestions } = await generateWithFallback(env,
-					[{ role: 'user', parts: [{ text: `You are an AI product strategist reviewing a Telegram AI companion chatbot called Xaridotis. Find 3 unique innovations.
+					const { text: suggestions } = await generateWithFallback(env,
+						[{ role: 'user', parts: [{ text: `You are an AI product strategist reviewing a Telegram AI companion chatbot called Xaridotis. Find 3 unique innovations.
 
 PROJECT REALITY: Pure JavaScript on Cloudflare Workers. No TypeScript/Python.
 
@@ -624,36 +629,34 @@ UNIQUENESS TEST: Would a user switch from ChatGPT for this feature?
 For each of 3 proposals: what it is, why it is unique, implementation sketch (files + APIs), and why it matters for mental health.
 
 Be bold. Reference actual file paths.` }] }],
-					{ tools: researchContext ? [] : [{ googleSearch: {} }], temperature: 0.7 }
-				);
+						{ tools: researchContext ? [] : [{ googleSearch: {} }], temperature: 0.7 }
+					);
 
-				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Phase 3: Analysing gaps and drafting suggestions...</i>", env);
+					// Step 3: Validate
+					await update('<i>Step 3/4: ✅ Proposals generated. Validating and formatting...</i>');
 
-				if (!suggestions || suggestions.length < 100) {
-					if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Could not generate suggestions. Try again later.</i>", env);
-					return true;
-				}
+					if (!suggestions || suggestions.length < 100) {
+						await update('<i>❌ Could not generate meaningful suggestions. The model may be overloaded. Try again later.</i>');
+						return;
+					}
 
-				const today = new Date().toISOString().split('T')[0];
-				await memoryStore.saveMemory(env, chatId, 'discovery', `Architect review (${today}): ${suggestions.slice(0, 500)}`, 1, chatId);
+					// Step 4: Save and send
+					await update('<i>Step 4/4: Saving to memory and preparing final output...</i>');
 
-				// Send directly without a second formatting LLM call (saves time + avoids timeout)
-				const finalText = stripLeakedThoughts(suggestions).slice(0, 3900);
-				if (statusMsgId) {
-					await telegram.editMessage(chatId, statusMsgId, `<b>Architecture Review</b>\n\n${finalText}`, env, null, {
-						inline_keyboard: [[
-							{ text: '✅ Approve', callback_data: 'approve_pr', style: 'success' },
-							{ text: '❌ Dismiss', callback_data: 'action_dismiss_pr', style: 'danger' }
-						]]
-					});
-				} else {
-					await telegram.sendMessage(chatId, threadId, `<b>Architecture Review</b>\n\n${finalText}`, env, null, {
-						inline_keyboard: [[
-							{ text: '✅ Approve', callback_data: 'approve_pr', style: 'success' },
-							{ text: '❌ Dismiss', callback_data: 'action_dismiss_pr', style: 'danger' }
-						]]
-					});
-				}
+					const today = new Date().toISOString().split('T')[0];
+					await memoryStore.saveMemory(env, chatId, 'discovery', `Architect review (${today}): ${suggestions.slice(0, 500)}`, 1, chatId);
+
+					const finalText = stripLeakedThoughts(suggestions).slice(0, 3900);
+					const btns = { inline_keyboard: [[
+						{ text: '✅ Approve', callback_data: 'approve_pr', style: 'success' },
+						{ text: '❌ Dismiss', callback_data: 'action_dismiss_pr', style: 'danger' }
+					]] };
+
+					if (statusMsgId) {
+						await telegram.editMessage(chatId, statusMsgId, `<b>Architecture Review</b>\n\n${finalText}`, env, null, btns);
+					} else {
+						await telegram.sendMessage(chatId, threadId, `<b>Architecture Review</b>\n\n${finalText}`, env, null, btns);
+					}
 				})(); // end architectPromise
 
 				// Race against 45-second timeout

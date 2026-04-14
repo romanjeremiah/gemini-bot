@@ -1237,6 +1237,9 @@ export default {
 						) || 'Just checking — did you manage to take your meds?';
 						await telegram.sendMessage(chatId, threadId, nudge, env);
 					}
+
+				} else if (task.type === 'spontaneous_outreach') {
+					await handleSpontaneousOutreach(env);
 				}
 
 				msg.ack();
@@ -1256,14 +1259,28 @@ export default {
 				await enqueueHealthTasks(env);
 			} catch (e) { log.error('cron_enqueue', { msg: e.message }); }
 
-			// Run remaining tasks concurrently
+			// Lightweight tasks that don't call LLMs run inline
 			const cronResults = await Promise.allSettled([
 				handleMemoryConsolidation(env),
-				handleSpontaneousOutreach(env),
 			]);
 			cronResults.forEach((r, i) => {
 				if (r.status === 'rejected') log.error('cron_task_failed', { task: i, msg: r.reason?.message });
 			});
+
+			// Spontaneous outreach: cheap checks inline, only enqueue if the random roll passes
+			try {
+				const now = new Date();
+				const chatId = Number(env.OWNER_ID);
+				const londonTime = new Date(now.toLocaleString('en-US', { timeZone: await env.CHAT_KV.get(`timezone_${chatId}`) || 'Europe/London' }));
+				const hour = londonTime.getHours();
+				const today = londonTime.toISOString().split('T')[0];
+				if (hour >= 10 && hour <= 19 && Math.random() <= 0.05) {
+					const outreachKey = `spontaneous_${today}`;
+					if (!await env.CHAT_KV.get(outreachKey)) {
+						await env.TASK_QUEUE.send({ type: 'spontaneous_outreach', chatId });
+					}
+				}
+			} catch (e) { log.error('cron_outreach_check', { msg: e.message }); }
 		} else if (env.OWNER_ID) {
 			// Fallback: run all tasks concurrently without queue
 			const cronResults = await Promise.allSettled([

@@ -18,6 +18,24 @@ const HISTORY_LENGTH = 24;
 const HISTORY_TTL = 604800;
 const DRAFT_THROTTLE_MS = 500;
 
+/** Strip leaked thinking/internal reasoning from model output */
+function stripLeakedThoughts(text) {
+	if (!text) return text;
+	return text
+		// Remove [bracketed internal reasoning]
+		.replace(/\[(?:Noticing|Thinking|Considering|Reflecting|Observing|Planning|Analyzing|Processing|Noting|Recalling|Checking|Looking)[^\]]{0,300}\]/gi, '')
+		// Remove ⚙️ Computing... Result: ... lines
+		.replace(/⚙️\s*Computing[^\n]*\n?/g, '')
+		.replace(/^Result:\s*.*?timestamp:\s*\d+\s*$/gm, '')
+		// Remove ACTION PLAN leaks
+		.replace(/ACTION PLAN[^\n]*(?:\n[-•*][^\n]*)*/g, '')
+		// Remove PROCEDURAL MEMORY leaks
+		.replace(/PROCEDURAL MEMORY[^\n]*(?:\n[-•*][^\n]*)*/g, '')
+		// Clean up resulting double newlines
+		.replace(/\n{3,}/g, '\n\n')
+		.trim();
+}
+
 /** Split long text into chunks at paragraph boundaries, respecting a max length */
 function splitMessage(text, maxLen = 3900) {
 	const chunks = [];
@@ -822,28 +840,28 @@ export async function handleMessage(msg, env) {
 		}
 		const daysKnown = Math.floor((Date.now() - parseInt(firstSeen)) / 86400000);
 
-		// CoALA reflection step: retrieve relevant episodes for emotional messages
+		// CoALA: batch all episode/procedural queries in parallel to reduce D1 load
 		let episodeCtx = '';
-		const isEmotionalMsg = /\b(anxious|depressed|panic|overwhelm|scared|lonely|empty|hopeless|angry|frustrated|sad|grief|trigger|manic|racing|numb|crying|breakdown|struggling|worried|stressed)\b/i.test(userText);
-		if (isEmotionalMsg) {
-			const episodes = await episodeStore.getRecentEpisodes(env, chatId, 5).catch(() => []);
-			episodeCtx = episodeStore.formatEpisodesForContext(episodes);
-		}
-
-		// CoALA Phase 2: Planning step for emotional/complex messages
-		// Generates an explicit plan before responding (what approach to take, what to avoid)
 		let planCtx = '';
-		if (isEmotionalMsg && isOwner) {
-			const { generatePlan } = await import('../services/planner');
-			const plan = await generatePlan(env, chatId, userText, null).catch(() => null);
-			if (plan) planCtx = `\nACTION PLAN (your internal reasoning, do NOT share this with the user):\n${plan}`;
-		}
-
-		// CoALA Phase 3: Procedural memory (what approaches worked/didn't)
 		let proceduralCtx = '';
+		const isEmotionalMsg = /\b(anxious|depressed|panic|overwhelm|scared|lonely|empty|hopeless|angry|frustrated|sad|grief|trigger|manic|racing|numb|crying|breakdown|struggling|worried|stressed)\b/i.test(userText);
+
 		if (isEmotionalMsg) {
-			const insights = await episodeStore.getProceduralInsights(env, chatId).catch(() => ({ worked: [], didntWork: [] }));
+			// Run all CoALA D1 queries in parallel (single round-trip instead of 5 sequential)
+			const [episodes, insights] = await Promise.all([
+				episodeStore.getRecentEpisodes(env, chatId, 5).catch(() => []),
+				episodeStore.getProceduralInsights(env, chatId).catch(() => ({ worked: [], didntWork: [] })),
+			]);
+
+			episodeCtx = episodeStore.formatEpisodesForContext(episodes);
 			proceduralCtx = episodeStore.formatProceduralContext(insights);
+
+			// Planning step uses the already-fetched data (no extra D1 calls)
+			if (isOwner && (episodes.length || insights.worked.length || insights.didntWork.length)) {
+				const { generatePlan } = await import('../services/planner');
+				const plan = await generatePlan(env, chatId, userText, null).catch(() => null);
+				if (plan) planCtx = `\nACTION PLAN (your internal reasoning, do NOT share this with the user):\n${plan}`;
+			}
 		}
 
 		// GraphRAG: query knowledge graph for relational context
@@ -1027,6 +1045,9 @@ export async function handleMessage(msg, env) {
 			} else {
 				isComplete = true;
 				if (fullText.trim()) {
+					// Strip any leaked internal reasoning before sending to user
+					fullText = stripLeakedThoughts(fullText);
+
 					const btns = { inline_keyboard: [[{ text: "🔊 Voice", callback_data: "action_voice" }, { text: "🗑️ Delete", callback_data: "action_delete_msg" }]] };
 
 					// Split long messages to respect Telegram's 4096 char limit

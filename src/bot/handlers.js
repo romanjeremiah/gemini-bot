@@ -568,13 +568,22 @@ async function handleCommand(command, msg, env) {
 				return true;
 			}
 
-			// Deduplication: prevent concurrent /architect runs
+			// Concurrency guard: only one /architect at a time, with kill switch
 			const architectLock = await env.CHAT_KV.get(`architect_lock_${chatId}`);
 			if (architectLock) {
-				await telegram.sendMessage(chatId, threadId, "Architecture review is already running. Please wait.", env);
+				const lockAge = Date.now() - parseInt(architectLock);
+				const ageSeconds = Math.round(lockAge / 1000);
+				await telegram.sendMessage(chatId, threadId,
+					`⚙️ <b>Architecture review is already running</b> (${ageSeconds}s ago).\n\nTap below to cancel the stuck run and start fresh.`,
+					env, null, {
+						inline_keyboard: [[
+							{ text: '🔄 Kill & Restart', callback_data: 'architect_kill', style: 'danger' },
+							{ text: '⏳ Wait', callback_data: 'noop' }
+						]]
+					});
 				return true;
 			}
-			await env.CHAT_KV.put(`architect_lock_${chatId}`, '1', { expirationTtl: 300 }); // 5 min lock
+			await env.CHAT_KV.put(`architect_lock_${chatId}`, String(Date.now()), { expirationTtl: 120 }); // 2 min lock (was 5)
 
 			const statusRes = await telegram.sendMessage(chatId, threadId, "⚙️ <b>Architecture Review</b>\n<i>Starting research...</i>", env);
 			const statusMsgId = statusRes?.result?.message_id;
@@ -1141,6 +1150,11 @@ export async function handleCallback(callbackQuery, env) {
 		await telegram.editMessageReplyMarkup(chatId, msgId, null, env);
 	} else if (data === "action_delete_msg") {
 		await telegram.deleteMessage(chatId, msgId, env);
+	} else if (data === 'architect_kill') {
+		// Kill stuck architect run and clear the lock
+		await env.CHAT_KV.delete(`architect_lock_${chatId}`);
+		await telegram.editMessage(chatId, msgId, '⚙️ <b>Architecture review cancelled.</b> Run /architect to start fresh.', env);
+		await telegram.answerCallbackQuery(callbackQuery.id, env, { text: 'Cancelled. Run /architect again.' }).catch(() => {});
 	} else if (data === "action_dismiss_pr") {
 		await telegram.editMessage(chatId, msgId, "<i>Architecture suggestion dismissed.</i>", env);
 	} else if (data === "approve_pr") {

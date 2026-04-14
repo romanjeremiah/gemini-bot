@@ -582,7 +582,9 @@ async function handleCommand(command, msg, env) {
 			try {
 				const { ARCHITECTURE_SUMMARY } = await import('../config/architecture.js');
 
-				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Phase 2: Searching across platforms and competitors...</i>", env);
+				// Wrap entire architect flow in a 45-second timeout
+				const architectPromise = (async () => {
+					if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Searching platforms and competitors...</i>", env);
 
 				// Use Tavily for research (if available), fall back to Google Search
 				let researchContext = '';
@@ -635,20 +637,29 @@ Be bold. Reference actual file paths.` }] }],
 				const today = new Date().toISOString().split('T')[0];
 				await memoryStore.saveMemory(env, chatId, 'discovery', `Architect review (${today}): ${suggestions.slice(0, 500)}`, 1, chatId);
 
-				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, "⚙️ <b>Architecture Review</b>\n<i>Phase 4: Formatting final response...</i>", env);
-
-				const pKey = getPersona(await env.CHAT_KV.get(`persona_${chatId}_${threadId}`));
-				const persona = personas[pKey];
-				const formatted = await generateShortResponse(
-					`Rewrite these technical suggestions as a casual message sharing ideas about how to improve the bot. Keep your personality. Present each as something you noticed while doing research. 3-4 paragraphs.\n\nRaw:\n${suggestions}`,
-					persona.instruction, env
-				);
-
+				// Send directly without a second formatting LLM call (saves time + avoids timeout)
+				const finalText = stripLeakedThoughts(suggestions).slice(0, 3900);
 				if (statusMsgId) {
-					await telegram.editMessage(chatId, statusMsgId, `<b>Architecture Review</b>\n\n${formatted || suggestions.slice(0, 2000)}`, env);
+					await telegram.editMessage(chatId, statusMsgId, `<b>Architecture Review</b>\n\n${finalText}`, env, null, {
+						inline_keyboard: [[
+							{ text: '✅ Approve', callback_data: 'approve_pr', style: 'success' },
+							{ text: '❌ Dismiss', callback_data: 'action_dismiss_pr', style: 'danger' }
+						]]
+					});
 				} else {
-					await telegram.sendMessage(chatId, threadId, `<b>Architecture Review</b>\n\n${formatted || suggestions.slice(0, 2000)}`, env);
+					await telegram.sendMessage(chatId, threadId, `<b>Architecture Review</b>\n\n${finalText}`, env, null, {
+						inline_keyboard: [[
+							{ text: '✅ Approve', callback_data: 'approve_pr', style: 'success' },
+							{ text: '❌ Dismiss', callback_data: 'action_dismiss_pr', style: 'danger' }
+						]]
+					});
 				}
+				})(); // end architectPromise
+
+				// Race against 45-second timeout
+				const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Architecture review timed out after 45 seconds')), 45000));
+				await Promise.race([architectPromise, timeout]);
+
 			} catch (e) {
 				console.error('Architect error:', e.message);
 				if (statusMsgId) await telegram.editMessage(chatId, statusMsgId, `⚙️ <b>Architecture Review Failed</b>\n<i>${e.message?.slice(0, 100)}</i>`, env);

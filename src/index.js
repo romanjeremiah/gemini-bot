@@ -1170,10 +1170,11 @@ export default {
 		if (task) {
 			// Long-running commands (/architect) must use waitUntil to avoid Telegram webhook timeout retries
 			const msgText = update.message?.text || '';
-			const isLongRunning = /^\/(architect|research)\b/.test(msgText);
+			// Owner messages: await directly to prevent waitUntil timeout
+			// This blocks the 200 response but Cloudflare paid plan has no wall-time limit
 			const isOwnerMsg = update.message?.from?.id === Number(env.OWNER_ID) || update.callback_query?.from?.id === Number(env.OWNER_ID);
 
-			if (isOwnerMsg && !isLongRunning) {
+			if (isOwnerMsg) {
 				try {
 					await task;
 				} catch (err) {

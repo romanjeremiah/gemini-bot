@@ -71,21 +71,35 @@ async function embed(env, input) {
 async function rerank(env, query, results) {
 	if (!env.AI || !results.length || !query?.trim()) return results;
 	try {
-		const contexts = results.map(r => r.metadata?.fact || r.metadata?.preview || '').filter(Boolean);
-		if (!contexts.length) return results;
+		// Build contexts + track which original results they map to
+		const validPairs = [];
+		for (let i = 0; i < results.length; i++) {
+			const text = (results[i].metadata?.fact || results[i].metadata?.preview || '').trim();
+			if (text.length >= 3) validPairs.push({ idx: i, text });
+		}
+		if (!validPairs.length) return results;
 
-		const reranked = await env.AI.run(RERANKER_MODEL, { query, contexts });
+		const cleanQuery = query.trim().slice(0, 512);
+		if (cleanQuery.length < 2) return results;
+
+		const contexts = validPairs.map(p => p.text);
+		const reranked = await env.AI.run(RERANKER_MODEL, { query: cleanQuery, contexts });
 		if (!reranked?.data?.length) return results;
 
-		// Map reranker scores back to original results
+		// Map reranker scores back to original results via tracked indices
 		const scored = reranked.data
-			.map((item, idx) => ({ ...results[idx], rerankerScore: item.score }))
+			.map((item, i) => {
+				const originalIdx = validPairs[i]?.idx;
+				if (originalIdx == null || !results[originalIdx]) return null;
+				return { ...results[originalIdx], rerankerScore: item.score };
+			})
+			.filter(Boolean)
 			.sort((a, b) => b.rerankerScore - a.rerankerScore);
 
 		return scored;
 	} catch (err) {
 		console.error('⚠️ Reranker error:', err.message);
-		return results; // Fallback to original Vectorize ordering
+		return results;
 	}
 }
 

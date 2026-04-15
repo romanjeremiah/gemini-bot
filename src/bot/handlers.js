@@ -63,38 +63,30 @@ function splitMessage(text, maxLen = 3900) {
 const THERAPEUTIC_CATEGORIES = ['pattern', 'trigger', 'avoidance', 'schema', 'growth', 'coping', 'insight', 'homework'];
 
 /**
- * Detect task complexity and return { needsPro, thinkingLevel }.
- * Maps message content to model selection AND thinking depth.
- *
- * Thinking levels (Gemini 3.x):
- * - Pro:   LOW (casual), MEDIUM (standard), HIGH (deep reasoning)
- * - Flash: MINIMAL (greetings), LOW (casual), MEDIUM (moderate)
+ * Detect task complexity — returns true if Pro model is needed.
+ * Health check-ins use Flash (handled separately by callbacks).
  */
-function detectComplexTask(text, activeCheckin) {
-	if (!text) return { needsPro: false, thinkingLevel: 'low' };
+function detectComplexTask(text) {
+	if (!text) return false;
 
-	// Active health check-in: Pro + HIGH thinking
-	if (activeCheckin) return { needsPro: true, thinkingLevel: 'high' };
+	// Code/architecture
+	if (/\b(code|function|bug|error|deploy|refactor|implement|architecture|PR|pull request|commit|git|webpack|npm|wrangler|api|endpoint|database|query|sql|schema|migration)\b/i.test(text)) return true;
+	if (/\.(js|ts|py|json|css|html|jsx|mjs)\b/.test(text)) return true;
+	if (/```/.test(text)) return true;
 
-	// Code/architecture: Pro + HIGH
-	if (/\b(code|function|bug|error|deploy|refactor|implement|architecture|PR|pull request|commit|git|webpack|npm|wrangler|api|endpoint|database|query|sql|schema|migration)\b/i.test(text)) return { needsPro: true, thinkingLevel: 'high' };
-	if (/\.(js|ts|py|json|css|html|jsx|mjs)\b/.test(text)) return { needsPro: true, thinkingLevel: 'high' };
-	if (/```/.test(text)) return { needsPro: true, thinkingLevel: 'high' };
+	// Mental health / emotional depth
+	if (/\b(anxious|depressed|panic|overwhelm|trigger|dissociat|suicid|self.?harm|therapy|therapist|schema|attachment|ifs|dbt|aedp|emotion|mood|bipolar|mania|hypo)\b/i.test(text)) return true;
 
-	// Mental health / emotional depth: Pro + MEDIUM
-	if (/\b(anxious|depressed|panic|overwhelm|trigger|dissociat|suicid|self.?harm|therapy|therapist|schema|attachment|ifs|dbt|aedp|emotion|mood|bipolar|mania|hypo)\b/i.test(text)) return { needsPro: true, thinkingLevel: 'medium' };
+	// Complex analytical requests
+	if (/\b(analyse|analyze|compare|explain.*detail|deep dive|break down|pros and cons|trade.?off|strategy|plan)\b/i.test(text)) return true;
 
-	// Complex analytical requests: Pro + MEDIUM
-	if (/\b(analyse|analyze|compare|explain.*detail|deep dive|break down|pros and cons|trade.?off|strategy|plan)\b/i.test(text)) return { needsPro: true, thinkingLevel: 'medium' };
+	// Research triggers (doing, not viewing)
+	if (/\b(research|investigate|look into)\b/i.test(text) && !/\b(show|list|recent|history|results|previous|past|full report)\b/i.test(text)) return true;
 
-	// Research triggers (doing, not viewing): Pro + MEDIUM
-	if (/\b(research|investigate|look into)\b/i.test(text) && !/\b(show|list|recent|history|results|previous|past|full report)\b/i.test(text)) return { needsPro: true, thinkingLevel: 'medium' };
+	// Long messages
+	if (text.length > 300) return true;
 
-	// Long messages: Pro + MEDIUM
-	if (text.length > 300) return { needsPro: true, thinkingLevel: 'medium' };
-
-	// Default: Flash + LOW
-	return { needsPro: false, thinkingLevel: 'low' };
+	return false;
 }
 
 // Silent Observation: Xaridotis quietly reflects on conversations to learn about the user
@@ -778,16 +770,13 @@ export async function handleMessage(msg, env) {
 		if (modelOverride) await env.CHAT_KV.delete(`model_override_${chatId}_${threadId}`); // One-shot override
 
 		let textModel = FALLBACK_TEXT_MODEL;
-		let taskThinkingLevel = 'low';
 		if (modelOverride) {
 			textModel = modelOverride === 'pro' ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
-			taskThinkingLevel = modelOverride === 'pro' ? 'medium' : 'low';
 			log.info('model_override_applied', { model: textModel });
 		} else if (isOwner) {
-			const complexity = detectComplexTask(userText, healthCheckin);
-			textModel = complexity.needsPro ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
-			taskThinkingLevel = complexity.thinkingLevel;
-			if (complexity.needsPro) log.info('model_upgrade', { reason: 'complex_task', model: textModel, thinking: taskThinkingLevel });
+			const needsPro = detectComplexTask(userText);
+			textModel = needsPro ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
+			if (needsPro) log.info('model_upgrade', { reason: 'complex_task', model: textModel });
 		}
 
 		const effectivePersona = 'xaridotis';
@@ -879,16 +868,14 @@ export async function handleMessage(msg, env) {
 		const fullSysPrompt = `${personaInstruction}\n\n${MENTAL_HEALTH_DIRECTIVE}\n\n${SECOND_BRAIN_DIRECTIVE}\n\n${FORMATTING_RULES}\n${dynamicContext}`;
 
 		let chat;
-		// Test-Time Compute: high thinking for emotional/complex, none for casual
-		const thinkingLevel = isEmotionalMsg ? 'high' : null;
 
 		try {
-			chat = await createChat(hist, fullSysPrompt, env, cacheContext, textModel, { skipCodeExecution: hasMedia, thinkingLevel: taskThinkingLevel });
+			chat = await createChat(hist, fullSysPrompt, env, cacheContext, textModel, { skipCodeExecution: hasMedia });
 		} catch (cacheErr) {
 			// If cache is stale (403), retry without cache
 			if (cacheErr.message?.includes('403') || cacheErr.message?.includes('CachedContent')) {
 				log.warn('cache_stale_retry', { msg: cacheErr.message });
-				chat = await createChat(hist, fullSysPrompt, env, null, textModel, { skipCodeExecution: hasMedia, thinkingLevel: taskThinkingLevel });
+				chat = await createChat(hist, fullSysPrompt, env, null, textModel, { skipCodeExecution: hasMedia });
 			} else {
 				throw cacheErr;
 			}
@@ -955,6 +942,8 @@ export async function handleMessage(msg, env) {
 		let nextMessage = userParts;
 		let isFirstPass = true;
 
+		// Pro→Flash fallback: if Pro fails with overload/rate-limit, retry with Flash
+		const runGenerateLoop = async () => {
 		while (!isComplete) {
 			// First pass with no tool calls: use streaming for animated text
 			// Tool-calling passes: use non-streaming (need complete response for function call/response pairs)
@@ -1053,6 +1042,32 @@ export async function handleMessage(msg, env) {
 						lastSentMsgId = sent?.result?.message_id;
 					}
 				}
+			}
+		}
+		}; // end runGenerateLoop
+
+		try {
+			await runGenerateLoop();
+		} catch (proErr) {
+			const msg = proErr?.message || '';
+			const isRetryable = msg.includes('503') || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')
+				|| msg.includes('overloaded') || msg.includes('unavailable') || msg.includes('UNAVAILABLE')
+				|| proErr?.status === 503 || proErr?.status === 429;
+			if (isRetryable && textModel === PRIMARY_TEXT_MODEL) {
+				log.warn('pro_fallback_to_flash', { error: msg.slice(0, 100), model: textModel });
+				textModel = FALLBACK_TEXT_MODEL;
+				// Reset state for retry
+				isComplete = false;
+				fullText = "";
+				lastSentMsgId = null;
+				nextMessage = userParts;
+				isFirstPass = true;
+				// Recreate chat with Flash
+				const flashCache = hasMedia ? null : await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, FALLBACK_TEXT_MODEL);
+				chat = await createChat(hist, fullSysPrompt, env, flashCache, FALLBACK_TEXT_MODEL, { skipCodeExecution: hasMedia });
+				await runGenerateLoop();
+			} else {
+				throw proErr;
 			}
 		}
 

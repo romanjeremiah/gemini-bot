@@ -187,14 +187,6 @@ function buildConfig(systemInstruction, opts = {}) {
     maxOutputTokens: 8192,
   };
 
-  // Test-Time Compute: Gemini 3.x thinkingLevel parameter
-  // Controls reasoning depth without includeThoughts (which leaks into responses)
-  // Gemini 3.1 Pro: 'low', 'medium', 'high'
-  // Gemini 3 Flash: 'minimal', 'low', 'medium', 'high'
-  if (opts.thinkingLevel) {
-    config.thinkingConfig = { thinkingLevel: opts.thinkingLevel.toUpperCase() };
-  }
-
   return config;
 }
 
@@ -210,7 +202,7 @@ export async function createChat(history, systemInstruction, env, cacheContext =
   const useModel = model || PRIMARY_TEXT_MODEL;
   const config = cacheContext?.cacheName
     ? buildCachedConfig(cacheContext.cacheName)
-    : buildConfig(systemInstruction, { ...opts, thinkingLevel: opts.thinkingLevel });
+    : buildConfig(systemInstruction, opts);
 
   console.log(`🤖 Model: ${useModel}`);
   return getAI(env).chats.create({

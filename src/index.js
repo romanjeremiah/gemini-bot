@@ -1124,12 +1124,16 @@ export default {
 			if (bizMsg.business_connection_id && bizMsg.from?.id) {
 				await env.CHAT_KV.put(`biz_conn_${bizMsg.from.id}`, bizMsg.business_connection_id, { expirationTtl: BIZ_CONN_TTL });
 			}
-			if (bizMsg.effect_id) {
+			// Only process business messages from the owner in their own chat.
+			// Telegram Business forwards ALL personal chats; skip the rest.
+			if (env.OWNER_ID && String(bizMsg.from?.id) === String(env.OWNER_ID) && String(bizMsg.chat?.id) === String(env.OWNER_ID)) {
+				if (bizMsg.effect_id) {
 				const emoji = extractEffectEmoji(bizMsg, bizMsg.effect_id);
 				console.log(`✨ Effect discovered: ${bizMsg.effect_id} emoji: ${emoji}`);
 				await storeDiscoveredEffect(env, bizMsg.effect_id, emoji);
 			}
 			task = handleMessage(bizMsg, env);
+			}
 		}
 		else if (update.inline_query) task = handleInlineQuery(update.inline_query, env);
 		else if (update.poll_answer) {

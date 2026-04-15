@@ -46,7 +46,7 @@ export function buildDateTimeMessage(before, unixTime, after = '', format = 'DT'
 }
 
 // ---- Send text message ----
-export async function sendMessage(chatId, threadId, text, env, replyId = null, markup = null, effectId = null, quote = null) {
+export async function sendMessage(chatId, threadId, text, env, replyId = null, markup = null, effectId = null, quote = null, bizConnId = null) {
 	const cleanText = sanitizeTelegramHTML(text);
 	const payload = {
 		chat_id: chatId,
@@ -61,6 +61,7 @@ export async function sendMessage(chatId, threadId, text, env, replyId = null, m
 	}
 	if (markup) payload.reply_markup = markup;
 	if (effectId) payload.message_effect_id = effectId;
+	if (bizConnId) payload.business_connection_id = bizConnId;
 
 	let res = await tgApi("sendMessage", env, payload);
 
@@ -195,9 +196,10 @@ export async function sendVoice(chatId, threadId, buffer, env, replyId = null) {
 }
 
 // ---- Chat action ----
-export async function sendChatAction(chatId, threadId, action, env) {
+export async function sendChatAction(chatId, threadId, action, env, bizConnId = null) {
 	const payload = { chat_id: chatId, action };
 	if (threadId && threadId !== "default") payload.message_thread_id = Number(threadId);
+	if (bizConnId) payload.business_connection_id = bizConnId;
 	await tgApi("sendChatAction", env, payload);
 }
 

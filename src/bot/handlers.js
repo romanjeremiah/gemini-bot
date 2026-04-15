@@ -707,6 +707,7 @@ Be bold. Reference actual file paths.` }] }],
 export async function handleMessage(msg, env) {
 	const chatId = msg.chat.id, messageId = msg.message_id, threadId = msg.message_thread_id || "default";
 	const replyToMessageId = msg.reply_to_message?.message_id || null;
+	const bizConnId = msg.business_connection_id || null;
 
 	// Skip messages from bots (including our own)
 	if (msg.from?.is_bot) return;
@@ -749,7 +750,7 @@ export async function handleMessage(msg, env) {
 			return;
 		}
 
-		await telegram.sendChatAction(chatId, threadId, "typing", env);
+		await telegram.sendChatAction(chatId, threadId, "typing", env, bizConnId);
 
 		// Dynamic context throttling: skip heavy D1/Vectorize queries for short, low-value replies
 		const hasMedia = !!getMediaFromMessage(msg);
@@ -1044,11 +1045,11 @@ export async function handleMessage(msg, env) {
 						const chunks = splitMessage(fullText, 3900);
 						for (let i = 0; i < chunks.length; i++) {
 							const isLast = i === chunks.length - 1;
-							const sent = await telegram.sendMessage(chatId, threadId, chunks[i], env, i === 0 ? messageId : null, isLast ? btns : undefined);
+							const sent = await telegram.sendMessage(chatId, threadId, chunks[i], env, i === 0 ? messageId : null, isLast ? btns : undefined, null, null, bizConnId);
 							if (isLast) lastSentMsgId = sent?.result?.message_id;
 						}
 					} else {
-						const sent = await telegram.sendMessage(chatId, threadId, fullText, env, messageId, btns);
+						const sent = await telegram.sendMessage(chatId, threadId, fullText, env, messageId, btns, null, null, bizConnId);
 						lastSentMsgId = sent?.result?.message_id;
 					}
 				}
@@ -1088,7 +1089,7 @@ export async function handleMessage(msg, env) {
 
 	} catch (err) {
 		console.error("❌ handleMessage crash:", err.message, err.stack);
-		try { await telegram.sendMessage(chatId, threadId, `⚠️ ${err.message?.slice(0, 150) || "Unknown error"}`, env, messageId); }
+		try { await telegram.sendMessage(chatId, threadId, `⚠️ ${err.message?.slice(0, 150) || "Unknown error"}`, env, messageId, null, null, null, bizConnId); }
 		catch (sendErr) { console.error("❌ Failed to send error msg:", sendErr.message); }
 	}
 }

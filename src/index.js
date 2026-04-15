@@ -1163,6 +1163,13 @@ export default {
 		}
 		else if (update.callback_query) task = handleCallback(update.callback_query, env);
 		else if (update.message) {
+			// Skip messages forwarded via Telegram Business to chats that aren't ours
+			const msgChatId = String(update.message.chat?.id || '');
+			const msgFromId = String(update.message.from?.id || '');
+			if (update.message.chat?.type === 'private' && env.OWNER_ID && msgFromId === String(env.OWNER_ID) && msgChatId !== String(env.OWNER_ID)) {
+				// Owner messaging a different private chat — business-forwarded, ignore
+				return new Response("OK");
+			}
 			if (update.message.effect_id) {
 				const emoji = extractEffectEmoji(update.message, update.message.effect_id);
 				console.log(`✨ Effect discovered: ${update.message.effect_id} emoji: ${emoji}`);

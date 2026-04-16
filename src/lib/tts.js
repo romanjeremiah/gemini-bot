@@ -1,19 +1,16 @@
 /**
- * Generates an Ogg Opus buffer from text using Google Cloud TTS.
+ * Generates an Ogg Opus buffer from text using Google Cloud TTS (Chirp 3: HD).
  */
-export async function generateSpeech(text, personaKey, env) {
-	const voices = {
-		xaridotis: "en-US-Chirp3-HD-Gacrux",
-		tenon:     "en-US-Chirp3-HD-Gacrux",
-		nightfall: "en-US-Chirp3-HD-Gacrux",
-		tribore:   "en-US-Chirp3-HD-Gacrux",
-		default:   "en-US-Chirp3-HD-Gacrux"
-	};
+import { resolveVoice } from '../config/voices';
+
+export async function generateSpeech(text, personaKey, env, userVoiceOverride = null) {
+	const voiceName = resolveVoice(personaKey, userVoiceOverride);
+	const locale = voiceName.split('-').slice(0, 2).join('-');
 
 	const url = `https://texttospeech.googleapis.com/v1/text:synthesize?key=${env.GCP_TTS_API_KEY}`;
 	const payload = {
 		input: { text },
-		voice: { languageCode: "en-US", name: voices[personaKey] || voices.default },
+		voice: { languageCode: locale, name: voiceName },
 		audioConfig: { audioEncoding: "OGG_OPUS", sampleRateHertz: 24000 }
 	};
 

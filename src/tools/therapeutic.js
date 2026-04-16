@@ -37,7 +37,7 @@ export const saveTherapeuticNoteTool = {
 	},
 	async execute(args, env, context) {
 		const importance = args.importance || 2;
-		await memoryStore.saveMemory(env, context.chatId, args.note_type, args.content, importance);
+		await memoryStore.saveMemory(env, context.userId, args.note_type, args.content, importance);
 		return { status: "success", saved: args.note_type, importance };
 	}
 };
@@ -67,13 +67,13 @@ export const getTherapeuticNotesTool = {
 
 		if (args.note_type) {
 			// Fetch a specific therapeutic category
-			const notes = await memoryStore.getMemoriesByCategory(env, context.chatId, args.note_type, args.limit || 15);
+			const notes = await memoryStore.getMemoriesByCategory(env, context.userId, args.note_type, args.limit || 15);
 			if (!notes.length) return { status: "success", notes: [], message: `No ${args.note_type} notes found.` };
 			return { status: "success", notes };
 		}
 
 		// Fetch all memories and filter to therapeutic categories
-		const all = await memoryStore.getMemories(env, context.chatId, args.limit || 30);
+		const all = await memoryStore.getMemories(env, context.userId, args.limit || 30);
 		const notes = all.filter(m => therapeuticCategories.includes(m.category));
 		if (!notes.length) return { status: "success", notes: [], message: "No therapeutic notes found." };
 		return { status: "success", notes };

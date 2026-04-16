@@ -113,7 +113,7 @@ async function rerank(env, query, results) {
  * @param {string} fact - the memory text to embed
  * @param {string|number} memoryId - DB row ID or unique key
  */
-export async function indexMemory(env, chatId, category, fact, memoryId) {
+export async function indexMemory(env, userId, category, fact, memoryId) {
 	if (!env.VECTORIZE || !env.AI) {
 		console.log('⚠️ Vectorize/AI not bound — skipping semantic indexing');
 		return;
@@ -121,16 +121,16 @@ export async function indexMemory(env, chatId, category, fact, memoryId) {
 	try {
 		const vector = await embed(env, fact);
 		await env.VECTORIZE.upsert([{
-			id: `mem_${chatId}_${memoryId}`,
+			id: `mem_${userId}_${memoryId}`,
 			values: vector,
 			metadata: {
-				chatId: Number(chatId),
+				userId: Number(userId),
 				category,
-				fact: fact.slice(0, 200), // store truncated fact in metadata for quick retrieval
+				fact: fact.slice(0, 200),
 				memoryId: String(memoryId),
 			},
 		}]);
-		console.log(`🧠 Vectorize indexed: mem_${chatId}_${memoryId}`);
+		console.log(`🧠 Vectorize indexed: mem_${userId}_${memoryId}`);
 	} catch (err) {
 		console.error('⚠️ Vectorize index error:', err.message);
 	}
@@ -147,17 +147,17 @@ export async function indexMemory(env, chatId, category, fact, memoryId) {
  * @param {string} description - AI-generated description of the media
  * @param {number} messageId - Telegram message ID for reference
  */
-export async function indexMedia(env, chatId, mediaType, base64Data, mimeType, description, messageId) {
+export async function indexMedia(env, userId, mediaType, base64Data, mimeType, description, messageId) {
 	if (!env.VECTORIZE || !env.GEMINI_API_KEY) return;
 	try {
 		const vector = await embed(env, { inlineData: { mimeType, data: base64Data } });
 		if (!vector) return;
 
 		await env.VECTORIZE.upsert([{
-			id: `media_${chatId}_${messageId}`,
+			id: `media_${userId}_${messageId}`,
 			values: vector,
 			metadata: {
-				chatId: Number(chatId),
+				userId: Number(userId),
 				category: mediaType,
 				fact: `[${mediaType}] ${description || 'Media attachment'}`.slice(0, 200),
 				messageId: String(messageId),
@@ -180,17 +180,17 @@ export async function indexMedia(env, chatId, mediaType, base64Data, mimeType, d
  * @param {string} aiSummary - brief AI response summary (first 200 chars)
  * @param {number} messageId - Telegram message ID
  */
-export async function indexConversation(env, chatId, userText, aiSummary, messageId) {
+export async function indexConversation(env, userId, userText, aiSummary, messageId) {
 	if (!env.VECTORIZE || !env.AI) return;
 	try {
 		const combined = `User: ${userText}\nAI: ${aiSummary}`;
 		const vector = await embed(env, combined);
 		const timestamp = Math.floor(Date.now() / 1000);
 		await env.VECTORIZE.upsert([{
-			id: `conv_${chatId}_${messageId}`,
+			id: `conv_${userId}_${messageId}`,
 			values: vector,
 			metadata: {
-				chatId: Number(chatId),
+				userId: Number(userId),
 				type: 'conversation',
 				preview: combined.slice(0, 200),
 				timestamp,
@@ -213,14 +213,14 @@ export async function indexConversation(env, chatId, userText, aiSummary, messag
  * @param {Object} opts - options: { categories: string[], minScore: number }
  * @returns {Array<{ id: string, score: number, metadata: Object }>}
  */
-export async function semanticSearch(env, chatId, query, topK = 5, opts = {}) {
+export async function semanticSearch(env, userId, query, topK = 5, opts = {}) {
 	if (!env.VECTORIZE || !env.AI) {
 		console.log('⚠️ Vectorize/AI not bound — semantic search unavailable');
 		return [];
 	}
 	try {
 		const vector = await embed(env, query);
-		const filter = { chatId: { $eq: Number(chatId) } };
+		const filter = { userId: { $eq: Number(userId) } };
 
 		// Use $in for multi-category filtering (e.g. all therapeutic categories at once)
 		if (opts.categories?.length) {
@@ -251,8 +251,8 @@ export async function semanticSearch(env, chatId, query, topK = 5, opts = {}) {
  * Search specifically across therapeutic memories (triggers, schemas, patterns, avoidance, growth).
  * Uses $in filter to sweep all clinical categories in a single query.
  */
-export async function therapeuticSearch(env, chatId, query, topK = 5) {
-	return semanticSearch(env, chatId, query, topK, {
+export async function therapeuticSearch(env, userId, query, topK = 5) {
+	return semanticSearch(env, userId, query, topK, {
 		categories: ['trigger', 'schema', 'avoidance', 'pattern', 'growth', 'coping', 'insight', 'homework'],
 		minScore: 0.6,
 	});
@@ -261,8 +261,8 @@ export async function therapeuticSearch(env, chatId, query, topK = 5) {
 /**
  * Search specifically across learning/discovery memories.
  */
-export async function knowledgeSearch(env, chatId, query, topK = 5) {
-	return semanticSearch(env, chatId, query, topK, {
+export async function knowledgeSearch(env, userId, query, topK = 5) {
+	return semanticSearch(env, userId, query, topK, {
 		categories: ['discovery', 'growth'],
 		minScore: 0.5,
 	});
@@ -271,21 +271,19 @@ export async function knowledgeSearch(env, chatId, query, topK = 5) {
 /**
  * Delete all vectors for a chat (call when user does /forget).
  */
-export async function deleteAllVectors(env, chatId) {
+export async function deleteAllVectors(env, userId) {
 	if (!env.VECTORIZE) return;
 	try {
-		// Vectorize V2 supports deleteByFilter (if available), otherwise we query + delete
-		// For now, query all and delete by IDs
 		const dummyVector = new Array(768).fill(0);
 		const results = await env.VECTORIZE.query(dummyVector, {
 			topK: 1000,
-			filter: { chatId: { $eq: Number(chatId) } },
+			filter: { userId: { $eq: Number(userId) } },
 			returnMetadata: 'none',
 		});
 		const ids = (results.matches || []).map(m => m.id);
 		if (ids.length) {
 			await env.VECTORIZE.deleteByIds(ids);
-			console.log(`🧠 Vectorize deleted ${ids.length} vectors for chat ${chatId}`);
+			console.log(`🧠 Vectorize deleted ${ids.length} vectors for user ${userId}`);
 		}
 	} catch (err) {
 		console.error('⚠️ Vectorize bulk delete error:', err.message);
@@ -301,15 +299,14 @@ export async function deleteAllVectors(env, chatId) {
  * @param {string} userMessage
  * @returns {string} formatted context or empty string
  */
-export async function getSemanticContext(env, chatId, userMessage) {
+export async function getSemanticContext(env, userId, userMessage) {
 	if (!env.VECTORIZE || !env.AI) return '';
 	if (!userMessage || userMessage.length < 5) return '';
 
 	try {
-		// Run two searches in parallel: general recall + therapeutic pattern matching
 		const [generalResults, therapeuticResults] = await Promise.all([
-			semanticSearch(env, chatId, userMessage, 3, { minScore: 0.65 }),
-			therapeuticSearch(env, chatId, userMessage, 3),
+			semanticSearch(env, userId, userMessage, 3, { minScore: 0.65 }),
+			therapeuticSearch(env, userId, userMessage, 3),
 		]);
 
 		// Deduplicate by ID

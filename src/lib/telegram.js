@@ -37,9 +37,19 @@ export function dateTimeEntity(offset, length, unixTime, format = 'DT') {
  * @returns {{ text: string, entities: object[] }}
  */
 export function buildDateTimeMessage(before, unixTime, after = '', format = 'DT') {
-	// The placeholder text is what users on old clients see
+	// The placeholder text is what users on old clients see.
+	// Force 24-hour format explicitly — timeStyle: 'short' is locale-dependent and
+	// can fall back to 12h (AM/PM) on some clients even with en-GB.
 	const date = new Date(unixTime * 1000);
-	const placeholder = date.toLocaleString('en-GB', { timeZone: 'Europe/London', dateStyle: 'medium', timeStyle: 'short' });
+	const placeholder = date.toLocaleString('en-GB', {
+		timeZone: 'Europe/London',
+		day: '2-digit',
+		month: 'short',
+		year: 'numeric',
+		hour: '2-digit',
+		minute: '2-digit',
+		hour12: false,
+	});
 	const text = `${before}${placeholder}${after}`;
 	const entity = dateTimeEntity(before.length, placeholder.length, unixTime, format);
 	return { text, entities: [entity] };

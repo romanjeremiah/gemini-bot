@@ -14,6 +14,7 @@ import { ARCHITECTURE_SUMMARY } from './config/architecture';
 import { getSchedule, matchesSchedule } from './config/schedules';
 import { toolRegistry } from './tools/index';
 import { log } from './lib/logger';
+import { wrapD1 } from './lib/db';
 
 // Export Workflow classes for Cloudflare Workflows binding
 export { MemoryConsolidationWorkflow } from './workflows/memoryConsolidation';
@@ -52,6 +53,7 @@ function extractEffectEmoji(msg, effectId) {
 // Runs inside the cron handler. Checks London time and sends check-ins as Nightfall.
 async function handleHealthCheckIns(env) {
 	const chatId = Number(env.OWNER_ID);
+	const userId = chatId; // Owner's private chat: chatId == userId
 	const userTz = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Europe/London';
 	const now = new Date();
 	const localTime = new Date(now.toLocaleString('en-US', { timeZone: userTz }));
@@ -84,7 +86,7 @@ async function handleHealthCheckIns(env) {
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
 		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'morning', { expirationTtl: 1800 });
 
-		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'morning');
+		const alreadyLogged = await moodStore.hasCheckedInToday(env, userId, 'morning');
 		if (alreadyLogged) return;
 
 		// Conversational medication check (no buttons)
@@ -108,7 +110,7 @@ async function handleHealthCheckIns(env) {
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
 		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'midday', { expirationTtl: 1800 });
 
-		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'midday');
+		const alreadyLogged = await moodStore.hasCheckedInToday(env, userId, 'midday');
 		if (alreadyLogged) return;
 
 		// Conversational medication check (no buttons)
@@ -131,7 +133,7 @@ async function handleHealthCheckIns(env) {
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
 		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 1800 });
 
-		const alreadyLogged = await moodStore.hasCheckedInToday(env, chatId, 'evening');
+		const alreadyLogged = await moodStore.hasCheckedInToday(env, userId, 'evening');
 		if (alreadyLogged) return;
 
 		// Send mood poll instead of checklist buttons
@@ -144,6 +146,7 @@ async function handleHealthCheckIns(env) {
 // If a check-in was sent but not responded to within 30 minutes, send a gentle nudge.
 async function handleMedicationNudge(env) {
 	const chatId = Number(env.OWNER_ID);
+	const userId = chatId; // Owner's private chat: chatId == userId
 	const now = Date.now();
 	const londonTime = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/London' }));
 	const hour = londonTime.getHours();
@@ -161,7 +164,7 @@ async function handleMedicationNudge(env) {
 		if ((now - parseInt(pendingTime)) < 30 * 60 * 1000) continue;
 
 		// Check if the user has since responded (data was logged)
-		const logged = await moodStore.hasCheckedInToday(env, chatId, type);
+		const logged = await moodStore.hasCheckedInToday(env, userId, type);
 		if (logged) {
 			await env.CHAT_KV.delete(nudgeKey);
 			continue;
@@ -204,6 +207,7 @@ async function handleWeeklyReport(env) {
 	if (londonTime.getDay() !== schedule.day || londonTime.getHours() !== schedule.hour) return;
 
 	const chatId = Number(env.OWNER_ID);
+	const userId = chatId; // Owner's private chat
 	const threadId = 'default';
 	const today = londonTime.toISOString().split('T')[0];
 	const reportKey = `weekly_report_${today}`;
@@ -213,7 +217,7 @@ async function handleWeeklyReport(env) {
 
 	try {
 		// Pull the last 7 days of mood data
-		const entries = await moodStore.getWeeklySummary(env, chatId);
+		const entries = await moodStore.getWeeklySummary(env, userId);
 		if (!entries.length) {
 			await telegram.sendMessage(chatId, threadId,
 				`<b>Weekly Report</b>\n\nNo mood data recorded this week. Start logging with /mood to build your pattern history.`, env);
@@ -248,7 +252,7 @@ Do not give advice. Do not prescribe solutions. Present the data, prove your wor
 				`<b>Your Weekly Mental Health Report</b>\n\n${report}`, env);
 
 			// Save the weekly observation for long-term pattern tracking (Importance: 2)
-			await memoryStore.saveMemory(env, chatId, 'insight', `Weekly Observation (${today}): ${report}`, 2, chatId);
+			await memoryStore.saveMemory(env, userId, 'insight', `Weekly Observation (${today}): ${report}`, 2);
 		}
 	} catch (e) {
 		console.error('Weekly report error:', e.message);
@@ -265,6 +269,7 @@ async function handleAccountabilityNudge(env) {
 	if (londonTime.getDay() !== schedule.day || londonTime.getHours() !== schedule.hour) return;
 
 	const chatId = Number(env.OWNER_ID);
+	const userId = chatId; // Owner's private chat
 	const today = londonTime.toISOString().split('T')[0];
 	const nudgeKey = `accountability_nudge_${today}`;
 
@@ -272,11 +277,11 @@ async function handleAccountabilityNudge(env) {
 	await env.CHAT_KV.put(nudgeKey, '1', { expirationTtl: 86400 });
 
 	try {
-		const memories = await memoryStore.getRecentTherapeuticMemories(env, chatId, 7);
+		const memories = await memoryStore.getRecentTherapeuticMemories(env, userId, 7);
 		if (!memories.length) return;
 
 		// Fetch the most recent weekly insight for clinical context
-		const recentInsights = await memoryStore.getMemoriesByCategory(env, chatId, 'insight', 1);
+		const recentInsights = await memoryStore.getMemoriesByCategory(env, userId, 'insight', 1);
 		const latestInsight = recentInsights.length > 0 ? recentInsights[0].fact : 'None';
 
 		const prompt = `You are Nightfall.
@@ -309,6 +314,7 @@ async function handleMemoryConsolidation(env) {
 	if (londonTime.getDate() !== schedule.date || londonTime.getHours() !== schedule.hour) return;
 
 	const chatId = Number(env.OWNER_ID);
+	const userId = chatId; // Owner's private chat
 	const month = londonTime.toISOString().split('-').slice(0, 2).join('-');
 	const runKey = `rem_consolidation_${month}`;
 
@@ -320,12 +326,12 @@ async function handleMemoryConsolidation(env) {
 		if (env.MEMORY_WORKFLOW) {
 			await env.MEMORY_WORKFLOW.create({
 				id: `rem-sleep-${month}`,
-				params: { chatId }
+				params: { chatId, userId }
 			});
 			log.info('workflow_triggered', { workflow: 'memory-consolidation', month });
 		} else {
 			// Fallback: run inline if Workflow binding not available
-			await memoryStore.consolidateMemories(env, chatId);
+			await memoryStore.consolidateMemories(env, userId);
 			await telegram.sendMessage(chatId, 'default',
 				'<i>Did some deep memory consolidation overnight. Your saved memories are organised and ready for the new month.</i>', env);
 		}
@@ -366,20 +372,20 @@ async function sendMoodPoll(chatId, threadId, env) {
 	return pollRes;
 }
 
-async function handleMoodPollAnswer(chatId, threadId, score, env) {
+async function handleMoodPollAnswer(userId, chatId, threadId, score, env) {
 	const today = new Date().toISOString().split('T')[0];
-	log.info('mood_poll_score', { chatId, score });
+	log.info('mood_poll_score', { userId, chatId, score });
 
-	// Save mood score
-	await moodStore.upsertEntry(env, chatId, today, 'evening', { mood_score: score });
+	// Save mood score (keyed by user, not chat)
+	await moodStore.upsertEntry(env, userId, today, 'evening', { mood_score: score });
 
 	// Build context-aware response using recent mood history and memories
-	const moodHistory = await moodStore.getHistory(env, chatId, 30);
-	const memoryCtx = await memoryStore.getFormattedContext(env, chatId);
-	const semanticCtx = await vectorStore.getSemanticContext(env, chatId, `mood score ${score} how I feel`);
+	const moodHistory = await moodStore.getHistory(env, userId, 30);
+	const memoryCtx = await memoryStore.getFormattedContext(env, userId);
+	const semanticCtx = await vectorStore.getSemanticContext(env, userId, `mood score ${score} how I feel`);
 	const therapeuticNotes = await env.DB.prepare(
-		`SELECT category, fact FROM memories WHERE chat_id = ? AND category IN ('pattern','trigger','schema','insight','homework') ORDER BY created_at DESC LIMIT 10`
-	).bind(chatId).all().then(r => r.results || []);
+		`SELECT category, fact FROM memories WHERE user_id = ? AND category IN ('pattern','trigger','schema','insight','homework') ORDER BY created_at DESC LIMIT 10`
+	).bind(userId).all().then(r => r.results || []);
 
 	const recentScores = moodHistory.slice(0, 7).map(e => {
 		const parsed = typeof e.data === 'string' ? JSON.parse(e.data || '{}') : (e.data || {});
@@ -390,7 +396,7 @@ async function handleMoodPollAnswer(chatId, threadId, score, env) {
 	const clinicalNotes = therapeuticNotes.map(n => `[${n.category}] ${n.fact}`).join('\n');
 
 	// Retrieve relevant past episodes (CoALA episodic memory)
-	const relevantEpisodes = await episodeStore.getRecentEpisodes(env, chatId, 5, score <= 3 ? 'crisis' : null).catch(() => []);
+	const relevantEpisodes = await episodeStore.getRecentEpisodes(env, userId, 5, score <= 3 ? 'crisis' : null).catch(() => []);
 	const episodeCtx = episodeStore.formatEpisodesForContext(relevantEpisodes);
 
 	let contextPrompt;
@@ -464,10 +470,10 @@ async function handleSpontaneousOutreach(env) {
 	if (Math.random() > 0.05) return;
 
 	const chatId = Number(env.OWNER_ID);
+	const userId = chatId; // Owner's private chat
 	const today = londonTime.toISOString().split('T')[0];
 
-	// Max one spontaneous message per day
-	const outreachKey = `spontaneous_${today}`;
+	// Max one spontaneous message per day = `spontaneous_${today}`;
 	if (await env.CHAT_KV.get(outreachKey)) return;
 	await env.CHAT_KV.put(outreachKey, '1', { expirationTtl: 86400 });
 
@@ -479,7 +485,7 @@ async function handleSpontaneousOutreach(env) {
 
 	try {
 		// Pull memories with a mix of types for contextual check-ins
-		const allMemories = await memoryStore.getMemories(env, chatId, 50);
+		const allMemories = await memoryStore.getMemories(env, userId, 50);
 		const casualMemories = allMemories.filter(m => !['pattern', 'schema', 'trigger', 'avoidance'].includes(m.category));
 		if (!casualMemories.length) return;
 
@@ -539,6 +545,7 @@ async function handleCuriosityDigest(env) {
 	if (londonTime.getDay() !== schedule.day || londonTime.getHours() !== schedule.hour) return;
 
 	const chatId = Number(env.OWNER_ID);
+	const userId = chatId; // Owner's private chat
 	const today = londonTime.toISOString().split('T')[0];
 	const digestKey = `curiosity_digest_${today}`;
 
@@ -577,7 +584,7 @@ ${digest}`;
 			await telegram.sendMessage(chatId, 'default', `<b>Things I found interesting this week</b>\n\n${msg}`, env);
 
 			// Save the raw discoveries as a memory so they feed into spontaneous outreach and conversations
-			await memoryStore.saveMemory(env, chatId, 'discovery', `Weekly research (${today}): ${digest.slice(0, 500)}`, 1, chatId);
+			await memoryStore.saveMemory(env, userId, 'discovery', `Weekly research (${today}): ${digest.slice(0, 500)}`, 1);
 		}
 	} catch (e) {
 		console.error('Curiosity digest error:', e.message);
@@ -598,6 +605,7 @@ async function handleAutonomousResearch(env) {
 	if (!matchDay || !matchHour) return;
 
 	const chatId = Number(env.OWNER_ID);
+	const userId = chatId; // Owner's private chat
 	const today = londonTime.toISOString().split('T')[0];
 	const key = `auto_research_${today}`;
 
@@ -622,7 +630,7 @@ async function handleAutonomousResearch(env) {
 			{ tools: [{ googleSearch: {} }], temperature: 0.7 }
 		);
 		if (text && text.length > 30) {
-			await memoryStore.saveMemory(env, chatId, 'discovery', `Research (${randomDomain.split('(')[0].trim()}): ${text}`, 1, chatId);
+			await memoryStore.saveMemory(env, userId, 'discovery', `Research (${randomDomain.split('(')[0].trim()}): ${text}`, 1);
 			console.log(`🧠 Autonomous research: ${randomDomain.split('(')[0].trim()}`);
 		}
 	} catch (e) {
@@ -641,6 +649,7 @@ async function handleSelfImprovement(env) {
 	if (londonTime.getDate() !== schedule.date || londonTime.getHours() !== schedule.hour) return;
 
 	const chatId = Number(env.OWNER_ID);
+	const userId = chatId; // Owner's private chat
 	const month = londonTime.toISOString().split('-').slice(0, 2).join('-');
 	const key = `self_improve_${month}`;
 
@@ -671,7 +680,7 @@ RULES:
 		if (!suggestions || suggestions.length < 100) return;
 
 		// Save as a memory for future reference
-		await memoryStore.saveMemory(env, chatId, 'discovery', `Self-improvement suggestions (${month}): ${suggestions.slice(0, 500)}`, 1, chatId);
+		await memoryStore.saveMemory(env, userId, 'discovery', `Self-improvement suggestions (${month}): ${suggestions.slice(0, 500)}`, 1);
 
 		// Send to the user
 		const formatPrompt = `Rewrite these technical suggestions into a casual, conversational message. You are Tenon sharing ideas with Roman about how to improve the bot. Keep your dry wit. Present each suggestion as something you noticed while doing some reading, not as a formal report. 3-4 short paragraphs.
@@ -698,6 +707,7 @@ async function handleArchitectureEvolution(env) {
 	if (londonTime.getMinutes() !== 0) return;
 
 	const chatId = Number(env.OWNER_ID);
+	const userId = chatId; // Owner's private chat
 	const currentKey = `auto_architect_${londonTime.toISOString().slice(0, 13)}`;
 
 	if (await env.CHAT_KV.get(currentKey)) return;
@@ -764,7 +774,7 @@ Keep it under 500 words. End with: "Awaiting your manual review."` }] }],
 					{ text: '❌ Dismiss', callback_data: 'action_dismiss_pr', style: 'danger' }
 				]]
 			});
-			await memoryStore.saveMemory(env, chatId, 'discovery', `Architecture PR (${randomTech}): ${prText.slice(0, 300)}`, 1, chatId);
+			await memoryStore.saveMemory(env, userId, 'discovery', `Architecture PR (${randomTech}): ${prText.slice(0, 300)}`, 1);
 		}
 	} catch (e) {
 		console.error('Architecture evolution error:', e.message);
@@ -788,6 +798,7 @@ async function handleDailyStudy(env) {
 	if (Math.random() > 0.10) return;
 
 	const chatId = Number(env.OWNER_ID);
+	const userId = chatId; // Owner's private chat
 	const today = londonTime.toISOString().split('T')[0];
 	const studyKey = `daily_study_${today}`;
 
@@ -843,7 +854,7 @@ async function handleDailyStudy(env) {
 		if (env.RESEARCH_WORKFLOW) {
 			await env.RESEARCH_WORKFLOW.create({
 				id: `study-${today}-${Date.now()}`,
-				params: { chatId, topic }
+				params: { chatId, userId, topic }
 			});
 			log.info('deep_research_triggered', { topic: topic.slice(0, 50) });
 			return; // Workflow handles everything: research → save → notify
@@ -891,7 +902,7 @@ Write as if noting this down for yourself to use later.` }] }],
 		const isTherapeutic = /therapy|adhd|ifs|dbt|schema|attachment|bipolar|emotion|mental/i.test(topic);
 		const isCareer = /servicenow|certification|itsm/i.test(topic);
 		const category = isTherapeutic ? 'growth' : (isCareer ? 'growth' : 'discovery');
-		await memoryStore.saveMemory(env, chatId, category, `Study (${topic.split(' ').slice(0, 5).join(' ')}): ${insight.slice(0, 400)}`, 1, chatId);
+		await memoryStore.saveMemory(env, userId, category, `Study (${topic.split(' ').slice(0, 5).join(' ')}): ${insight.slice(0, 400)}`, 1);
 		log.info('daily_study_complete', { topic: topic.slice(0, 50), category });
 
 		// 40% chance: share what was learned naturally
@@ -915,38 +926,56 @@ Match your tone to the topic: sassy/direct for tech, warm/grounded for psycholog
 
 // ---- Reaction Feedback Handler ----
 // Processes emoji reactions on bot messages as implicit RLHF feedback.
+// Uses Llama 3.1 (8B) to interpret any emoji in context rather than a hardcoded dictionary.
+// Private chats only — we never extract learning signal from group chats.
 async function handleReactionFeedback(reaction, env) {
+	// Privacy guard: only learn from private chats
+	if (reaction.chat?.type !== 'private') return;
+
 	const chatId = reaction.chat.id;
+	const userId = reaction.user?.id || chatId; // Reaction author; chat.id in private chats
 	const msgId = reaction.message_id;
 	const newReactions = reaction.new_reaction || [];
 
-	if (!newReactions.length) return;
+	if (!newReactions.length) return; // Reaction was removed, not added
 
 	const emoji = newReactions[0].emoji;
 	if (!emoji) return;
 
-	// Retrieve the context of the message that was reacted to
+	// Retrieve the context of the message that was reacted to (written by telegram.js sendMessage)
 	const contextText = await env.CHAT_KV.get(`msg_context_${chatId}_${msgId}`);
-	if (!contextText) return; // Can't correlate reaction without context
+	if (!contextText) return; // Expired or never cached (reaction on old/short message)
 
-	// Only save significant reactions as memories (thumbs, hearts, fire, negative)
-	const significantReactions = {
-		'👍': { sentiment: 'positive', importance: 1 },
-		'❤': { sentiment: 'positive', importance: 2 },
-		'🔥': { sentiment: 'positive', importance: 2 },
-		'👎': { sentiment: 'negative', importance: 2 },
-		'💔': { sentiment: 'negative', importance: 2 },
-		'🤯': { sentiment: 'positive', importance: 1 },
-		'😢': { sentiment: 'negative', importance: 1 },
-		'🤣': { sentiment: 'positive', importance: 1 },
+	// Strong, unambiguous signals bypass the AI and save directly
+	const strongSignals = {
+		'👎': { sentiment: 'negative', insight: 'User reacted negatively — response style needs adjustment' },
+		'💔': { sentiment: 'negative', insight: 'User reacted negatively — response style needs adjustment' },
+		'🤬': { sentiment: 'negative', insight: 'User reacted with frustration — response style needs adjustment' },
+		'🔥': { sentiment: 'positive', insight: 'User loved this response style — reinforce this approach' },
+		'💯': { sentiment: 'positive', insight: 'User found this response highly accurate — reinforce this approach' },
 	};
 
-	const sig = significantReactions[emoji];
-	if (!sig) return; // Ignore casual reactions like 👀 or 🤔
+	let insight, sentiment;
 
-	const feedbackFact = `User reacted ${emoji} (${sig.sentiment}) to: "${contextText.slice(0, 200)}"`;
-	await memoryStore.saveMemory(env, chatId, 'feedback', feedbackFact, sig.importance, chatId);
-	console.log(`✨ Reaction feedback: ${emoji} (${sig.sentiment}) for msg ${msgId}`);
+	if (strongSignals[emoji]) {
+		({ insight, sentiment } = strongSignals[emoji]);
+	} else {
+		// Ambiguous emoji → let Llama interpret in context (Option B)
+		const { interpretReaction } = await import('./services/cfAi');
+		const interpreted = await interpretReaction(env, emoji, contextText).catch(e => {
+			log.error('reaction_interpret_error', { msg: e.message });
+			return null;
+		});
+		if (!interpreted) return; // AI skipped or errored — no useful signal
+		({ insight, sentiment } = interpreted);
+	}
+
+	// Negative feedback is more valuable for adaptation (importance 2); positive reinforcement is lower weight (1)
+	const importance = sentiment === 'negative' ? 2 : 1;
+
+	const feedbackFact = `${insight} [reacted ${emoji}]`;
+	await memoryStore.saveMemory(env, userId, 'feedback', feedbackFact, importance);
+	log.info('reaction_feedback_saved', { userId, emoji, sentiment, insight: insight.slice(0, 80) });
 }
 
 // ---- Queue-based task enqueuing (decouples LLM calls from cron) ----
@@ -956,6 +985,7 @@ async function enqueueHealthTasks(env) {
 	const hour = londonTime.getHours();
 	const minute = londonTime.getMinutes();
 	const chatId = Number(env.OWNER_ID);
+	const userId = chatId; // Owner's private chat
 	const today = londonTime.toISOString().split('T')[0];
 	const currentMins = hour * 60 + minute;
 
@@ -976,7 +1006,7 @@ async function enqueueHealthTasks(env) {
 		const key = `health_checkin_morning_${today}`;
 		if (!(await env.CHAT_KV.get(key)) && !isUserActive) {
 			await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
-			if (!(await moodStore.hasCheckedInToday(env, chatId, 'morning'))) {
+			if (!(await moodStore.hasCheckedInToday(env, userId, 'morning'))) {
 				await env.TASK_QUEUE.send({ type: 'health_checkin', period: 'morning', chatId });
 			}
 		}
@@ -986,7 +1016,7 @@ async function enqueueHealthTasks(env) {
 		const key = `health_checkin_midday_${today}`;
 		if (!(await env.CHAT_KV.get(key)) && !isUserActive) {
 			await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
-			if (!(await moodStore.hasCheckedInToday(env, chatId, 'midday'))) {
+			if (!(await moodStore.hasCheckedInToday(env, userId, 'midday'))) {
 				await env.TASK_QUEUE.send({ type: 'health_checkin', period: 'midday', chatId });
 			}
 		}
@@ -996,7 +1026,7 @@ async function enqueueHealthTasks(env) {
 		const key = `health_checkin_evening_${today}`;
 		if (!(await env.CHAT_KV.get(key)) && !isUserActive) {
 			await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
-			if (!(await moodStore.hasCheckedInToday(env, chatId, 'evening'))) {
+			if (!(await moodStore.hasCheckedInToday(env, userId, 'evening'))) {
 				await env.TASK_QUEUE.send({ type: 'mood_poll', chatId });
 			}
 		}
@@ -1008,7 +1038,7 @@ async function enqueueHealthTasks(env) {
 		const pendingTime = await env.CHAT_KV.get(nudgeKey);
 		if (!pendingTime) continue;
 		if ((Date.now() - parseInt(pendingTime)) < 30 * 60 * 1000) continue;
-		const logged = await moodStore.hasCheckedInToday(env, chatId, type);
+		const logged = await moodStore.hasCheckedInToday(env, userId, type);
 		if (logged) { await env.CHAT_KV.delete(nudgeKey); continue; }
 		await env.TASK_QUEUE.send({ type: 'med_nudge', period: type, chatId });
 		await env.CHAT_KV.delete(nudgeKey);
@@ -1024,6 +1054,8 @@ async function getUserTimezone(env) {
 export default {
 	async fetch(request, env, ctx) {
 	  try {
+		// Wrap D1 so any failing query logs its full SQL + bindings for debugging
+		env.DB = wrapD1(env.DB);
 		if (!telegram.verifyWebhook(request, env)) {
 			return new Response("Unauthorized", { status: 401 });
 		}
@@ -1060,11 +1092,12 @@ export default {
 
 		if (request.method === "GET" && new URL(request.url).pathname === "/reindex-vectors") {
 			const chatId = Number(env.OWNER_ID);
-			const allMemories = await memoryStore.getMemories(env, chatId, 200);
+			const userId = chatId; // Owner's private chat
+			const allMemories = await memoryStore.getMemories(env, userId, 200);
 			let indexed = 0;
 			for (const m of allMemories) {
 				try {
-					await vectorStore.indexMemory(env, chatId, m.category, m.fact, m.id || Date.now());
+					await vectorStore.indexMemory(env, userId, m.category, m.fact, m.id || Date.now());
 					indexed++;
 				} catch (e) { console.error(`Re-index error for ${m.id}:`, e.message); }
 			}
@@ -1145,7 +1178,7 @@ export default {
 			if (pollCtx) {
 				const score = pa.option_ids?.[0]; // 0-10, maps directly to mood score
 				if (score != null) {
-					task = handleMoodPollAnswer(pollCtx.chatId, pollCtx.threadId, score, env);
+					task = handleMoodPollAnswer(pa.user?.id || pollCtx.chatId, pollCtx.chatId, pollCtx.threadId, score, env);
 				}
 				await env.CHAT_KV.delete(`mood_poll_${pa.poll_id}`);
 			} else {
@@ -1206,6 +1239,7 @@ export default {
 
 	// ---- Queue Consumer: processes LLM-heavy tasks decoupled from cron ----
 	async queue(batch, env) {
+		env.DB = wrapD1(env.DB);
 		for (const msg of batch.messages) {
 			const task = msg.body;
 			try {
@@ -1253,6 +1287,8 @@ export default {
 
 	// eslint-disable-next-line no-unused-vars
 	async scheduled(_event, env, _ctx) {
+		// Wrap D1 so any failing query logs its full SQL for debugging
+		env.DB = wrapD1(env.DB);
 		// ---- Health check-ins: enqueue to task queue instead of running inline ----
 		if (env.OWNER_ID && env.TASK_QUEUE) {
 			try {
@@ -1305,7 +1341,7 @@ export default {
 			const firstName = meta.firstName || "mate";
 			const reason = meta.reason || "Scheduled task";
 
-			const isGroup = r.recipient_chat_id !== r.creator_chat_id;
+			const isGroup = r.chat_id !== r.user_id;
 
 			// Build reminder with native date_time entity for timezone-aware display
 			const prefix = isGroup ? `⏰ ${firstName}, reminder: ` : '⏰ Reminder: ';
@@ -1313,11 +1349,11 @@ export default {
 				`${prefix}${r.text}\nScheduled for: `, r.due_at, `\n\nContext: ${reason}`, 'DT'
 			);
 
-			const personaKey = meta.persona || await env.CHAT_KV.get(`persona_${r.creator_chat_id}`) || 'xaridotis';
+			const personaKey = meta.persona || await env.CHAT_KV.get(`persona_${r.user_id}`) || 'xaridotis';
 			await Promise.all([
-				telegram.sendMessageWithEntities(r.recipient_chat_id, threadId, dtText, entities, env, r.original_message_id),
+				telegram.sendMessageWithEntities(r.chat_id, threadId, dtText, entities, env, r.original_message_id),
 				generateSpeech(r.text, personaKey, env)
-					.then(audio => telegram.sendVoice(r.recipient_chat_id, threadId, audio, env, r.original_message_id))
+					.then(audio => telegram.sendVoice(r.chat_id, threadId, audio, env, r.original_message_id))
 					.catch(e => console.error("Cron voice error:", e.message))
 			]);
 

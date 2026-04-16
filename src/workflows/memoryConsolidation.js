@@ -11,13 +11,14 @@ import { WorkflowEntrypoint } from 'cloudflare:workers';
 export class MemoryConsolidationWorkflow extends WorkflowEntrypoint {
 	async run(event, step) {
 		const chatId = event.payload?.chatId;
-		if (!chatId) throw new Error('Missing chatId in workflow payload');
+		const userId = event.payload?.userId || chatId;
+		if (!userId) throw new Error('Missing userId/chatId in workflow payload');
 
 		// Step 1: Fetch all memories from D1
 		const allMemories = await step.do('fetch-memories', async () => {
 			const { results } = await this.env.DB.prepare(
-				'SELECT id, category, fact, importance_score, created_at FROM memories WHERE chat_id = ? ORDER BY importance_score DESC, created_at DESC LIMIT 200'
-			).bind(chatId).all();
+				'SELECT id, category, fact, importance_score, created_at FROM memories WHERE user_id = ? ORDER BY importance_score DESC, created_at DESC LIMIT 200'
+			).bind(userId).all();
 			return results || [];
 		});
 
@@ -92,11 +93,11 @@ No markdown, no backticks. Just the array.`;
 
 		// Step 3: Batch write to D1 (atomic: delete old + insert consolidated)
 		const writeResult = await step.do('batch-write', async () => {
-			const deleteStmt = this.env.DB.prepare('DELETE FROM memories WHERE chat_id = ?').bind(chatId);
+			const deleteStmt = this.env.DB.prepare('DELETE FROM memories WHERE user_id = ?').bind(userId);
 			const insertStmts = consolidated.map(m =>
 				this.env.DB.prepare(
-					'INSERT INTO memories (chat_id, category, fact, importance_score) VALUES (?, ?, ?, ?)'
-				).bind(chatId, (m.category || 'general').toLowerCase(), m.fact, m.importance || 1)
+					'INSERT INTO memories (user_id, category, fact, importance_score) VALUES (?, ?, ?, ?)'
+				).bind(userId, (m.category || 'general').toLowerCase(), m.fact, m.importance || 1)
 			);
 			await this.env.DB.batch([deleteStmt, ...insertStmts]);
 			return { before: allMemories.length, after: consolidated.length };
@@ -121,10 +122,10 @@ No markdown, no backticks. Just the array.`;
 					const result = await this.env.AI.run(EMBEDDING_MODEL, { text: [truncated] });
 					const vector = result.data[0];
 					await this.env.VECTORIZE.upsert([{
-						id: `mem_${chatId}_${Date.now()}_${indexed}`,
+						id: `mem_${userId}_${Date.now()}_${indexed}`,
 						values: vector,
 						metadata: {
-							chatId: Number(chatId),
+							userId: Number(userId),
 							category: (m.category || 'general').toLowerCase(),
 							fact: m.fact.slice(0, 200),
 						},

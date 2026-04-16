@@ -33,6 +33,7 @@ export const searchResearchTool = {
 	},
 	async execute(args, env, context) {
 		const chatId = context.chatId;
+		const userId = context.userId;
 		const threadId = context.threadId || 'default';
 
 		// Sanitise topic for D1 LIKE query safety
@@ -40,8 +41,8 @@ export const searchResearchTool = {
 
 		if (args.action === 'list') {
 			const { results } = await env.DB.prepare(
-				`SELECT id, fact, category, created_at FROM memories WHERE chat_id = ? AND fact LIKE 'Deep Research%' ORDER BY created_at DESC LIMIT 10`
-			).bind(chatId).all();
+				`SELECT id, fact, category, created_at FROM memories WHERE user_id = ? AND fact LIKE 'Deep Research%' ORDER BY created_at DESC LIMIT 10`
+			).bind(userId).all();
 
 			if (!results?.length) return { status: "empty", message: "No deep research results found yet. Ask me to research any topic and I will investigate it deeply." };
 
@@ -97,8 +98,8 @@ export const searchResearchTool = {
 
 			// Try R2 full report first
 			const { results: refs } = await env.DB.prepare(
-				`SELECT fact FROM memories WHERE chat_id = ? AND category = 'research_ref' AND fact LIKE ? ORDER BY created_at DESC LIMIT 1`
-			).bind(chatId, `%${safeTopic}%`).all();
+				`SELECT fact FROM memories WHERE user_id = ? AND category = 'research_ref' AND fact LIKE ? ORDER BY created_at DESC LIMIT 1`
+			).bind(userId, `%${safeTopic}%`).all();
 
 			let reportText = null;
 
@@ -113,8 +114,8 @@ export const searchResearchTool = {
 			// Fallback: use the D1 summary if no R2 report
 			if (!reportText) {
 				const { results: summaries } = await env.DB.prepare(
-					`SELECT fact FROM memories WHERE chat_id = ? AND fact LIKE ? ORDER BY created_at DESC LIMIT 1`
-				).bind(chatId, `%Deep Research%${safeTopic}%`).all();
+					`SELECT fact FROM memories WHERE user_id = ? AND fact LIKE ? ORDER BY created_at DESC LIMIT 1`
+				).bind(userId, `%Deep Research%${safeTopic}%`).all();
 				if (summaries?.length) {
 					reportText = summaries[0].fact.replace(/^Deep Research \([^)]+\):\s*/, '');
 				}
@@ -135,8 +136,7 @@ export const searchResearchTool = {
 			return {
 				status: "success",
 				topic: searchTopic,
-				report: reportText.slice(0, 10000),
-				truncated: reportText.length > 10000,
+				report: reportText,
 				charCount: reportText.length,
 				instructions: "Present this report in digestible sections. After sharing, ask if the user wants it as audio."
 			};

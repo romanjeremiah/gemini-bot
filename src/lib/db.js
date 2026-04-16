@@ -34,3 +34,64 @@ export function safeLike(input, maxWords = 4) {
 		.slice(0, maxWords)
 		.join(' ');
 }
+
+/**
+ * Wrap a D1 database instance so that every failed query logs the
+ * exact SQL text and bindings that triggered the error.
+ *
+ * Non-invasive: query results are unchanged, only errors get extra logging.
+ *
+ * Usage (at env boundary, e.g. index.js webhook handler):
+ *   env.DB = wrapD1(env.DB);
+ *
+ * @param {D1Database} db
+ * @returns {D1Database} A proxied instance that logs SQL on error
+ */
+export function wrapD1(db) {
+	if (!db || db.__wrapped) return db;
+
+	const wrapped = new Proxy(db, {
+		get(target, prop) {
+			if (prop === '__wrapped') return true;
+			const value = target[prop];
+			if (prop === 'prepare') {
+				return (sql) => {
+					const stmt = value.call(target, sql);
+					return wrapStmt(stmt, sql);
+				};
+			}
+			return typeof value === 'function' ? value.bind(target) : value;
+		}
+	});
+	return wrapped;
+}
+
+function wrapStmt(stmt, sql, binds = []) {
+	return new Proxy(stmt, {
+		get(target, prop) {
+			const value = target[prop];
+			if (prop === 'bind') {
+				return (...args) => {
+					const bound = value.apply(target, args);
+					return wrapStmt(bound, sql, args);
+				};
+			}
+			if (prop === 'run' || prop === 'all' || prop === 'first' || prop === 'raw') {
+				return async (...args) => {
+					try {
+						return await value.apply(target, args);
+					} catch (err) {
+						console.error('[D1_QUERY_ERROR]', {
+							sql: sql?.replace(/\s+/g, ' ').trim().slice(0, 500),
+							binds: binds.map(b => typeof b === 'string' ? b.slice(0, 80) : b),
+							method: prop,
+							message: err?.message,
+						});
+						throw err;
+					}
+				};
+			}
+			return typeof value === 'function' ? value.bind(target) : value;
+		}
+	});
+}

@@ -43,12 +43,12 @@
 	},
 	"workflows": [
 		{
-			"name": "memory-consolidation",
+			"name": "xaridotis-memory-consolidation",
 			"binding": "MEMORY_WORKFLOW",
 			"class_name": "MemoryConsolidationWorkflow"
 		},
 		{
-			"name": "deep-research",
+			"name": "xaridotis-deep-research",
 			"binding": "RESEARCH_WORKFLOW",
 			"class_name": "DeepResearchWorkflow"
 		}

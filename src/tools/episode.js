@@ -55,7 +55,7 @@ WHEN TO USE: After emotional conversations, therapy-like exchanges, significant 
 	},
 	async execute(args, env, context) {
 		const { saveEpisode } = await import('../services/episodeStore');
-		await saveEpisode(env, context.chatId, {
+		await saveEpisode(env, context.userId, {
 			type: args.episode_type,
 			trigger: args.trigger,
 			emotions: args.emotions || [],
@@ -104,7 +104,7 @@ export const updateEpisodeOutcomeTool = {
 	},
 	async execute(args, env, context) {
 		const { updateEpisodeOutcome } = await import('../services/episodeStore');
-		await updateEpisodeOutcome(env, args.episode_id, args.outcome, args.lesson || null);
+		await updateEpisodeOutcome(env, context.userId, args.episode_id, args.outcome, args.lesson || null);
 		return {
 			status: "updated",
 			message: `Episode ${args.episode_id} outcome updated to '${args.outcome}'. This will inform future responses.`

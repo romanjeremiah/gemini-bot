@@ -21,18 +21,18 @@ import * as episodeStore from './episodeStore';
  *
  * Returns a brief plan string that gets prepended to the dynamic context.
  */
-export async function generatePlan(env, chatId, userText, currentMood) {
+export async function generatePlan(env, userId, userText, currentMood) {
 	try {
 		// Get procedural insights (what worked/didn't)
-		const insights = await episodeStore.getProceduralInsights(env, chatId);
+		const insights = await episodeStore.getProceduralInsights(env, userId);
 		const proceduralCtx = episodeStore.formatProceduralContext(insights);
 
 		// Get recent episodes for pattern recognition
-		const recentEps = await episodeStore.getRecentEpisodes(env, chatId, 5);
+		const recentEps = await episodeStore.getRecentEpisodes(env, userId, 5);
 		const episodeCtx = episodeStore.formatEpisodesForContext(recentEps, 800);
 
 		// Get any pending follow-ups
-		const pending = await episodeStore.getPendingEpisodes(env, chatId, 3);
+		const pending = await episodeStore.getPendingEpisodes(env, userId, 3);
 		const pendingCtx = pending.length
 			? `PENDING FOLLOW-UPS (check if these resolved):\n${pending.map(p =>
 				`- [${p.episode_type}] ${p.trigger_context?.slice(0, 60)} (intervention: ${p.intervention?.slice(0, 60)})`

@@ -82,7 +82,7 @@ IMPORTANT: If mood_score is 0-1 or 9-10, this is a clinical concern. Always ackn
 		// Auto-link the latest uploaded photo if requested
 		let photoKey = null;
 		if (args.link_latest_photo && env.MEDIA_BUCKET) {
-			const recent = await mediaStore.listMedia(env, context.chatId, 'image', 1);
+			const recent = await mediaStore.listMedia(env, context.userId, 'image', 1);
 			if (recent?.length) photoKey = recent[0].key;
 		}
 
@@ -99,7 +99,7 @@ IMPORTANT: If mood_score is 0-1 or 9-10, this is a clinical concern. Always ackn
 			ai_observation: args.ai_observation || null,
 			photo_r2_key: photoKey,
 		};
-		const entry = await moodStore.upsertEntry(env, context.chatId, date, args.entry_type || 'evening', data);
+		const entry = await moodStore.upsertEntry(env, context.userId, date, args.entry_type || 'evening', data);
 		console.log(`📊 Mood logged: ${date} ${args.entry_type} score=${args.mood_score}`);
 
 		// Dynamic feedback: tell the AI what's still missing
@@ -149,7 +149,7 @@ When presenting analysis, cite relevant clinical frameworks:
 		}
 	},
 	async execute(args, env, context) {
-		const entries = await moodStore.getHistory(env, context.chatId, args.days || 14, args.entry_type || null);
+		const entries = await moodStore.getHistory(env, context.userId, args.days || 14, args.entry_type || null);
 		if (!entries.length) return { status: "success", entries: [], message: "No mood data recorded yet." };
 		// Parse JSON fields for the AI
 		const parsed = entries.map(e => ({

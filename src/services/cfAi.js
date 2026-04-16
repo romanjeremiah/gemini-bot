@@ -127,3 +127,62 @@ If no duplicates found, write: DUPLICATES: none`,
 }
 
 export { MODELS };
+
+
+/**
+ * Interpret a user's emoji reaction in the context of the bot message they reacted to.
+ * Returns a short feedback insight or null if the reaction carries no useful signal.
+ *
+ * Uses the balanced 8B model for nuance — the 1B model struggles with emoji semantics.
+ *
+ * @param {object} env - Worker env with AI binding
+ * @param {string} emoji - The reaction emoji (e.g. '👍', '🤔', '💯')
+ * @param {string} botMessageText - Plain text of the message that was reacted to
+ * @returns {Promise<{insight: string, sentiment: 'positive'|'negative'|'neutral'} | null>}
+ */
+export async function interpretReaction(env, emoji, botMessageText) {
+	if (!emoji || !botMessageText) return null;
+
+	const prompt = `The user reacted with ${emoji} to this message you (the bot) sent them:
+"${botMessageText.slice(0, 280)}"
+
+Extract ONE concise meta-behavioural rule about how the user prefers you to communicate.
+Focus on: tone, length, phrasing, directness, humour, clinical vocabulary, formatting.
+Ignore the topic itself — focus on HOW the message was written.
+
+Output format (strict): one line only, under 100 characters.
+Start with "User" and a verb (liked/disliked/preferred/appreciated/etc).
+Example: "User appreciated the short, non-clinical tone"
+Example: "User disliked the framework name-drop"
+Example: "User found the lecturing repetitive"
+
+If the reaction is ambiguous or carries no useful signal, respond with exactly: SKIP`;
+
+	const response = await cfAiGenerate(
+		env,
+		MODELS.balanced,
+		prompt,
+		'You extract communication preferences from user reactions. Be specific about HOW the user prefers the bot to communicate, not what the topic was. Return ONE line only.'
+	);
+
+	if (!response || response.trim() === 'SKIP') return null;
+
+	// Take the first non-empty line, clean it up
+	const insight = response
+		.split('\n')
+		.map(l => l.trim())
+		.find(l => l.length > 10 && l.length < 200);
+
+	if (!insight || !/^user\s/i.test(insight)) return null;
+
+	// Quick sentiment classification from the insight wording
+	const lower = insight.toLowerCase();
+	const negative = /(dislike|disliked|found.+(repetitive|annoying|robotic|clinical)|too\s(long|much|clinical)|complained|preferred\s(less|shorter)|criticised|criticized)/;
+	const positive = /(liked|appreciated|enjoyed|loved|found.+(helpful|natural|warm)|preferred\s(more|this)|welcomed)/;
+
+	let sentiment = 'neutral';
+	if (negative.test(lower)) sentiment = 'negative';
+	else if (positive.test(lower)) sentiment = 'positive';
+
+	return { insight: insight.slice(0, 150), sentiment };
+}

@@ -6,11 +6,12 @@ import * as memoryStore from '../services/memoryStore';
 import * as vectorStore from '../services/vectorStore';
 import * as mediaStore from '../services/mediaStore';
 import { uploadToFilesAPI, shouldUseFilesAPI } from '../services/filesApi';
-import { upsertUser, buildUserIdentity } from '../services/userStore';
+import { upsertUser, buildUserIdentity, getStyleCard } from '../services/userStore';
 import { generateSpeech } from '../lib/tts';
 import { buildChecklistText } from '../tools/checklist';
 import * as moodStore from '../services/moodStore';
 import * as episodeStore from '../services/episodeStore';
+import * as personaStore from '../services/personaStore';
 import { safeLike } from '../lib/db';
 import { getAllSchedules, setSchedule, resetSchedule } from '../config/schedules';
 import { log } from '../lib/logger';
@@ -38,26 +39,94 @@ function stripLeakedThoughts(text) {
 		.trim();
 }
 
-/** Split long text into chunks at paragraph boundaries, respecting a max length */
+/** Split long text into chunks at paragraph boundaries, preserving HTML tag state across chunks */
 function splitMessage(text, maxLen = 3900) {
+	if (text.length <= maxLen) return [text];
+
 	const chunks = [];
 	let remaining = text;
-	while (remaining.length > maxLen) {
-		// Try to split at a double newline (paragraph break)
-		let splitIdx = remaining.lastIndexOf('\n\n', maxLen);
-		if (splitIdx < maxLen * 0.3) {
-			// No good paragraph break, try single newline
-			splitIdx = remaining.lastIndexOf('\n', maxLen);
+	let openTags = []; // stack of tags open at the end of previous chunk
+
+	while (remaining.length > 0) {
+		// Re-open tags from previous chunk
+		const reopenPrefix = openTags.map(t => `<${t}>`).join('');
+		const effectiveMax = maxLen - reopenPrefix.length;
+		let piece = reopenPrefix + remaining;
+
+		if (piece.length <= maxLen) {
+			chunks.push(piece);
+			break;
 		}
-		if (splitIdx < maxLen * 0.3) {
-			// No good newline, hard split at maxLen
-			splitIdx = maxLen;
+
+		// Find split point at paragraph boundary
+		let splitIdx = piece.lastIndexOf('\n\n', maxLen);
+		if (splitIdx < maxLen * 0.3) splitIdx = piece.lastIndexOf('\n', maxLen);
+		if (splitIdx < maxLen * 0.3) splitIdx = maxLen;
+
+		let chunk = piece.slice(0, splitIdx).trim();
+		remaining = piece.slice(splitIdx).trim();
+		// Remove the reopenPrefix from remaining since we sliced from `piece`
+		if (reopenPrefix && remaining.startsWith(reopenPrefix)) {
+			remaining = remaining.slice(reopenPrefix.length);
 		}
-		chunks.push(remaining.slice(0, splitIdx).trim());
-		remaining = remaining.slice(splitIdx).trim();
+
+		// Track open/close tags in this chunk to know what to reopen next
+		openTags = getOpenTags(chunk);
+
+		// Close any tags left open at end of this chunk
+		const closers = [...openTags].reverse().map(t => {
+			const tagName = t.split(/\s/)[0]; // handle <blockquote expandable>
+			return `</${tagName}>`;
+		}).join('');
+		chunk += closers;
+
+		chunks.push(chunk);
 	}
-	if (remaining) chunks.push(remaining);
 	return chunks;
+}
+
+/** Parse HTML to find which tags are still open at the end of a string */
+function getOpenTags(html) {
+	const stack = [];
+	const tagRegex = /<\/?([a-z0-9-]+)(?:\s+[^>]*?)?>/gi;
+	let match;
+	while ((match = tagRegex.exec(html)) !== null) {
+		const fullTag = match[0];
+		const tagName = match[1].toLowerCase();
+		const isClosing = fullTag.startsWith('</');
+		if (fullTag.endsWith('/>')) continue;
+		if (isClosing) {
+			if (stack.length > 0 && stack[stack.length - 1].split(/\s/)[0] === tagName) stack.pop();
+		} else {
+			// Store full opening tag content (e.g. "blockquote expandable")
+			const inner = fullTag.slice(1, -1).trim(); // strip < >
+			stack.push(inner);
+		}
+	}
+	return stack;
+}
+
+/**
+ * Send a long message as multiple chunks with rate-limit-safe delays.
+ * Returns the message_id of the last sent message.
+ */
+async function sendLongMessage(chatId, threadId, text, env, replyId = null, finalMarkup = null, bizConnId = null) {
+	const chunks = splitMessage(text, 3900);
+	let lastMsgId = null;
+	for (let i = 0; i < chunks.length; i++) {
+		const isFirst = i === 0;
+		const isLast = i === chunks.length - 1;
+		// Small delay between chunks to avoid Telegram rate limits (30 msg/sec per chat)
+		if (i > 0) await new Promise(r => setTimeout(r, 120));
+		const sent = await telegram.sendMessage(
+			chatId, threadId, chunks[i], env,
+			isFirst ? replyId : null,
+			isLast ? finalMarkup : undefined,
+			null, null, bizConnId
+		);
+		if (sent?.result?.message_id) lastMsgId = sent.result.message_id;
+	}
+	return lastMsgId;
 }
 
 const THERAPEUTIC_CATEGORIES = ['pattern', 'trigger', 'avoidance', 'schema', 'growth', 'coping', 'insight', 'homework'];
@@ -91,10 +160,10 @@ function detectComplexTask(text) {
 
 // Silent Observation: Xaridotis quietly reflects on conversations to learn about the user
 // implicitly. Runs in the background after substantive exchanges. Throttled to max 5/day.
-async function silentObservation(env, chatId, userText, botResponse) {
+async function silentObservation(env, userId, chatId, userText, botResponse) {
 	// Throttle: max 5 observations per day
 	const today = new Date().toISOString().split('T')[0];
-	const countKey = `observation_count_${chatId}_${today}`;
+	const countKey = `observation_count_${userId}_${today}`;
 	const count = parseInt(await env.CHAT_KV.get(countKey) || '0');
 	if (count >= 5) return;
 
@@ -107,9 +176,9 @@ async function silentObservation(env, chatId, userText, botResponse) {
 			const obsMatch = response.match(/OBSERVATION:\s*(.+)/);
 			if (obsMatch && obsMatch[1].trim().length > 10) {
 				const observation = obsMatch[1].trim();
-				await memoryStore.saveMemory(env, chatId, 'insight', `Implicit: ${observation}`, 1, chatId);
+				await memoryStore.saveMemory(env, userId, 'insight', `Implicit: ${observation}`, 1);
 				await env.CHAT_KV.put(countKey, String(count + 1), { expirationTtl: 86400 });
-				log.info('silent_observation', { chatId, observation: observation.slice(0, 80) });
+				log.info('silent_observation', { userId, observation: observation.slice(0, 80) });
 			}
 		}
 
@@ -121,11 +190,11 @@ async function silentObservation(env, chatId, userText, botResponse) {
 				const triple = `${subject.trim()} | ${predicate.trim()} | ${object.trim()}`;
 				// Avoid duplicates: check if this triple already exists
 				const existing = await env.DB.prepare(
-					`SELECT id FROM memories WHERE chat_id = ? AND category = 'triple' AND fact = ? LIMIT 1`
-				).bind(chatId, triple).first();
+					`SELECT id FROM memories WHERE user_id = ? AND category = 'triple' AND fact = ? LIMIT 1`
+				).bind(userId, triple).first();
 				if (!existing) {
-					await memoryStore.saveMemory(env, chatId, 'triple', triple, 1, chatId);
-					log.info('triple_extracted', { chatId, triple });
+					await memoryStore.saveMemory(env, userId, 'triple', triple, 1);
+					log.info('triple_extracted', { userId, triple });
 				}
 			}
 		}
@@ -148,7 +217,7 @@ Create a structured episode record. Respond with ONLY valid JSON (no markdown):
 				if (episodeResponse) {
 					const cleaned = episodeResponse.replace(/```json|```/g, '').trim();
 					const ep = JSON.parse(cleaned);
-					await episodeStore.saveEpisode(env, chatId, {
+					await episodeStore.saveEpisode(env, userId, {
 						type: ep.type || 'conversation',
 						trigger: ep.trigger,
 						emotions: ep.emotions || [],
@@ -156,7 +225,7 @@ Create a structured episode record. Respond with ONLY valid JSON (no markdown):
 						outcome: ep.outcome,
 						lesson: ep.lesson,
 					});
-					log.info('auto_episode_saved', { chatId, type: ep.type, trigger: ep.trigger?.slice(0, 60) });
+					log.info('auto_episode_saved', { userId, type: ep.type, trigger: ep.trigger?.slice(0, 60) });
 				}
 			} catch { /* episode creation is best-effort */ }
 		}
@@ -178,10 +247,10 @@ Only extract concrete, factual relationships. If nothing new, return [].`,
 				const { saveTriple } = await import('../services/knowledgeGraph');
 				for (const t of triples.slice(0, 5)) {
 					if (t.subject && t.predicate && t.object) {
-						await saveTriple(env, chatId, t.subject, t.predicate, t.object, null, 'conversation');
+						await saveTriple(env, userId, t.subject, t.predicate, t.object, null, 'conversation');
 					}
 				}
-				if (triples.length) log.info('graph_triples_extracted', { chatId, count: triples.length });
+				if (triples.length) log.info('graph_triples_extracted', { userId, count: triples.length });
 			}
 		} catch { /* triple extraction is best-effort */ }
 
@@ -203,9 +272,9 @@ async function getWeatherContext(env) {
 }
 
 // Helper: build a dynamic journal roadmap by checking what's missing in today's DB entry
-async function getCheckinRoadmap(env, chatId) {
+async function getCheckinRoadmap(env, userId) {
 	const todayLondon = moodStore.todayLondon();
-	const entry = await moodStore.getEntry(env, chatId, todayLondon, 'evening');
+	const entry = await moodStore.getEntry(env, userId, todayLondon, 'evening');
 	const missing = [];
 	if (!entry || entry.mood_score === null) missing.push('mood score (0-10)');
 	if (!entry || entry.sleep_hours === null) missing.push('sleep hours and quality');
@@ -224,7 +293,9 @@ POLLS: You are encouraged to use the send_poll tool when asking about emotions o
 }
 
 function getPersona(key) {
-	return personas[key] ? key : "tenon";
+	// Resolve to a valid persona key. Custom personas fall back to their base.
+	if (personas[key]) return key;
+	return 'xaridotis';
 }
 
 function sanitizeHistory(hist) {
@@ -278,15 +349,38 @@ async function handleCommand(command, msg, env) {
 			await telegram.sendMessage(chatId, threadId, `Hey. I am <b>Xaridotis</b>.\n\nSend a message, voice note, photo, or document to begin.\n\n<b>Commands:</b>\n/mood — Interactive mood check-in\n/listen — Deep listening mode\n/architect — Architecture review\n/schedule — View schedules\n/memories — View saved facts\n/clear — Fresh start\n/forget — Delete all memories`, env);
 			return true;
 		}
-		case "/persona":
-			await telegram.sendMessage(chatId, threadId, "You are talking to <b>Xaridotis</b>. I adapt my tone naturally based on the conversation. No switching needed.\n\nIf you want to explicitly set a tone, just tell me: \"be direct\" or \"be gentle\".", env);
+		case "/persona": {
+			const allPersonas = await personaStore.getAllPersonas(env, msg.from.id);
+			if (!allPersonas.length) {
+				await telegram.sendMessage(chatId, threadId, "No personas configured. Send a message to get started.", env);
+				return true;
+			}
+			const currentKey = await env.CHAT_KV.get(`persona_${chatId}_${threadId}`) || 'xaridotis';
+			let text = '<b>Available Personas</b>\n\n';
+			for (const p of allPersonas) {
+				const active = p.persona_key === currentKey ? ' (active)' : '';
+				const custom = p.is_custom ? ' [custom]' : '';
+				text += `${p.display_name || p.persona_key}${active}${custom}\n`;
+				text += `<i>${p.tone} · ${p.formality} · ${p.voice_name || 'default voice'}</i>\n\n`;
+			}
+			const buttons = allPersonas.map(p => ({
+				text: `${p.persona_key === currentKey ? '● ' : ''}${p.display_name || p.persona_key}`,
+				callback_data: `set_persona_${p.persona_key}`
+			}));
+			// Arrange buttons in rows of 2
+			const rows = [];
+			for (let i = 0; i < buttons.length; i += 2) {
+				rows.push(buttons.slice(i, i + 2));
+			}
+			await telegram.sendMessage(chatId, threadId, text, env, null, { inline_keyboard: rows });
 			return true;
+		}
 		case "/clear":
 			await env.CHAT_KV.delete(`chat_${chatId}_${threadId}`);
 			await telegram.sendMessage(chatId, threadId, "🧹 Conversation history cleared. What is on your mind?", env);
 			return true;
 		case "/memories": {
-			const mems = await memoryStore.getMemories(env, chatId, 40);
+			const mems = await memoryStore.getMemories(env, msg.from.id, 40);
 			if (!mems.length) { await telegram.sendMessage(chatId, threadId, "📭 No memories saved.", env); return true; }
 			const factual = {}, therapeutic = {};
 			for (const m of mems) {
@@ -312,12 +406,8 @@ async function handleCommand(command, msg, env) {
 					t += "\n";
 				}
 			}
-			// Safety: split into chunks if still too long
 			const footer = "<i>Use /forget to clear all.</i>";
-			if (t.length + footer.length > 4000) {
-				t = t.slice(0, 3900) + "\n\n<i>...truncated. Too many memories to display.</i>\n";
-			}
-			await telegram.sendMessage(chatId, threadId, t + footer, env);
+			await sendLongMessage(chatId, threadId, t + footer, env);
 			return true;
 		}
 		case "/forget":
@@ -440,8 +530,8 @@ async function handleCommand(command, msg, env) {
 			const searchTopic = (msg.text || '').replace('/researchfull', '').trim();
 			try {
 				// Find research references in D1
-				let query = `SELECT fact FROM memories WHERE chat_id = ? AND category = 'research_ref'`;
-				const params = [chatId];
+				let query = `SELECT fact FROM memories WHERE user_id = ? AND category = 'research_ref'`;
+				const params = [msg.from.id];
 				if (searchTopic) {
 					query += ` AND fact LIKE ?`;
 					params.push(`%${safeLike(searchTopic)}%`);
@@ -482,24 +572,9 @@ async function handleCommand(command, msg, env) {
 				}
 
 				const fullReport = await obj.text();
-				// Split into chunks if too long for Telegram (4096 char limit)
-				const chunks = [];
 				const topicLabel = results[0].fact.match(/Topic:\s*(.+)$/)?.[1] || 'Research';
-				const header = `<b>Full Research Report</b>\n<i>${topicLabel}</i>\n\n`;
-				let remaining = fullReport;
-				let isFirst = true;
-				while (remaining.length > 0) {
-					const maxLen = isFirst ? (4000 - header.length) : 4000;
-					chunks.push((isFirst ? header : '') + remaining.slice(0, maxLen));
-					remaining = remaining.slice(maxLen);
-					isFirst = false;
-				}
-				for (const chunk of chunks.slice(0, 5)) { // Max 5 messages
-					await telegram.sendMessage(chatId, threadId, chunk, env);
-				}
-				if (chunks.length > 5) {
-					await telegram.sendMessage(chatId, threadId, `<i>...report truncated (${chunks.length} parts, showing first 5)</i>`, env);
-				}
+				const formatted = `<b>Full Research Report</b>\n<i>${topicLabel}</i>\n\n<blockquote expandable>${fullReport}</blockquote>`;
+				await sendLongMessage(chatId, threadId, formatted, env);
 			} catch (e) {
 				await telegram.sendMessage(chatId, threadId, `Error: ${e.message?.slice(0, 100)}`, env);
 			}
@@ -512,8 +587,8 @@ async function handleCommand(command, msg, env) {
 			}
 			try {
 				const { results } = await env.DB.prepare(
-					`SELECT fact, category, created_at FROM memories WHERE chat_id = ? AND fact LIKE 'Deep Research%' ORDER BY created_at DESC LIMIT 10`
-				).bind(chatId).all();
+					`SELECT fact, category, created_at FROM memories WHERE user_id = ? AND fact LIKE 'Deep Research%' ORDER BY created_at DESC LIMIT 10`
+				).bind(msg.from.id).all();
 
 				if (!results?.length) {
 					await telegram.sendMessage(chatId, threadId, "No deep research results found yet. Use <code>/research your topic</code> to start one.", env);
@@ -529,9 +604,8 @@ async function handleCommand(command, msg, env) {
 					text += `<b>${date}</b> [${r.category}]\n<i>${topic}</i>\n${summary}${summary.length >= 200 ? '...' : ''}\n\n`;
 				}
 
-				// Safety: truncate if too long for Telegram
-				if (text.length > 4000) text = text.slice(0, 3900) + '\n\n<i>...truncated</i>';
-				await telegram.sendMessage(chatId, threadId, text, env);
+				// Safety: use sendLongMessage for overflow
+				await sendLongMessage(chatId, threadId, text, env);
 			} catch (e) {
 				await telegram.sendMessage(chatId, threadId, `Error fetching research history: ${e.message?.slice(0, 100)}`, env);
 			}
@@ -647,7 +721,7 @@ Be bold. Reference actual file paths.` }] }],
 					await update('<i>Step 4/4: Saving to memory and preparing final output...</i>');
 
 					const today = new Date().toISOString().split('T')[0];
-					await memoryStore.saveMemory(env, chatId, 'discovery', `Architect review (${today}): ${suggestions.slice(0, 500)}`, 1, chatId);
+					await memoryStore.saveMemory(env, msg.from.id, 'discovery', `Architect review (${today}): ${suggestions.slice(0, 500)}`, 1);
 
 					const finalText = stripLeakedThoughts(suggestions).slice(0, 3900);
 					const btns = { inline_keyboard: [[
@@ -698,6 +772,7 @@ Be bold. Reference actual file paths.` }] }],
 
 export async function handleMessage(msg, env) {
 	const chatId = msg.chat.id, messageId = msg.message_id, threadId = msg.message_thread_id || "default";
+	const userId = msg.from?.id;
 	const replyToMessageId = msg.reply_to_message?.message_id || null;
 	const bizConnId = msg.business_connection_id || null;
 
@@ -749,8 +824,8 @@ export async function handleMessage(msg, env) {
 		const isSubstantive = userText.length > 15 || userText.includes('?') || hasMedia;
 
 		const [memCtx, semanticCtx, personaKey, rawHistory] = await Promise.all([
-			isSubstantive ? memoryStore.getFormattedContext(env, chatId) : Promise.resolve(''),
-			isSubstantive ? vectorStore.getSemanticContext(env, chatId, userText) : Promise.resolve(''),
+			isSubstantive ? memoryStore.getFormattedContext(env, userId) : Promise.resolve(''),
+			isSubstantive ? vectorStore.getSemanticContext(env, userId, userText) : Promise.resolve(''),
 			env.CHAT_KV.get(`persona_${chatId}_${threadId}`),
 			env.CHAT_KV.get(`chat_${chatId}_${threadId}`, { type: "json" })
 		]);
@@ -759,7 +834,7 @@ export async function handleMessage(msg, env) {
 		const hist = sanitizeHistory(rawHistory || []);
 
 		// Model routing: check for manual override in KV, otherwise default to Owner=Pro / Guest=Flash
-		const isOwner = env.OWNER_ID && String(msg.from.id) === String(env.OWNER_ID);
+		const isOwner = env.OWNER_ID && String(userId) === String(env.OWNER_ID);
 
 		// Check health check-in state early (needed for model selection + context gating)
 		const healthCheckin = isOwner ? await env.CHAT_KV.get(`health_checkin_active_${chatId}`) : null;
@@ -779,7 +854,10 @@ export async function handleMessage(msg, env) {
 			if (needsPro) log.info('model_upgrade', { reason: 'complex_task', model: textModel });
 		}
 
-		const effectivePersona = 'xaridotis';
+		const effectivePersona = activePersona;
+
+		// Fetch per-user persona config from D1 (voice, tone, evolved traits)
+		const personaConfig = await personaStore.getPersona(env, userId, effectivePersona).catch(() => null);
 
 		// If the user is clearly NOT engaging with a health check-in, clear the flag
 		const isHealthRelated = /sleep|mood|medication|medic|anxious|anxiety|depressed|how.*feel|emotion|check.?in/i.test(userText);
@@ -794,7 +872,7 @@ export async function handleMessage(msg, env) {
 		// Build dynamic journal roadmap for evening check-ins
 		let checkinProgress = '';
 		if (currentCheckin === 'evening') {
-			const roadmap = await getCheckinRoadmap(env, chatId);
+			const roadmap = await getCheckinRoadmap(env, userId);
 			if (roadmap.includes('All data collected')) {
 				checkinProgress = ` | ${roadmap}`;
 				env.CHAT_KV.delete(`health_checkin_active_${chatId}`);
@@ -808,7 +886,14 @@ export async function handleMessage(msg, env) {
 		let replyContext = "";
 		if (msg.reply_to_message) replyContext = `\n[User is replying to ${msg.reply_to_message.from?.first_name || "Someone"}: "${(msg.reply_to_message.text || msg.reply_to_message.caption || "").slice(0, 500)}"]\n`;
 
-		const personaInstruction = personas[effectivePersona].instruction;
+		// Resolve the base persona instruction (built-in definition)
+		const basePersonaKey = personaConfig?.base_persona || effectivePersona;
+		const personaInstruction = personas[basePersonaKey]?.instruction || personas.xaridotis.instruction;
+
+		// Build per-user persona traits overlay
+		const personaTraits = personaStore.buildPersonaTraits(personaConfig);
+		const customInstruction = personaConfig?.custom_instruction || '';
+
 		const weatherCtx = await getWeatherContext(env);
 
 		// Familiarity Index: track relationship length
@@ -828,8 +913,8 @@ export async function handleMessage(msg, env) {
 		if (isEmotionalMsg) {
 			// Run all CoALA D1 queries in parallel (single round-trip instead of 5 sequential)
 			const [episodes, insights] = await Promise.all([
-				episodeStore.getRecentEpisodes(env, chatId, 5).catch(() => []),
-				episodeStore.getProceduralInsights(env, chatId).catch(() => ({ worked: [], didntWork: [] })),
+				episodeStore.getRecentEpisodes(env, userId, 5).catch(() => []),
+				episodeStore.getProceduralInsights(env, userId).catch(() => ({ worked: [], didntWork: [] })),
 			]);
 
 			episodeCtx = episodeStore.formatEpisodesForContext(episodes);
@@ -838,7 +923,7 @@ export async function handleMessage(msg, env) {
 			// Planning step uses the already-fetched data (no extra D1 calls)
 			if (isOwner && (episodes.length || insights.worked.length || insights.didntWork.length)) {
 				const { generatePlan } = await import('../services/planner');
-				const plan = await generatePlan(env, chatId, userText, null).catch(() => null);
+				const plan = await generatePlan(env, userId, userText, null).catch(() => null);
 				if (plan) planCtx = `\nACTION PLAN (your internal reasoning, do NOT share this with the user):\n${plan}`;
 			}
 		}
@@ -851,7 +936,7 @@ export async function handleMessage(msg, env) {
 			const keywords = userText.match(/\b[A-Za-z]{4,}\b/g)?.slice(0, 3) || [];
 			const graphResults = [];
 			for (const kw of keywords) {
-				const triples = await queryRelated(env, chatId, kw, 5).catch(() => []);
+				const triples = await queryRelated(env, userId, kw, 5).catch(() => []);
 				graphResults.push(...triples);
 			}
 			// Deduplicate by ID
@@ -860,12 +945,17 @@ export async function handleMessage(msg, env) {
 			graphCtx = formatGraphContext(unique);
 		}
 
-		const dynamicContext = `[Context] Current speaker: ${userIdentity} | London Time: ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London" })} | Unix: ${Math.floor(Date.now() / 1000)}${weatherCtx ? ` | ${weatherCtx}` : ''} | Relationship: ${daysKnown} days${checkinProgress}\n\nMEMORY:\n${memCtx}${semanticCtx}${episodeCtx ? `\n\n${episodeCtx}` : ''}${proceduralCtx ? `\n\n${proceduralCtx}` : ''}${graphCtx ? `\n\n${graphCtx}` : ''}${planCtx}`;
+		// Load the user's style card (communication preferences, interests, subjective opinions).
+		// Loaded here so Xaridotis does not have to infer these from scattered memories every turn.
+		const styleCard = await getStyleCard(env, userId);
+		const styleCardSection = styleCard ? `\n\n=== USER STYLE CARD ===\n${styleCard}\n=== END STYLE CARD ===` : '';
+
+		const dynamicContext = `[Context] Current speaker: ${userIdentity} | London Time: ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })} | Unix: ${Math.floor(Date.now() / 1000)}${weatherCtx ? ` | ${weatherCtx}` : ''} | Relationship: ${daysKnown} days | Persona: ${personaConfig?.display_name || effectivePersona}${checkinProgress}${personaTraits ? `\n\nPERSONA TRAITS FOR THIS USER:\n${personaTraits}` : ''}${customInstruction ? `\n\nCUSTOM INSTRUCTION:\n${customInstruction}` : ''}\n\nMEMORY:\n${memCtx}${semanticCtx}${episodeCtx ? `\n\n${episodeCtx}` : ''}${proceduralCtx ? `\n\n${proceduralCtx}` : ''}${graphCtx ? `\n\n${graphCtx}` : ''}${planCtx}`;
 
 		// Skip code execution when media is present (incompatible with audio/video inline data)
 		// Also skip cache when media is present, because the cache has codeExecution baked in
 		const cacheContext = hasMedia ? null : await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, textModel);
-		const fullSysPrompt = `${personaInstruction}\n\n${MENTAL_HEALTH_DIRECTIVE}\n\n${SECOND_BRAIN_DIRECTIVE}\n\n${FORMATTING_RULES}\n${dynamicContext}`;
+		const fullSysPrompt = `${personaInstruction}${styleCardSection}\n\n${MENTAL_HEALTH_DIRECTIVE}\n\n${SECOND_BRAIN_DIRECTIVE}\n\n${FORMATTING_RULES}\n${dynamicContext}`;
 
 		let chat;
 
@@ -921,7 +1011,7 @@ export async function handleMessage(msg, env) {
 				// Store media in R2 (fire-and-forget) — pass raw buffer, no decoding
 				if (env.MEDIA_BUCKET) {
 					const mediaType = media.mimeHint.split('/')[0];
-					mediaStore.storeMedia(env, chatId, mediaType, buffer, media.mimeHint, {
+					mediaStore.storeMedia(env, userId, mediaType, buffer, media.mimeHint, {
 						messageId: String(messageId), filename: media.fileId,
 					}).catch(e => console.error('R2 store error:', e.message));
 				}
@@ -989,7 +1079,8 @@ export async function handleMessage(msg, env) {
 					try {
 						if (name === "send_voice_note") {
 							await telegram.sendChatAction(chatId, threadId, "upload_voice", env);
-							const buf = await generateSpeech(args.text_to_speak, effectivePersona, env);
+							const voiceOverride = personaConfig?.voice_name ? { voice: personaConfig.voice_name, locale: personaConfig.voice_locale || 'en-US' } : null;
+							const buf = await generateSpeech(args.text_to_speak, effectivePersona, env, voiceOverride);
 							await telegram.sendVoice(chatId, threadId, buf, env, messageId);
 						} else if (name === "generate_image") {
 							await telegram.sendChatAction(chatId, threadId, "upload_photo", env);
@@ -1001,7 +1092,7 @@ export async function handleMessage(msg, env) {
 							await env.CHAT_KV.put(`last_img_${chatId}_${threadId}`, JSON.stringify({ prompt: args.prompt }), { expirationTtl: 86400 });
 							// Store generated image in R2
 							if (env.MEDIA_BUCKET) {
-								mediaStore.storeMedia(env, chatId, 'generated', imageBase64, mimeType, {
+								mediaStore.storeMedia(env, userId, 'generated', imageBase64, mimeType, {
 									prompt: args.prompt?.slice(0, 200), messageId: String(messageId),
 								}).catch(e => console.error('R2 gen-image store error:', e.message));
 							}
@@ -1029,18 +1120,7 @@ export async function handleMessage(msg, env) {
 
 					const btns = { inline_keyboard: [[{ text: "🔊 Voice", callback_data: "action_voice" }, { text: "🗑️ Delete", callback_data: "action_delete_msg" }]] };
 
-					// Split long messages to respect Telegram's 4096 char limit
-					if (fullText.length > 3900) {
-						const chunks = splitMessage(fullText, 3900);
-						for (let i = 0; i < chunks.length; i++) {
-							const isLast = i === chunks.length - 1;
-							const sent = await telegram.sendMessage(chatId, threadId, chunks[i], env, i === 0 ? messageId : null, isLast ? btns : undefined, null, null, bizConnId);
-							if (isLast) lastSentMsgId = sent?.result?.message_id;
-						}
-					} else {
-						const sent = await telegram.sendMessage(chatId, threadId, fullText, env, messageId, btns, null, null, bizConnId);
-						lastSentMsgId = sent?.result?.message_id;
-					}
+					lastSentMsgId = await sendLongMessage(chatId, threadId, fullText, env, messageId, btns, bizConnId);
 				}
 			}
 		}
@@ -1077,13 +1157,13 @@ export async function handleMessage(msg, env) {
 
 		// Index conversation in Vectorize for semantic recall (fire-and-forget)
 		if (userText && fullText) {
-			vectorStore.indexConversation(env, chatId, userText, fullText.slice(0, 200), messageId)
+			vectorStore.indexConversation(env, userId, userText, fullText.slice(0, 200), messageId)
 				.catch(e => console.error('Vectorize index error:', e.message));
 		}
 
 		// Index media in Vectorize for multimodal search (fire-and-forget)
 		if (uploadedImageBase64 && uploadedImageMime && fullText) {
-			vectorStore.indexMedia(env, chatId, 'image', uploadedImageBase64, uploadedImageMime, fullText.slice(0, 200), messageId)
+			vectorStore.indexMedia(env, userId, 'image', uploadedImageBase64, uploadedImageMime, fullText.slice(0, 200), messageId)
 				.catch(e => console.error('Vectorize media index error:', e.message));
 		}
 
@@ -1097,7 +1177,7 @@ export async function handleMessage(msg, env) {
 		// Silent Observation: after substantive conversations, Xaridotis quietly reflects
 		// on what it learned about the user implicitly (not just what was explicitly saved)
 		if (userText.length > 30 && fullText.length > 50) {
-			silentObservation(env, chatId, userText, fullText).catch(e =>
+			silentObservation(env, userId, chatId, userText, fullText).catch(e =>
 				log.error('silent_observation_error', { msg: e.message })
 			);
 		}
@@ -1111,6 +1191,7 @@ export async function handleMessage(msg, env) {
 
 export async function handleCallback(callbackQuery, env) {
 	const chatId = callbackQuery.message.chat.id, threadId = callbackQuery.message.message_thread_id || "default";
+	const userId = callbackQuery.from?.id;
 	const data = callbackQuery.data, msgId = callbackQuery.message.message_id;
 	log.info('callback', { chatId, data });
 
@@ -1122,25 +1203,30 @@ export async function handleCallback(callbackQuery, env) {
 
 	if (data.startsWith("set_persona_")) {
 		const key = data.replace("set_persona_", "");
-		if (personas[key]) {
+		// Check built-in personas first, then user's custom personas in D1
+		const isBuiltIn = !!personas[key];
+		const userPersona = !isBuiltIn ? await personaStore.getPersona(env, userId, key) : null;
+		if (isBuiltIn || userPersona) {
 			await env.CHAT_KV.put(`persona_${chatId}_${threadId}`, key);
 			await telegram.editMessageReplyMarkup(chatId, msgId, null, env);
 			await telegram.sendChatAction(chatId, threadId, "typing", env);
+			const displayName = userPersona?.display_name || personas[key]?.name || key;
+			const instruction = userPersona?.custom_instruction || personas[personas[key] ? key : (userPersona?.base_persona || 'xaridotis')]?.instruction || personas.xaridotis.instruction;
 			try {
 				const greeting = await generateShortResponse(
 					"The user just chose to talk to you. Greet them in 1-2 complete sentences in your distinct voice. Let them know you are here and ready.",
-					personas[key].instruction,
+					instruction,
 					env
 				);
 				await telegram.sendMessage(chatId, threadId, greeting, env, null, null, "5159385139981059251");
 			} catch (e) {
-				await telegram.sendMessage(chatId, threadId, `You are now talking to <b>${personas[key].name}</b>.`, env);
+				await telegram.sendMessage(chatId, threadId, `You are now talking to <b>${displayName}</b>.`, env);
 			}
 		}
 	} else if (data === "confirm_forget") {
 		await Promise.all([
-			memoryStore.deleteAllMemories(env, chatId),
-			vectorStore.deleteAllVectors(env, chatId),
+			memoryStore.deleteAllMemories(env, userId),
+			vectorStore.deleteAllVectors(env, userId),
 		]);
 		await telegram.editMessage(chatId, msgId, "🗑️ All memories deleted.", env);
 	} else if (data === "cancel_forget") {
@@ -1158,10 +1244,12 @@ export async function handleCallback(callbackQuery, env) {
 	} else if (data === "action_voice") {
 		const botText = callbackQuery.message.text || "";
 		if (botText) {
-			const voicePersona = getPersona(await env.CHAT_KV.get(`persona_${chatId}_${threadId}`));
+			const voicePersonaKey = getPersona(await env.CHAT_KV.get(`persona_${chatId}_${threadId}`));
+			const voiceConfig = await personaStore.getPersona(env, userId, voicePersonaKey).catch(() => null);
+			const voiceOverride = voiceConfig?.voice_name ? { voice: voiceConfig.voice_name, locale: voiceConfig.voice_locale || 'en-US' } : null;
 			try {
 				await telegram.sendChatAction(chatId, threadId, "upload_voice", env);
-				const audio = await generateSpeech(botText, voicePersona, env);
+				const audio = await generateSpeech(botText, voicePersonaKey, env, voiceOverride);
 				await telegram.sendVoice(chatId, threadId, audio, env, msgId);
 			} catch (e) { console.error("Voice err:", e.message); }
 		}
@@ -1223,17 +1311,13 @@ export async function handleCallback(callbackQuery, env) {
 				{ chatId, threadId, replyToMessageId: msgId }
 			);
 		} else {
-			// Send as text, split into chunks if needed
-			const report = `<b>Research: ${topic}</b>\n\n${result.report}`;
-			const chunks = splitMessage(report, 3900);
+			// Send as text with expandable blockquote for long reports
+			const report = `<b>Research: ${topic}</b>\n\n<blockquote expandable>${result.report}</blockquote>`;
 			const btns = { inline_keyboard: [[
 				{ text: '🔊 Listen', callback_data: `research_audio_${num}` },
 				{ text: '🗑️ Delete', callback_data: 'action_delete_msg' }
 			]] };
-			for (let i = 0; i < chunks.length; i++) {
-				const isLast = i === chunks.length - 1;
-				await telegram.sendMessage(chatId, threadId, chunks[i], env, null, isLast ? btns : undefined);
-			}
+			await sendLongMessage(chatId, threadId, report, env, null, btns);
 		}
 	} else if (data === 'noop') {
 		// Separator row, do nothing
@@ -1311,23 +1395,23 @@ export async function handleCallback(callbackQuery, env) {
 		let contextPrompt = "";
 
 		if (data === 'mood_med_yes_morning') {
-			await moodStore.upsertEntry(env, chatId, today, 'morning', { medication_taken: 1, medication_notes: 'Morning meds taken on time' });
+			await moodStore.upsertEntry(env, userId, today, 'morning', { medication_taken: 1, medication_notes: 'Morning meds taken on time' });
 			contextPrompt = "The user just confirmed they took their morning medication on time. Acknowledge this positively in one short sentence, then ask ONE natural follow-up question about how they slept last night. Do not ask anything else.";
 		} else if (data === 'mood_med_no_morning') {
-			await moodStore.upsertEntry(env, chatId, today, 'morning', { medication_taken: 0, medication_notes: 'Morning meds not taken at check-in' });
+			await moodStore.upsertEntry(env, userId, today, 'morning', { medication_taken: 0, medication_notes: 'Morning meds not taken at check-in' });
 			contextPrompt = "The user just said they haven't taken their morning medication yet. Gently remind them not to skip it, then ask ONE natural follow-up question about how they slept last night.";
 		} else if (data === 'mood_med_yes_midday') {
-			await moodStore.upsertEntry(env, chatId, today, 'midday', { medication_taken: 1, medication_notes: 'ADHD + anxiety meds taken' });
+			await moodStore.upsertEntry(env, userId, today, 'midday', { medication_taken: 1, medication_notes: 'ADHD + anxiety meds taken' });
 			contextPrompt = "The user just confirmed they took their midday ADHD and anxiety medications. Acknowledge this, then ask ONE natural conversational question about how their day is going so far.";
 		} else if (data === 'mood_med_partial_midday') {
-			await moodStore.upsertEntry(env, chatId, today, 'midday', { medication_taken: 1, medication_notes: 'ADHD only, anxiety not taken' });
+			await moodStore.upsertEntry(env, userId, today, 'midday', { medication_taken: 1, medication_notes: 'ADHD only, anxiety not taken' });
 			contextPrompt = "The user just confirmed they took their ADHD medication, but not their anxiety medication. Acknowledge this, remind them anxiety meds are there if they need them, and ask ONE conversational question about how their day is going.";
 		} else if (data === 'mood_med_no_midday') {
-			await moodStore.upsertEntry(env, chatId, today, 'midday', { medication_taken: 0, medication_notes: 'Midday meds not taken' });
+			await moodStore.upsertEntry(env, userId, today, 'midday', { medication_taken: 0, medication_notes: 'Midday meds not taken' });
 			contextPrompt = "The user hasn't taken their midday ADHD medication. Remind them gently that per NICE NG87 guidelines, taking it too late affects sleep, so they should take it soon. Then ask ONE conversational question about their day.";
 		} else if (data.startsWith('mood_score_')) {
 			const score = parseInt(data.split('_')[2]);
-			const entry = await moodStore.upsertEntry(env, chatId, today, 'evening', { mood_score: score });
+			const entry = await moodStore.upsertEntry(env, userId, today, 'evening', { mood_score: score });
 			log.info('mood_score', { chatId, score });
 
 			// Retrieve any checklist items that were ticked before the score was submitted
@@ -1335,7 +1419,7 @@ export async function handleCallback(callbackQuery, env) {
 			const checkedItems = checklistRaw ? JSON.parse(checklistRaw) : [];
 			if (checkedItems.length) {
 				// Save checklist data alongside the mood entry
-				await moodStore.upsertEntry(env, chatId, today, 'evening', {
+				await moodStore.upsertEntry(env, userId, today, 'evening', {
 					med_morning: checkedItems.includes('med_morning'),
 					med_adhd: checkedItems.includes('med_adhd'),
 					med_anxiety: checkedItems.includes('med_anxiety'),
@@ -1469,17 +1553,17 @@ export async function handleCallback(callbackQuery, env) {
 			// Save all emotions to mood journal
 			const today = moodStore.todayLondon();
 			if (selected.length > 0) {
-				await moodStore.upsertEntry(env, chatId, today, 'evening', { emotions: JSON.stringify(selected) });
-				log.info('mood_emotions_logged', { chatId, emotions: selected });
+				await moodStore.upsertEntry(env, userId, today, 'evening', { emotions: JSON.stringify(selected) });
+				log.info('mood_emotions_logged', { userId, emotions: selected });
 
 				// Background: auto-tag mood entry with clinical categories (CF AI, free)
 				import('../services/cfAi').then(async ({ tagMoodEntry }) => {
-					const todayEntry = await moodStore.getEntry(env, chatId, today, 'evening').catch(() => null);
+				const todayEntry = await moodStore.getEntry(env, userId, today, 'evening').catch(() => null);
 					const parsed = todayEntry?.data ? (typeof todayEntry.data === 'string' ? JSON.parse(todayEntry.data) : todayEntry.data) : {};
 					const tags = await tagMoodEntry(env, parsed.mood_score, selected, parsed.note);
 					if (tags) {
-						await moodStore.upsertEntry(env, chatId, today, 'evening', { clinical_tags: tags });
-						log.info('mood_tagged', { chatId, tags });
+						await moodStore.upsertEntry(env, userId, today, 'evening', { clinical_tags: tags });
+						log.info('mood_tagged', { userId, tags });
 					}
 				}).catch(e => console.error('Mood tagging error:', e.message));
 			}
@@ -1493,7 +1577,7 @@ export async function handleCallback(callbackQuery, env) {
 			const posSelected = selected.filter(e => !negativeList.includes(e));
 
 			// Pull recent mood history for context (last 30 days)
-			const recentEntries = await moodStore.getHistory(env, chatId, 30, 'evening').catch(() => []);
+			const recentEntries = await moodStore.getHistory(env, userId, 30, 'evening').catch(() => []);
 			let pastContext = 'No previous check-ins found.';
 			if (recentEntries.length > 1) {
 				const summaries = recentEntries.slice(0, 10).map(e => {
@@ -1505,25 +1589,25 @@ export async function handleCallback(callbackQuery, env) {
 
 			// Pull therapeutic notes for clinical depth
 			const therapeuticNotes = await env.DB.prepare(
-				`SELECT category, fact FROM memories WHERE chat_id = ? AND category IN ('pattern','trigger','schema','insight','homework','growth') ORDER BY created_at DESC LIMIT 10`
-			).bind(chatId).all().then(r => r.results || []).catch(() => []);
+				`SELECT category, fact FROM memories WHERE user_id = ? AND category IN ('pattern','trigger','schema','insight','homework','growth') ORDER BY created_at DESC LIMIT 10`
+			).bind(userId).all().then(r => r.results || []).catch(() => []);
 			const clinicalCtx = therapeuticNotes.length
 				? 'Clinical notes:\n' + therapeuticNotes.map(n => `[${n.category}] ${n.fact}`).join('\n')
 				: '';
 
 			// Pull semantic context related to their current emotions
 			const emotionQuery = [...negSelected, ...posSelected].join(' ') || 'mood emotions feelings';
-			const semanticCtx = await vectorStore.getSemanticContext(env, chatId, emotionQuery).catch(() => '');
+			const semanticCtx = await vectorStore.getSemanticContext(env, userId, emotionQuery).catch(() => '');
 
 			// Pull relevant past episodes (CoALA episodic memory)
 			const allEmotions = [...negSelected, ...posSelected];
 			const relevantEpisodes = allEmotions.length
-				? await episodeStore.getEpisodesByEmotion(env, chatId, allEmotions, 5).catch(() => [])
-				: await episodeStore.getRecentEpisodes(env, chatId, 5).catch(() => []);
+				? await episodeStore.getEpisodesByEmotion(env, userId, allEmotions, 5).catch(() => [])
+				: await episodeStore.getRecentEpisodes(env, userId, 5).catch(() => []);
 			const episodeCtx = episodeStore.formatEpisodesForContext(relevantEpisodes);
 
 			// Today's mood score (pull from the entry we just updated)
-			const todayEntry = await moodStore.getEntry(env, chatId, today, 'evening').catch(() => null);
+			const todayEntry = await moodStore.getEntry(env, userId, today, 'evening').catch(() => null);
 			const todayParsed = todayEntry?.data ? (typeof todayEntry.data === 'string' ? JSON.parse(todayEntry.data) : todayEntry.data) : {};
 			const todayScore = todayParsed.mood_score;
 

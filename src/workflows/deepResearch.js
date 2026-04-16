@@ -11,6 +11,7 @@ import { WorkflowEntrypoint } from 'cloudflare:workers';
 export class DeepResearchWorkflow extends WorkflowEntrypoint {
 	async run(event, step) {
 		const { chatId, topic, manual } = event.payload;
+		const userId = event.payload?.userId || chatId;
 		if (!chatId || !topic) throw new Error('Missing chatId or topic in workflow payload');
 
 		// Step 1: Start the Deep Research agent
@@ -114,13 +115,13 @@ Write as if noting this down for yourself.` }] }],
 			const truncated = `Deep Research (${topic.split(' ').slice(0, 5).join(' ')}): ${insight.slice(0, 500)}`;
 
 			await this.env.DB.prepare(
-				'INSERT INTO memories (chat_id, category, fact, importance_score) VALUES (?, ?, ?, ?)'
-			).bind(chatId, category, truncated, 2).run();
+				'INSERT INTO memories (user_id, category, fact, importance_score) VALUES (?, ?, ?, ?)'
+			).bind(userId, category, truncated, 2).run();
 
 			// Also save the R2 key reference so we can find the full report
 			await this.env.DB.prepare(
-				'INSERT INTO memories (chat_id, category, fact, importance_score) VALUES (?, ?, ?, ?)'
-			).bind(chatId, 'research_ref', `[R2:${reportKey}] Topic: ${topic}`, 0).run();
+				'INSERT INTO memories (user_id, category, fact, importance_score) VALUES (?, ?, ?, ?)'
+			).bind(userId, 'research_ref', `[R2:${reportKey}] Topic: ${topic}`, 0).run();
 
 			console.log(`🧠 Deep Research insight saved: ${category}`);
 			return { insight: truncated, category, reportKey };

@@ -25,7 +25,7 @@ export const memoryTool = {
 	},
 	async execute(args, env, context) {
 		const importance = args.importance || 1;
-		await memoryStore.saveMemory(env, context.chatId, args.category, args.fact, importance, context.userId);
+		await memoryStore.saveMemory(env, context.userId, args.category, args.fact, importance);
 		return { status: "success", category: args.category, importance };
 	}
 };

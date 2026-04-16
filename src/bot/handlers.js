@@ -135,7 +135,7 @@ const THERAPEUTIC_CATEGORIES = ['pattern', 'trigger', 'avoidance', 'schema', 'gr
  * Detect task complexity — returns true if Pro model is needed.
  * Health check-ins use Flash (handled separately by callbacks).
  */
-function detectComplexTask(text) {
+export function detectComplexTask(text) {
 	if (!text) return false;
 
 	// Code/architecture
@@ -779,6 +779,11 @@ export async function handleMessage(msg, env) {
 	// Skip messages from bots (including our own)
 	if (msg.from?.is_bot) return;
 
+	// DIAGNOSTICS: track total elapsed time and last checkpoint.
+	// Helps distinguish waitUntil timeout from generation timeout from setup bottleneck.
+	const _t0 = Date.now();
+	const _elapsed = () => Date.now() - _t0;
+
 	try {
 		const firstName = msg.from.first_name || "User", userText = msg.text || msg.caption || "";
 		log.info('message_received', { chatId, from: firstName, len: userText.length, hasMedia: !!getMediaFromMessage(msg) });
@@ -952,13 +957,35 @@ export async function handleMessage(msg, env) {
 
 		const dynamicContext = `[Context] Current speaker: ${userIdentity} | London Time: ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })} | Unix: ${Math.floor(Date.now() / 1000)}${weatherCtx ? ` | ${weatherCtx}` : ''} | Relationship: ${daysKnown} days | Persona: ${personaConfig?.display_name || effectivePersona}${checkinProgress}${personaTraits ? `\n\nPERSONA TRAITS FOR THIS USER:\n${personaTraits}` : ''}${customInstruction ? `\n\nCUSTOM INSTRUCTION:\n${customInstruction}` : ''}\n\nMEMORY:\n${memCtx}${semanticCtx}${episodeCtx ? `\n\n${episodeCtx}` : ''}${proceduralCtx ? `\n\n${proceduralCtx}` : ''}${graphCtx ? `\n\n${graphCtx}` : ''}${planCtx}`;
 
+		// DIAGNOSTICS: size breakdown — tells us which dynamic section is bloating the prompt
+		log.info('prompt_sizes', {
+			chatId,
+			model: textModel,
+			persona_chars: personaInstruction.length,
+			styleCard_chars: styleCardSection.length,
+			memCtx_chars: memCtx.length,
+			semanticCtx_chars: semanticCtx.length,
+			episodeCtx_chars: episodeCtx.length,
+			proceduralCtx_chars: proceduralCtx.length,
+			graphCtx_chars: graphCtx.length,
+			planCtx_chars: planCtx.length,
+			dynamic_total_chars: dynamicContext.length,
+			hasMedia,
+			isEmotionalMsg,
+			elapsed_ms: _elapsed(),
+		});
+
 		// Skip code execution when media is present (incompatible with audio/video inline data)
 		// Also skip cache when media is present, because the cache has codeExecution baked in
+		const _tCacheStart = Date.now();
 		const cacheContext = hasMedia ? null : await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, textModel);
+		log.info('cache_setup_done', { elapsed_ms: Date.now() - _tCacheStart, hadCache: !!cacheContext, total_elapsed_ms: _elapsed() });
+
 		const fullSysPrompt = `${personaInstruction}${styleCardSection}\n\n${MENTAL_HEALTH_DIRECTIVE}\n\n${SECOND_BRAIN_DIRECTIVE}\n\n${FORMATTING_RULES}\n${dynamicContext}`;
 
 		let chat;
 
+		const _tChatStart = Date.now();
 		try {
 			chat = await createChat(hist, fullSysPrompt, env, cacheContext, textModel, { skipCodeExecution: hasMedia });
 		} catch (cacheErr) {
@@ -970,6 +997,7 @@ export async function handleMessage(msg, env) {
 				throw cacheErr;
 			}
 		}
+		log.info('chat_ready', { elapsed_ms: Date.now() - _tChatStart, total_elapsed_ms: _elapsed(), model: textModel });
 
 		let userParts = [];
 		if (cacheContext) {
@@ -1033,18 +1061,34 @@ export async function handleMessage(msg, env) {
 		let isFirstPass = true;
 
 		// Pro→Flash fallback: if Pro fails with overload/rate-limit, retry with Flash
+		let _passIndex = 0;
 		const runGenerateLoop = async () => {
 		while (!isComplete) {
 			// First pass with no tool calls: use streaming for animated text
 			// Tool-calling passes: use non-streaming (need complete response for function call/response pairs)
 			const useStreaming = isFirstPass;
+
+			// DIAGNOSTICS: mark start of generation call — if we never see generation_complete
+			// for this pass, it means the model call itself hung or was cancelled mid-stream.
+			const _tGenStart = Date.now();
+			_passIndex++;
+			log.info('generation_start', {
+				chatId,
+				pass: _passIndex,
+				streaming: useStreaming,
+				model: textModel,
+				total_elapsed_ms: _elapsed(),
+			});
+
 			const stream = useStreaming
 				? sendChatMessageStream(chat, nextMessage)
 				: sendChatMessage(chat, nextMessage);
 
 			let passText = "", toolCalls = [];
+			let _firstChunkTime = null;
 
 			for await (const chunk of stream) {
+				if (_firstChunkTime === null) _firstChunkTime = Date.now();
 				if (chunk.type === 'text') {
 					passText += chunk.text;
 					fullText += chunk.text;
@@ -1066,6 +1110,17 @@ export async function handleMessage(msg, env) {
 					toolCalls.push(...chunk.calls);
 				}
 			}
+
+			// DIAGNOSTICS: generation pass finished (may loop again if tool calls present)
+			log.info('generation_complete', {
+				chatId,
+				pass: _passIndex,
+				elapsed_ms: Date.now() - _tGenStart,
+				ttfb_ms: _firstChunkTime ? _firstChunkTime - _tGenStart : null,
+				response_chars: passText.length,
+				tool_calls: toolCalls.length,
+				total_elapsed_ms: _elapsed(),
+			});
 
 			isFirstPass = false;
 
@@ -1182,8 +1237,14 @@ export async function handleMessage(msg, env) {
 			);
 		}
 
+		// DIAGNOSTICS: handler completed successfully — total time from message_received to here.
+		// If we never see this log but we see message_received, we know the handler never reached
+		// its exit point before waitUntil killed it.
+		log.info('handler_end', { chatId, total_elapsed_ms: _elapsed(), outcome: 'success' });
+
 	} catch (err) {
 		console.error("❌ handleMessage crash:", err.message, err.stack);
+		log.error('handler_end', { chatId, total_elapsed_ms: _elapsed(), outcome: 'crash', msg: err.message, stack: err.stack?.slice(0, 300) });
 		try { await telegram.sendMessage(chatId, threadId, `⚠️ ${err.message?.slice(0, 150) || "Unknown error"}`, env, messageId, null, null, null, bizConnId); }
 		catch (sendErr) { console.error("❌ Failed to send error msg:", sendErr.message); }
 	}

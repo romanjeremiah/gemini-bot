@@ -1,4 +1,4 @@
-import { handleMessage, handleCallback } from './bot/handlers';
+import { handleMessage, handleCallback, detectComplexTask } from './bot/handlers';
 import { handleInlineQuery } from './bot/inlineHandler';
 import * as reminderStore from './services/reminderStore';
 import * as moodStore from './services/moodStore';
@@ -1092,6 +1092,17 @@ export default {
 			});
 		}
 
+		// ---- Test queue consumer end-to-end ----
+		if (request.method === "GET" && new URL(request.url).pathname === "/test-queue") {
+			if (!env.TASK_QUEUE) return new Response(JSON.stringify({ error: 'TASK_QUEUE binding not found' }), { status: 500 });
+			const chatId = Number(env.OWNER_ID);
+			// Send a minimal test task — consumer will send a Telegram message to prove it works
+			await env.TASK_QUEUE.send({ type: 'queue_test', chatId });
+			return new Response(JSON.stringify({ status: 'queued', chatId }), {
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
 		if (request.method === "GET" && new URL(request.url).pathname === "/test-research") {
 			if (!env.RESEARCH_WORKFLOW) return new Response(JSON.stringify({ error: 'RESEARCH_WORKFLOW binding not found' }), { status: 500 });
 			const chatId = Number(env.OWNER_ID);
@@ -1223,7 +1234,28 @@ export default {
 				console.log(`✨ Effect discovered: ${update.message.effect_id} emoji: ${emoji}`);
 				await storeDiscoveredEffect(env, update.message.effect_id, emoji);
 			}
-			task = handleMessage(update.message, env);
+
+			// Route complex messages (Pro model) through the queue — waitUntil only has 30s
+			// which isn't enough for Pro. Queue consumer has 15 min wall clock.
+			// Flash messages are fast enough for waitUntil.
+			const userText = update.message.text || update.message.caption || '';
+			const isCommand = /^\/\w+/.test(userText);
+			const isOwner = env.OWNER_ID && String(update.message.from?.id) === String(env.OWNER_ID);
+
+			if (!isCommand && isOwner && env.TASK_QUEUE && detectComplexTask(userText)) {
+				try {
+					await env.TASK_QUEUE.send({ type: 'user_message', message: update.message });
+					log.info('message_queued', { chatId: update.message.chat.id, len: userText.length });
+					// Send typing indicator so user knows we received it
+					telegram.sendChatAction(update.message.chat.id, update.message.message_thread_id || 'default', 'typing', env).catch(() => {});
+				} catch (queueErr) {
+					// Queue send failed — fall back to waitUntil (may timeout, better than nothing)
+					log.warn('queue_send_failed', { msg: queueErr.message });
+					task = handleMessage(update.message, env);
+				}
+			} else {
+				task = handleMessage(update.message, env);
+			}
 		}
 
 		if (task) {
@@ -1254,9 +1286,11 @@ export default {
 
 	// ---- Queue Consumer: processes LLM-heavy tasks decoupled from cron ----
 	async queue(batch, env) {
+		try {
 		env.DB = wrapD1(env.DB);
 		for (const msg of batch.messages) {
 			const task = msg.body;
+			log.info('queue_task_received', { type: task.type, hasMessage: !!task.message });
 			try {
 				const chatId = task.chatId || Number(env.OWNER_ID);
 				const threadId = 'default';
@@ -1289,14 +1323,37 @@ export default {
 
 				} else if (task.type === 'spontaneous_outreach') {
 					await handleSpontaneousOutreach(env);
+
+				} else if (task.type === 'queue_test') {
+					// Simple test: send a Telegram message to prove the queue consumer works
+					await telegram.sendMessage(chatId, 'default', '✅ <b>Queue test passed.</b> Consumer received and processed the task.', env);
+
+				} else if (task.type === 'user_message') {
+					// Pro-model user messages routed here for generous CPU budget.
+					const qChatId = task.message?.chat?.id;
+					const qThreadId = task.message?.message_thread_id || 'default';
+					log.info('queue_user_message_start', { chatId: qChatId, msgId: task.message?.message_id });
+					if (qChatId) await telegram.sendChatAction(qChatId, qThreadId, 'typing', env).catch(() => {});
+					try {
+						await handleMessage(task.message, env);
+						log.info('queue_user_message_done', { chatId: qChatId });
+					} catch (hmErr) {
+						// If handleMessage crashes, send the error to Telegram so we can SEE it
+						const errText = `⚠️ <b>Queue handleMessage error:</b>\n<code>${(hmErr.message || '').slice(0, 300)}</code>\n<code>${(hmErr.stack || '').slice(0, 300)}</code>`;
+						await telegram.sendMessage(qChatId, qThreadId, errText, env).catch(() => {});
+						throw hmErr; // re-throw for queue retry
+					}
 				}
 
 				msg.ack();
 				log.info('queue_task_done', { type: task.type, period: task.period });
 			} catch (e) {
-				log.error('queue_task_error', { type: task.type, msg: e.message });
+				log.error('queue_task_error', { type: task.type, msg: e.message, stack: e.stack?.slice(0, 500) });
 				msg.retry();
 			}
+		}
+		} catch (outerErr) {
+			log.fatal('queue_consumer_crash', { msg: outerErr.message, stack: outerErr.stack?.slice(0, 500) });
 		}
 	},
 

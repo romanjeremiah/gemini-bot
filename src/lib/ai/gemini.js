@@ -11,29 +11,12 @@ const MIN_CACHE_TOKENS_GEMINI3 = 4096;
 const CHARS_PER_TOKEN = 4;
 
 let _ai = null;
-let _aiDirect = null; // Direct connection (no gateway) for image gen
 
 function getAI(env) {
   if (!_ai) {
-    const opts = { apiKey: env.GEMINI_API_KEY };
-    // Proxy through Cloudflare AI Gateway if configured (caching, analytics, rate limiting)
-    if (env.AI_GATEWAY_ACCOUNT_ID && env.AI_GATEWAY_ID) {
-      opts.httpOptions = {
-        baseUrl: `https://gateway.ai.cloudflare.com/v1/${env.AI_GATEWAY_ACCOUNT_ID}/${env.AI_GATEWAY_ID}/google-ai-studio`,
-      };
-      console.log('🌐 AI Gateway enabled');
-    }
-    _ai = new GoogleGenAI(opts);
+    _ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
   }
   return _ai;
-}
-
-// Direct connection for image gen — bypasses gateway to avoid extra latency
-function getAIDirect(env) {
-  if (!_aiDirect) {
-    _aiDirect = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
-  }
-  return _aiDirect;
 }
 
 function normalizeSchema(obj) {
@@ -80,7 +63,7 @@ async function withRetry(fn, maxRetries = 3, fallbackFn = null) {
  * Use this for cron jobs and background tasks instead of direct ai.models.generateContent.
  */
 export async function generateWithFallback(env, contents, config = {}) {
-  const ai = getAIDirect(env);
+  const ai = getAI(env);
   const proConfig = { ...config };
   const flashConfig = { ...config };
 
@@ -111,7 +94,7 @@ async function getOrCreateCache(personaInstruction, formattingRules, env, model 
   // Check in-memory cache first, but validate it's still alive on Google
   if (_cacheNames.has(cacheKey)) {
     try {
-      await getAIDirect(env).caches.get({ name: _cacheNames.get(cacheKey) });
+      await getAI(env).caches.get({ name: _cacheNames.get(cacheKey) });
       return _cacheNames.get(cacheKey);
     } catch {
       console.log('🗑️ In-memory cache expired, clearing...');
@@ -122,7 +105,7 @@ async function getOrCreateCache(personaInstruction, formattingRules, env, model 
   const kvCacheName = await env.CHAT_KV.get(cacheKey);
   if (kvCacheName) {
     try {
-      await getAIDirect(env).caches.get({ name: kvCacheName });
+      await getAI(env).caches.get({ name: kvCacheName });
       _cacheNames.set(cacheKey, kvCacheName);
       return kvCacheName;
     } catch {
@@ -144,8 +127,7 @@ async function getOrCreateCache(personaInstruction, formattingRules, env, model 
 
   try {
     console.log(`🧊 Creating cache (~${totalEstimatedTokens} estimated tokens) for ${model}...`);
-    // Use direct connection for cache creation (Gateway doesn't proxy cache management)
-    const cache = await getAIDirect(env).caches.create({
+    const cache = await getAI(env).caches.create({
       model,
       config: {
         systemInstruction: staticContent,
@@ -278,7 +260,7 @@ export async function generateImage(prompt, env, inputImageBase64 = null, inputM
   }
   parts.push({ text: prompt });
   console.log(`🎨 Image ${isEditing ? 'edit' : 'gen'} → ${model}`);
-  const doGenerate = (m) => getAIDirect(env).models.generateContent({
+  const doGenerate = (m) => getAI(env).models.generateContent({
     model: m, contents: [{ role: 'user', parts }],
     config: { responseModalities: ['TEXT', 'IMAGE'] },
   });
@@ -307,7 +289,7 @@ export async function generateImage(prompt, env, inputImageBase64 = null, inputM
 // Uses Flash model via direct connection for speed. No tools, no history.
 export async function generateShortResponse(prompt, systemInstruction, env) {
   const response = await withRetry(
-    () => getAIDirect(env).models.generateContent({
+    () => getAI(env).models.generateContent({
       model: FALLBACK_TEXT_MODEL,
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       config: {

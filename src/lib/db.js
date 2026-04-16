@@ -78,16 +78,29 @@ function wrapStmt(stmt, sql, binds = []) {
 			}
 			if (prop === 'run' || prop === 'all' || prop === 'first' || prop === 'raw') {
 				return async (...args) => {
-					try {
-						return await value.apply(target, args);
-					} catch (err) {
-						console.error('[D1_QUERY_ERROR]', {
-							sql: sql?.replace(/\s+/g, ' ').trim().slice(0, 500),
-							binds: binds.map(b => typeof b === 'string' ? b.slice(0, 80) : b),
-							method: prop,
-							message: err?.message,
-						});
-						throw err;
+					for (let attempt = 0; attempt < 2; attempt++) {
+						try {
+							return await value.apply(target, args);
+						} catch (err) {
+							const msg = err?.message || '';
+							const isTransient = msg.includes('storage operation exceeded timeout')
+								|| msg.includes('Network connection lost')
+								|| msg.includes('internal error')
+								|| msg.includes('object to be reset')
+								|| msg.includes('transient issue');
+							if (attempt === 0 && isTransient) {
+								console.warn('[D1_RETRY]', { sql: sql?.replace(/\s+/g, ' ').trim().slice(0, 200), attempt: attempt + 1 });
+								await new Promise(r => setTimeout(r, 500));
+								continue;
+							}
+							console.error('[D1_QUERY_ERROR]', {
+								sql: sql?.replace(/\s+/g, ' ').trim().slice(0, 500),
+								binds: binds.map(b => typeof b === 'string' ? b.slice(0, 80) : b),
+								method: prop,
+								message: err?.message,
+							});
+							throw err;
+						}
 					}
 				};
 			}

@@ -25,7 +25,7 @@ WHEN TO USE: After emotional conversations, therapy-like exchanges, significant 
 				},
 				trigger: {
 					type: "STRING",
-					description: "What prompted this episode? What was the user dealing with? (1-2 sentences)"
+					description: "What prompted this episode? Write in SECOND PERSON: 'You were struggling with job application paralysis after the 14:00 check-in'. NEVER use third person ('Roman was...', 'He struggled with...'). ALL times in 24-hour format. 1-2 sentences."
 				},
 				emotions: {
 					type: "ARRAY",
@@ -34,7 +34,7 @@ WHEN TO USE: After emotional conversations, therapy-like exchanges, significant 
 				},
 				intervention: {
 					type: "STRING",
-					description: "What did you do or suggest? What approach did you take? (1-2 sentences)"
+					description: "What did you do or suggest? Write in SECOND PERSON from your perspective: 'I suggested a 15-minute timer and one application at 20:00'. NEVER narrate in third person about yourself or the user. ALL times in 24-hour format. 1-2 sentences."
 				},
 				outcome: {
 					type: "STRING",
@@ -43,7 +43,7 @@ WHEN TO USE: After emotional conversations, therapy-like exchanges, significant 
 				},
 				lesson: {
 					type: "STRING",
-					description: "What was learned for future reference? What should you remember to do (or avoid) next time? (1 sentence)"
+					description: "What was learned for future reference? Write naturally — no third-person narration of either party. ALL times in 24-hour format. 1 sentence. Example: 'Short timers with one task work when overwhelmed; broader open-ended prompts stall them.'"
 				},
 				mood_score: {
 					type: "NUMBER",
@@ -96,7 +96,7 @@ export const updateEpisodeOutcomeTool = {
 				},
 				lesson: {
 					type: "STRING",
-					description: "What was learned from this outcome? What to do differently or continue doing. (1 sentence)"
+					description: "What was learned from this outcome? Write naturally — no third-person narration. ALL times in 24-hour format. 1 sentence."
 				}
 			},
 			required: ["episode_id", "outcome"]

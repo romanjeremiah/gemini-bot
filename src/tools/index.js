@@ -19,6 +19,7 @@ import { cloudflareAdminTool } from './cloudflare';
 import { timezoneTool } from './timezone';
 import { searchResearchTool, startResearchTool } from './research';
 import { episodeTool, updateEpisodeOutcomeTool } from './episode';
+import { quietHoursTool, clearQuietHoursTool } from './quietHours';
 
 export const toolRegistry = {
 	[reminderTool.definition.name]: reminderTool,
@@ -49,6 +50,8 @@ export const toolRegistry = {
 	[startResearchTool.definition.name]: startResearchTool,
 	[episodeTool.definition.name]: episodeTool,
 	[updateEpisodeOutcomeTool.definition.name]: updateEpisodeOutcomeTool,
+	[quietHoursTool.definition.name]: quietHoursTool,
+	[clearQuietHoursTool.definition.name]: clearQuietHoursTool,
 };
 
 export const toolDefinitions = Object.values(toolRegistry).map(t => t.definition);

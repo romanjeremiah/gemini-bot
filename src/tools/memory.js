@@ -3,7 +3,7 @@ import * as memoryStore from '../services/memoryStore';
 export const memoryTool = {
 	definition: {
 		name: "save_memory",
-		description: "Save an important fact, observation, idea, or thought dump about the person you're talking to. IMPORTANT: Always use the person's actual first name in the fact (e.g., 'Roman goes to the gym') — never use generic 'User'. The person's name is provided in the context. Categories: preference, personal, work, hobby, identity, relationship, health, habit, pattern (recurring behaviour/emotional pattern), trigger (emotional/situational trigger), avoidance (things they avoid), schema (core belief or narrative), growth (positive change or breakthrough), coping (coping strategy, healthy or unhealthy), insight (self-awareness moment), idea (a creative idea, project concept, or plan worth preserving), brain_dump (raw unstructured thoughts that you should synthesise into a clean, logical note before saving), discovery (interesting news, research findings, or tech developments), architecture_spec (technical architecture maps or code structure summaries for the bot itself). Set importance to 2 or 3 for therapeutic observations that represent significant patterns or breakthroughs.",
+		description: "Save an important fact, observation, idea, or thought dump about the person you're talking to. Write facts in SECOND PERSON using 'you/your' (e.g. 'You go to the gym on weekday mornings', 'You are allergic to peanuts'). Do NOT narrate in third person ('Roman goes to...', 'He is allergic...'). ALL times in 24-hour format (20:00, NOT '8 PM'). Categories: preference, personal, work, hobby, identity, relationship, health, habit, pattern (recurring behaviour/emotional pattern), trigger (emotional/situational trigger), avoidance (things they avoid), schema (core belief or narrative), growth (positive change or breakthrough), coping (coping strategy, healthy or unhealthy), insight (self-awareness moment), idea (a creative idea, project concept, or plan worth preserving), brain_dump (raw unstructured thoughts that you should synthesise into a clean, logical note before saving), discovery (interesting news, research findings, or tech developments), architecture_spec (technical architecture maps or code structure summaries for the bot itself). Set importance to 2 or 3 for therapeutic observations that represent significant patterns or breakthroughs.",
 		parameters: {
 			type: "OBJECT",
 			properties: {
@@ -13,7 +13,7 @@ export const memoryTool = {
 				},
 				fact: {
 					type: "STRING",
-					description: "The fact or observation to remember. Always use the person's real name, e.g., 'Roman is allergic to peanuts' not 'User is allergic to peanuts'. For therapeutic categories, be specific and include context."
+					description: "The fact or observation to remember. Write in SECOND PERSON: 'You are allergic to peanuts', 'You prefer 24h time formats', 'You went rollerblading in Richmond Park on 15 Apr'. NEVER use third person ('Roman is...', 'He prefers...'). NEVER use generic 'User'. ALL times in 24-hour format (13:00, NOT '1 PM'). For therapeutic categories, be specific and include context."
 				},
 				importance: {
 					type: "INTEGER",

@@ -13,6 +13,7 @@ import { personas, MENTAL_HEALTH_DIRECTIVE } from './config/personas';
 import { ARCHITECTURE_SUMMARY } from './config/architecture';
 import { getSchedule, matchesSchedule } from './config/schedules';
 import { toolRegistry } from './tools/index';
+import { isQuietTime } from './tools/quietHours';
 import { log } from './lib/logger';
 import { wrapD1 } from './lib/db';
 
@@ -473,7 +474,8 @@ async function handleSpontaneousOutreach(env) {
 	const userId = chatId; // Owner's private chat
 	const today = londonTime.toISOString().split('T')[0];
 
-	// Max one spontaneous message per day = `spontaneous_${today}`;
+	// Max one spontaneous message per day
+	const outreachKey = `spontaneous_${today}`;
 	if (await env.CHAT_KV.get(outreachKey)) return;
 	await env.CHAT_KV.put(outreachKey, '1', { expirationTtl: 86400 });
 
@@ -482,6 +484,12 @@ async function handleSpontaneousOutreach(env) {
 	const lastSeen = lastSeenStr ? parseInt(lastSeenStr) : 0;
 	const hoursSinceLastChat = Math.round((Date.now() - lastSeen) / (1000 * 60 * 60));
 	if (hoursSinceLastChat < 3) return;
+
+	// Respect user-requested quiet hours
+	if (await isQuietTime(env, chatId)) {
+		log.info('spontaneous_outreach_skipped_quiet', { chatId });
+		return;
+	}
 
 	try {
 		// Pull memories with a mix of types for contextual check-ins
@@ -550,6 +558,13 @@ async function handleCuriosityDigest(env) {
 	const digestKey = `curiosity_digest_${today}`;
 
 	if (await env.CHAT_KV.get(digestKey)) return;
+
+	// Respect quiet hours — skip the whole digest if silenced
+	if (await isQuietTime(env, chatId)) {
+		log.info('curiosity_digest_skipped_quiet', { chatId });
+		return;
+	}
+
 	await env.CHAT_KV.put(digestKey, '1', { expirationTtl: 86400 * 2 });
 
 	try {
@@ -905,8 +920,8 @@ Write as if noting this down for yourself to use later.` }] }],
 		await memoryStore.saveMemory(env, userId, category, `Study (${topic.split(' ').slice(0, 5).join(' ')}): ${insight.slice(0, 400)}`, 1);
 		log.info('daily_study_complete', { topic: topic.slice(0, 50), category });
 
-		// 40% chance: share what was learned naturally
-		if (Math.random() < 0.40) {
+		// 40% chance: share what was learned naturally (skip during quiet hours)
+		if (Math.random() < 0.40 && !(await isQuietTime(env, chatId))) {
 			const sharePrompt = `You just spent some time reading about: "${topic}".
 Here is what you learned: ${insight.slice(0, 300)}
 
@@ -1339,19 +1354,43 @@ export default {
 			const threadId = r.thread_id || "default";
 			const meta = r.parsedMeta || {};
 			const firstName = meta.firstName || "mate";
-			const reason = meta.reason || "Scheduled task";
+			const reason = meta.reason || "";
 
 			const isGroup = r.chat_id !== r.user_id;
 
-			// Build reminder with native date_time entity for timezone-aware display
+			// Format scheduled time in London 24h for inline display.
+			// Previously used a native date_time entity, but HTML parse_mode is
+			// mutually exclusive with entities and we want <blockquote expandable>
+			// for the context section.
+			const dueDate = new Date(r.due_at * 1000);
+			const scheduledLabel = dueDate.toLocaleString('en-GB', {
+				timeZone: 'Europe/London',
+				day: '2-digit',
+				month: 'short',
+				year: 'numeric',
+				hour: '2-digit',
+				minute: '2-digit',
+				hour12: false,
+				weekday: 'short'
+			});
+
 			const prefix = isGroup ? `⏰ ${firstName}, reminder: ` : '⏰ Reminder: ';
-			const { text: dtText, entities } = telegram.buildDateTimeMessage(
-				`${prefix}${r.text}\nScheduled for: `, r.due_at, `\n\nContext: ${reason}`, 'DT'
-			);
+			// Escape HTML-sensitive chars in user-generated fields to avoid broken markup
+			const escapeHtml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+			const safeText = escapeHtml(r.text);
+			const safeReason = escapeHtml(reason);
+
+			// Context goes in an expandable blockquote so the main reminder stays clean.
+			// Only render the blockquote if there is actual context to show.
+			const contextBlock = safeReason
+				? `\n<blockquote expandable>${safeReason}</blockquote>`
+				: '';
+
+			const messageText = `${prefix}${safeText}\n<i>Scheduled for: ${scheduledLabel}</i>${contextBlock}`;
 
 			const personaKey = meta.persona || await env.CHAT_KV.get(`persona_${r.user_id}`) || 'xaridotis';
 			await Promise.all([
-				telegram.sendMessageWithEntities(r.chat_id, threadId, dtText, entities, env, r.original_message_id),
+				telegram.sendMessage(r.chat_id, threadId, messageText, env, r.original_message_id),
 				generateSpeech(r.text, personaKey, env)
 					.then(audio => telegram.sendVoice(r.chat_id, threadId, audio, env, r.original_message_id))
 					.catch(e => console.error("Cron voice error:", e.message))

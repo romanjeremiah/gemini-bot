@@ -53,7 +53,7 @@ IMPORTANT: If mood_score is 0-1 or 9-10, this is a clinical concern. Always ackn
 				},
 				medication_notes: {
 					type: "STRING",
-					description: "Which medications, timing, on-time or late. E.g. 'Bipolar meds on time, ADHD meds 30min late'"
+					description: "Which medications, timing, on-time or late. ALL times in 24-hour format. E.g. 'Bipolar meds on time at 08:15, ADHD meds 30min late at 09:45'. NEVER use '8 AM' or '9:45 AM'."
 				},
 				activities: {
 					type: "ARRAY",
@@ -62,11 +62,11 @@ IMPORTANT: If mood_score is 0-1 or 9-10, this is a clinical concern. Always ackn
 				},
 				note: {
 					type: "STRING",
-					description: "Free-text journal note or observation for the day"
+					description: "Free-text journal note or observation for the day. Write in SECOND PERSON as if the user is journaling to themselves: 'You hit the gym before the 09:00 meeting, felt sharp all morning'. NEVER use third person ('Roman hit the gym...'). ALL times in 24-hour format."
 				},
 				ai_observation: {
 					type: "STRING",
-					description: "Your clinical observation about the user's state today. Be specific, reference patterns."
+					description: "Your clinical observation about the user's state today. Write in SECOND PERSON from your perspective to them: 'You are running consistent sleep at 7h but your 22:00 energy spike matches a hypomanic pattern from March'. NEVER narrate in third person. ALL times in 24-hour format. Be specific, reference patterns."
 				},
 				link_latest_photo: {
 					type: "BOOLEAN",

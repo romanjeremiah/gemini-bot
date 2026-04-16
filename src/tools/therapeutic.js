@@ -25,7 +25,7 @@ export const saveTherapeuticNoteTool = {
 				},
 				content: {
 					type: "STRING",
-					description: "The observation itself. Be specific and include context."
+					description: "The observation itself. Write in SECOND PERSON: 'You deflect to humour when grief surfaces', 'You avoid opening the laptop at 20:00 despite the pattern holding'. NEVER use third person ('Roman deflects...', 'He avoids...'). ALL times in 24-hour format (13:00, NOT '1 PM'). Be specific and include context."
 				},
 				importance: {
 					type: "INTEGER",

@@ -341,6 +341,54 @@ async function handleMemoryConsolidation(env) {
 	}
 }
 
+// ---- Style Card Auto-Consolidation ----
+// Runs daily at 04:00 London time. Collects feedback memories
+// and merges them into the user's style card using Workers AI.
+async function handleStyleCardConsolidation(env) {
+	const now = new Date();
+	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+
+	// Only run at 04:00
+	if (londonTime.getHours() !== 4 || londonTime.getMinutes() > 0) return;
+
+	const today = londonTime.toISOString().split('T')[0];
+	const runKey = `style_consolidation_${today}`;
+	if (await env.CHAT_KV.get(runKey)) return;
+	await env.CHAT_KV.put(runKey, '1', { expirationTtl: 86400 });
+
+	const userId = Number(env.OWNER_ID);
+	try {
+		// Fetch recent feedback memories
+		const { results: feedbacks } = await env.DB.prepare(
+			`SELECT id, fact FROM memories WHERE user_id = ? AND category = 'feedback' ORDER BY created_at DESC LIMIT 30`
+		).bind(userId).all();
+
+		if (!feedbacks?.length) return;
+
+		const { getStyleCard, saveStyleCard } = await import('./services/userStore');
+		const currentCard = await getStyleCard(env, userId);
+		if (!currentCard) return; // No style card to update
+
+		const { consolidateStyleCard } = await import('./services/cfAi');
+		const feedbackInsights = feedbacks.map(f => f.fact);
+		const updated = await consolidateStyleCard(env, currentCard, feedbackInsights);
+
+		if (updated && updated.length > 200) {
+			await saveStyleCard(env, userId, updated);
+
+			// Delete consumed feedback memories to prevent re-processing
+			const ids = feedbacks.map(f => f.id);
+			await env.DB.prepare(
+				`DELETE FROM memories WHERE id IN (${ids.map(() => '?').join(',')}) AND user_id = ?`
+			).bind(...ids, userId).run();
+
+			log.info('style_card_consolidated', { userId, feedbackCount: feedbacks.length, cardLength: updated.length });
+		}
+	} catch (e) {
+		log.error('style_card_consolidation_error', { msg: e.message });
+	}
+}
+
 // ---- Mood Poll System ----
 // Condensed 0-10 bipolar mood scale descriptions (max 100 chars per option)
 const MOOD_POLL_OPTIONS = [
@@ -1397,6 +1445,7 @@ export default {
 			// Lightweight tasks that don't call LLMs run inline
 			const cronResults = await Promise.allSettled([
 				handleMemoryConsolidation(env),
+				handleStyleCardConsolidation(env),
 			]);
 			cronResults.forEach((r, i) => {
 				if (r.status === 'rejected') log.error('cron_task_failed', { task: i, msg: r.reason?.message });
@@ -1422,10 +1471,11 @@ export default {
 				handleHealthCheckIns(env),
 				handleMedicationNudge(env),
 				handleMemoryConsolidation(env),
+				handleStyleCardConsolidation(env),
 				handleSpontaneousOutreach(env),
 			]);
 			cronResults.forEach((r, i) => {
-				const names = ['checkin', 'nudge', 'consolidation', 'outreach'];
+				const names = ['checkin', 'nudge', 'consolidation', 'style_card', 'outreach'];
 				if (r.status === 'rejected') log.error(`cron_${names[i]}_failed`, { msg: r.reason?.message });
 			});
 		}

@@ -40,13 +40,17 @@ export class MemoryConsolidationWorkflow extends WorkflowEntrypoint {
 			}
 		});
 
-		// Remove duplicates identified by CF AI before sending to Gemini
-		const duplicateIds = new Set();
+		// Remove duplicates and contradicted (older) memories identified by CF AI
+		const removeIds = new Set();
 		for (const [, dupIdx] of dedupResult.duplicates) {
-			if (allMemories[dupIdx]) duplicateIds.add(allMemories[dupIdx].id);
+			if (allMemories[dupIdx]) removeIds.add(allMemories[dupIdx].id);
 		}
-		const dedupedMemories = allMemories.filter(m => !duplicateIds.has(m.id));
-		console.log(`🧹 CF AI dedup: ${allMemories.length} → ${dedupedMemories.length} memories (removed ${duplicateIds.size} duplicates)`);
+		// Contradictions: [olderIdx, newerIdx] — remove the older one
+		for (const [olderIdx] of (dedupResult.contradictions || [])) {
+			if (allMemories[olderIdx]) removeIds.add(allMemories[olderIdx].id);
+		}
+		const dedupedMemories = allMemories.filter(m => !removeIds.has(m.id));
+		console.log(`🧹 CF AI dedup: ${allMemories.length} → ${dedupedMemories.length} memories (removed ${removeIds.size} duplicates/contradictions)`);
 
 		// Step 3: Consolidate memories using CF AI (GLM-4.7-Flash — 131K context, free)
 		// Previously used Gemini Pro for this, but consolidation is summarisation,
@@ -55,18 +59,34 @@ export class MemoryConsolidationWorkflow extends WorkflowEntrypoint {
 			retries: { limit: 3, delay: '10 seconds', backoff: 'exponential' },
 			timeout: '120 seconds',
 		}, async () => {
-			const rawText = dedupedMemories.map(m => `[${m.category}] ${m.fact} (Score: ${m.importance_score})`).join('\n');
+			const rawText = dedupedMemories.map(m =>
+				`[${m.category}] ${m.fact} (Score: ${m.importance_score}, Date: ${m.created_at})`
+			).join('\n');
 
 			const prompt = `You are performing memory consolidation for a therapeutic Second Brain.
-Here are the user's saved memories:
+Here are the user's saved memories (sorted by importance, then date):
 ${rawText}
 
-Task:
-1. Remove duplicate facts entirely.
-2. Merge outdated preferences with newer ones (keep the latest).
-3. Group related therapeutic schemas, triggers, or patterns into coherent summaries.
-4. Preserve the exact wording of critical triggers or schemas (importance 3).
-5. Keep all unique facts, ideas, and brain dumps.
+CONSOLIDATION RULES:
+
+1. CONTRADICTIONS: When two memories contradict each other, KEEP ONLY THE NEWER ONE.
+   Example: "[preference] User likes coffee (Date: 2026-01)" vs "[preference] User switched to tea (Date: 2026-03)"
+   → Keep only: "User switched to tea"
+   For each contradiction you resolve, add a note: "(updated: was previously X)"
+
+2. DUPLICATES: Remove exact or near-exact duplicates. Keep the version with more detail.
+
+3. EVOLUTION: When a pattern has evolved over time, merge into ONE entry that captures the current state.
+   Example: "User avoids difficult conversations" + "User successfully confronted Jordan instead of freezing"
+   → Merge: "User historically avoided difficult conversations but has shown growing capacity to confront issues directly (e.g. successful confrontation with Jordan)."
+
+4. CRITICAL PRESERVATION: Memories with importance score 3 must keep their exact wording.
+   Never paraphrase or merge these — they capture precise therapeutic language.
+
+5. CATEGORIES: Preserve the original category. Valid categories:
+   identity, preference, pattern, growth, discovery, personal, feedback, research_ref, architecture_spec
+
+6. IMPORTANCE SCORES: Keep original scores. If merging two memories, use the higher score.
 
 Return ONLY a raw JSON array:
 [{"category":"preference","fact":"...","importance":1}]

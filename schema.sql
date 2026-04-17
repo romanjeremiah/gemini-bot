@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS user_profiles (
     communication_preference TEXT DEFAULT 'friendly',
     known_hobbies TEXT,
     core_traits TEXT,
+    style_card TEXT,
     first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -150,3 +151,17 @@ CREATE TABLE IF NOT EXISTS mood_journal (
 );
 
 CREATE INDEX IF NOT EXISTS idx_mood_user_date ON mood_journal(user_id, date);
+
+-- 9. TRAINING PAIRS (LoRA fine-tuning dataset from positive reactions)
+CREATE TABLE IF NOT EXISTS training_pairs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    user_message TEXT NOT NULL,
+    bot_response TEXT NOT NULL,
+    persona TEXT,
+    signal TEXT NOT NULL,
+    message_id INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_training_pairs_user_signal ON training_pairs(user_id, signal);

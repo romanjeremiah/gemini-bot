@@ -73,3 +73,16 @@ export async function getStyleCard(env, userId) {
 		return null;
 	}
 }
+
+/**
+ * Update the user's style card in the database.
+ */
+export async function saveStyleCard(env, userId, styleCard) {
+	try {
+		await env.DB.prepare(
+			'UPDATE user_profiles SET style_card = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?'
+		).bind(styleCard, userId).run();
+	} catch (e) {
+		console.error('⚠️ saveStyleCard failed:', e.message);
+	}
+}

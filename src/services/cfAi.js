@@ -89,28 +89,30 @@ Respond with ONLY the tags, comma-separated. Example: anxiety_state, sleep_disru
 export async function deduplicateMemories(env, memories) {
 	if (!memories.length) return { groups: [], duplicates: [] };
 
-	const memoryList = memories.map((m, i) => `[${i}] [${m.category}] ${m.fact}`).join('\n');
+	const memoryList = memories.map((m, i) => `[${i}] [${m.category}] ${m.fact} (${m.created_at || 'unknown'})`).join('\n');
 
 	const result = await cfAiGenerate(env, MODELS.context,
 		`Here are ${memories.length} stored memories. Identify:
 1. DUPLICATES: memories that say the same thing (list pairs of indices)
-2. GROUPS: memories that relate to the same topic (list groups of indices with a label)
+2. CONTRADICTIONS: memories where a newer one updates/replaces an older one (list pairs as [older, newer])
+3. GROUPS: memories that relate to the same topic (list groups of indices with a label)
 
 MEMORIES:
 ${memoryList}
 
 Respond in this exact format:
 DUPLICATES: [0,5], [3,7]
+CONTRADICTIONS: [2,9], [4,11]
 GROUP: ADHD management: [1,4,8,12]
 GROUP: Coffee preferences: [2,9]
-GROUP: Work patterns: [3,6,11]
 
-If no duplicates found, write: DUPLICATES: none`,
-		'You are a data organiser. Be precise with indices. Only group genuinely related items.'
+If none found, write: DUPLICATES: none / CONTRADICTIONS: none`,
+		'You are a data organiser. Be precise with indices. For contradictions, always list the OLDER memory first in each pair.'
 	);
 
 	// Parse the response
 	const duplicates = [];
+	const contradictions = [];
 	const groups = [];
 
 	if (result) {
@@ -120,6 +122,13 @@ If no duplicates found, write: DUPLICATES: none`,
 			for (const p of pairs) duplicates.push([parseInt(p[1]), parseInt(p[2])]);
 		}
 
+		// Contradictions: [older, newer] — the older one should be removed
+		const contraMatch = result.match(/CONTRADICTIONS:\s*(.+)/);
+		if (contraMatch && !contraMatch[1].includes('none')) {
+			const pairs = contraMatch[1].matchAll(/\[(\d+),\s*(\d+)\]/g);
+			for (const p of pairs) contradictions.push([parseInt(p[1]), parseInt(p[2])]);
+		}
+
 		const groupMatches = result.matchAll(/GROUP:\s*(.+?):\s*\[([^\]]+)\]/g);
 		for (const g of groupMatches) {
 			const indices = g[2].split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n));
@@ -127,7 +136,7 @@ If no duplicates found, write: DUPLICATES: none`,
 		}
 	}
 
-	return { groups, duplicates };
+	return { groups, duplicates, contradictions };
 }
 
 export { MODELS };
@@ -189,4 +198,49 @@ If the reaction is ambiguous or carries no useful signal, respond with exactly: 
 	else if (positive.test(lower)) sentiment = 'positive';
 
 	return { insight: insight.slice(0, 150), sentiment };
+}
+
+
+/**
+ * Consolidate feedback memories into an updated style card.
+ * Takes the current style card + new feedback signals and produces
+ * an updated style card that incorporates the learned preferences.
+ *
+ * Uses GLM-4.7-Flash (free, 131K context) since this is summarisation.
+ *
+ * @param {object} env - Worker env with AI binding
+ * @param {string} currentStyleCard - The current style card text
+ * @param {string[]} feedbackInsights - Array of feedback insights from reactions
+ * @returns {Promise<string|null>} Updated style card or null on failure
+ */
+export async function consolidateStyleCard(env, currentStyleCard, feedbackInsights) {
+	if (!feedbackInsights.length || !env.AI) return null;
+
+	const feedbackList = feedbackInsights.map((f, i) => `${i + 1}. ${f}`).join('\n');
+
+	const prompt = `You are updating a user's communication style card based on their recent feedback signals.
+
+CURRENT STYLE CARD:
+${currentStyleCard}
+
+RECENT FEEDBACK FROM USER REACTIONS:
+${feedbackList}
+
+RULES:
+- Integrate the feedback into the existing style card naturally.
+- If feedback contradicts an existing preference, UPDATE the preference (newer feedback wins).
+- If feedback confirms an existing preference, STRENGTHEN the wording slightly.
+- If feedback reveals something entirely new, ADD a line in the appropriate section.
+- PRESERVE the existing structure and sections.
+- Do NOT add commentary, explanations, or meta-text.
+- Do NOT wrap in markdown code blocks.
+- Return ONLY the updated style card text.`;
+
+	const result = await cfAiGenerate(env, MODELS.context, prompt,
+		'You update style cards by integrating user feedback. Return only the updated style card, no commentary.');
+
+	if (!result || result.length < 100) return null;
+
+	// Clean any markdown wrapping the AI might add
+	return result.replace(/^```[\s\S]*?\n/, '').replace(/\n```\s*$/, '').trim();
 }

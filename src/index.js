@@ -958,8 +958,24 @@ async function handleReactionFeedback(reaction, env) {
 	if (!emoji) return;
 
 	// Retrieve the context of the message that was reacted to (written by telegram.js sendMessage)
-	const contextText = await env.CHAT_KV.get(`msg_context_${chatId}_${msgId}`);
-	if (!contextText) return; // Expired or never cached (reaction on old/short message)
+	const contextRaw = await env.CHAT_KV.get(`msg_context_${chatId}_${msgId}`);
+	if (!contextRaw) return; // Expired or never cached (reaction on old/short message)
+
+	// Parse structured context (JSON with botResponse, userMessage, persona)
+	// Falls back to treating raw string as botResponse for legacy entries
+	let botResponse, userMessage, persona;
+	try {
+		const parsed = JSON.parse(contextRaw);
+		botResponse = parsed.botResponse || '';
+		userMessage = parsed.userMessage || '';
+		persona = parsed.persona || 'xaridotis';
+	} catch {
+		botResponse = contextRaw;
+		userMessage = '';
+		persona = 'xaridotis';
+	}
+
+	if (!botResponse) return;
 
 	// Strong, unambiguous signals bypass the AI and save directly
 	const strongSignals = {
@@ -977,7 +993,7 @@ async function handleReactionFeedback(reaction, env) {
 	} else {
 		// Ambiguous emoji → let Llama interpret in context (Option B)
 		const { interpretReaction } = await import('./services/cfAi');
-		const interpreted = await interpretReaction(env, emoji, contextText).catch(e => {
+		const interpreted = await interpretReaction(env, emoji, botResponse).catch(e => {
 			log.error('reaction_interpret_error', { msg: e.message });
 			return null;
 		});
@@ -991,6 +1007,17 @@ async function handleReactionFeedback(reaction, env) {
 	const feedbackFact = `${insight} [reacted ${emoji}]`;
 	await memoryStore.saveMemory(env, userId, 'feedback', feedbackFact, importance);
 	log.info('reaction_feedback_saved', { userId, emoji, sentiment, insight: insight.slice(0, 80) });
+
+	// Save positive reactions as training pairs for future LoRA fine-tuning.
+	// Only save if we have both the user message and bot response (enriched context).
+	const positiveSignals = ['👍', '❤️', '🔥', '💯', '❤', '😍', '🤩', '👏'];
+	if (positiveSignals.includes(emoji) && userMessage && botResponse) {
+		env.DB.prepare(
+			`INSERT INTO training_pairs (user_id, user_message, bot_response, persona, signal, message_id) VALUES (?, ?, ?, ?, ?, ?)`
+		).bind(userId, userMessage, botResponse, persona, emoji, msgId).run().catch(e =>
+			log.error('training_pair_save_error', { msg: e.message })
+		);
+	}
 }
 
 // ---- Queue-based task enqueuing (decouples LLM calls from cron) ----

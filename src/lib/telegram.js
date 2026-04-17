@@ -89,12 +89,31 @@ export async function sendMessage(chatId, threadId, text, env, replyId = null, m
 	}
 
 	// Cache bot message context for reaction correlation (24h TTL)
+	// Stores JSON with bot response text. User message + persona are added by handleMessage
+	// after sendMessage returns, via enrichMsgContext().
 	if (res.ok && res.result?.message_id && text.length > 20) {
 		const plainText = cleanText.replace(/<[^>]*>/g, '').slice(0, 300);
-		env.CHAT_KV.put(`msg_context_${chatId}_${res.result.message_id}`, plainText, { expirationTtl: 86400 }).catch(() => {});
+		env.CHAT_KV.put(`msg_context_${chatId}_${res.result.message_id}`, JSON.stringify({ botResponse: plainText }), { expirationTtl: 86400 }).catch(() => {});
 	}
 
 	return res;
+}
+
+// Enrich an existing msg_context entry with user message + persona for training pair collection.
+// Called by handleMessage after the bot response is sent.
+export async function enrichMsgContext(chatId, msgId, userText, persona, env) {
+	const key = `msg_context_${chatId}_${msgId}`;
+	const raw = await env.CHAT_KV.get(key);
+	if (!raw) return;
+	try {
+		const ctx = JSON.parse(raw);
+		ctx.userMessage = (userText || '').slice(0, 500);
+		ctx.persona = persona || 'xaridotis';
+		await env.CHAT_KV.put(key, JSON.stringify(ctx), { expirationTtl: 86400 });
+	} catch {
+		// If the stored value wasn't JSON (legacy format), overwrite with structured data
+		await env.CHAT_KV.put(key, JSON.stringify({ botResponse: raw?.slice(0, 300), userMessage: (userText || '').slice(0, 500), persona: persona || 'xaridotis' }), { expirationTtl: 86400 });
+	}
 }
 
 // ---- Send Message with Entities (for date_time, custom_emoji, etc.) ----

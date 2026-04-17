@@ -985,14 +985,16 @@ export async function handleMessage(msg, env) {
 
 		let chat;
 
+		const chatOpts = { skipCodeExecution: hasMedia };
+
 		const _tChatStart = Date.now();
 		try {
-			chat = await createChat(hist, fullSysPrompt, env, cacheContext, textModel, { skipCodeExecution: hasMedia });
+			chat = await createChat(hist, fullSysPrompt, env, cacheContext, textModel, chatOpts);
 		} catch (cacheErr) {
 			// If cache is stale (403), retry without cache
 			if (cacheErr.message?.includes('403') || cacheErr.message?.includes('CachedContent')) {
 				log.warn('cache_stale_retry', { msg: cacheErr.message });
-				chat = await createChat(hist, fullSysPrompt, env, null, textModel, { skipCodeExecution: hasMedia });
+				chat = await createChat(hist, fullSysPrompt, env, null, textModel, chatOpts);
 			} else {
 				throw cacheErr;
 			}
@@ -1220,6 +1222,13 @@ export async function handleMessage(msg, env) {
 		if (uploadedImageBase64 && uploadedImageMime && fullText) {
 			vectorStore.indexMedia(env, userId, 'image', uploadedImageBase64, uploadedImageMime, fullText.slice(0, 200), messageId)
 				.catch(e => console.error('Vectorize media index error:', e.message));
+		}
+
+		// Enrich bot message context with user text + persona for training pair collection.
+		// When the user reacts with 👍/❤️, handleReactionFeedback can build a complete pair.
+		if (lastSentMsgId && userText) {
+			telegram.enrichMsgContext(chatId, lastSentMsgId, userText, effectivePersona, env)
+				.catch(e => console.error('Enrich context error:', e.message));
 		}
 
 		// Check if user confirmed medication (clear the pending flag)

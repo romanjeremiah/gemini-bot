@@ -10,7 +10,7 @@ export const fetchTool = {
 			required: ["url"]
 		}
 	},
-	async execute(args) {
+	async execute(args, env) {
 		try {
 			const res = await fetch(args.url, {
 				headers: { 'User-Agent': 'Mozilla/5.0 (compatible; GeminiBot/1.0)' },
@@ -19,6 +19,21 @@ export const fetchTool = {
 			if (!res.ok) return { status: "error", message: `HTTP ${res.status}` };
 
 			const html = await res.text();
+
+			// Use Workers AI toMarkdown for clean extraction if available
+			if (env?.AI?.toMarkdown) {
+				try {
+					const blob = new Blob([html], { type: 'text/html' });
+					const [result] = await env.AI.toMarkdown([{ name: 'page.html', blob }]);
+					let text = (result?.data || '').trim();
+					if (text.length > 100) {
+						if (text.length > 12000) text = text.slice(0, 12000) + '\n[...truncated]';
+						return { status: "success", content: text, url: args.url, length: text.length, method: 'toMarkdown' };
+					}
+				} catch { /* fall through to regex stripping */ }
+			}
+
+			// Fallback: regex-based HTML stripping
 			let text = html
 				.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
 				.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
@@ -32,10 +47,9 @@ export const fetchTool = {
 				.replace(/\s+/g, ' ')
 				.trim();
 
-			// Cap at 12000 chars to stay within reasonable token limits
 			if (text.length > 12000) text = text.slice(0, 12000) + '\n[...truncated]';
 
-			return { status: "success", content: text, url: args.url, length: text.length };
+			return { status: "success", content: text, url: args.url, length: text.length, method: 'regex' };
 		} catch (e) {
 			return { status: "error", message: e.message };
 		}

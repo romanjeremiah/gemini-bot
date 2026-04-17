@@ -48,14 +48,13 @@ export class MemoryConsolidationWorkflow extends WorkflowEntrypoint {
 		const dedupedMemories = allMemories.filter(m => !duplicateIds.has(m.id));
 		console.log(`🧹 CF AI dedup: ${allMemories.length} → ${dedupedMemories.length} memories (removed ${duplicateIds.size} duplicates)`);
 
-		// Step 3: Call Gemini to consolidate (the expensive, retryable step)
+		// Step 3: Consolidate memories using CF AI (GLM-4.7-Flash — 131K context, free)
+		// Previously used Gemini Pro for this, but consolidation is summarisation,
+		// not therapeutic reasoning. GLM-4.7-Flash handles it well and saves Gemini tokens.
 		const consolidated = await step.do('ai-consolidation', {
 			retries: { limit: 3, delay: '10 seconds', backoff: 'exponential' },
 			timeout: '120 seconds',
 		}, async () => {
-			const { GoogleGenAI } = await import('@google/genai');
-			const ai = new GoogleGenAI({ apiKey: this.env.GEMINI_API_KEY });
-
 			const rawText = dedupedMemories.map(m => `[${m.category}] ${m.fact} (Score: ${m.importance_score})`).join('\n');
 
 			const prompt = `You are performing memory consolidation for a therapeutic Second Brain.
@@ -73,13 +72,31 @@ Return ONLY a raw JSON array:
 [{"category":"preference","fact":"...","importance":1}]
 No markdown, no backticks. Just the array.`;
 
-			const response = await ai.models.generateContent({
-				model: 'gemini-3.1-pro-preview',
-				contents: [{ role: 'user', parts: [{ text: prompt }] }],
-				config: { temperature: 0.2 }
-			});
+			// Try CF AI first (free, 131K context), fall back to Gemini Pro if it fails
+			let text = '';
+			try {
+				const result = await this.env.AI.run('@cf/zai-org/glm-4.7-flash', {
+					messages: [
+						{ role: 'system', content: 'You consolidate memories into clean JSON arrays. Return ONLY valid JSON, no markdown.' },
+						{ role: 'user', content: prompt },
+					],
+					max_tokens: 4096,
+				}, {
+					headers: { 'x-session-affinity': 'xaridotis-consolidation' },
+				});
+				text = result?.response || '';
+			} catch (cfErr) {
+				console.warn('CF AI consolidation failed, falling back to Gemini:', cfErr.message);
+				const { GoogleGenAI } = await import('@google/genai');
+				const ai = new GoogleGenAI({ apiKey: this.env.GEMINI_API_KEY });
+				const response = await ai.models.generateContent({
+					model: 'gemini-3.1-pro-preview',
+					contents: [{ role: 'user', parts: [{ text: prompt }] }],
+					config: { temperature: 0.2 }
+				});
+				text = response.candidates?.[0]?.content?.parts?.[0]?.text || '';
+			}
 
-			const text = response.candidates?.[0]?.content?.parts?.[0]?.text || '';
 			const arrayMatch = text.match(/\[[\s\S]*\]/);
 			const cleaned = arrayMatch ? arrayMatch[0] : '[]';
 			const parsed = JSON.parse(cleaned);

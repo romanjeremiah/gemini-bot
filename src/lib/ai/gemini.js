@@ -169,21 +169,34 @@ function buildConfig(systemInstruction, opts = {}) {
     maxOutputTokens: 8192,
   };
 
+  // Gemini 3.1 Pro supports 'low', 'medium', 'high' thinking levels.
+  // Thinking cannot be disabled on Pro. Default to 'low' for speed;
+  // callers can pass opts.thinkingLevel to override for therapeutic/complex tasks.
+  if (opts.thinkingLevel) {
+    config.thinkingConfig = { thinkingLevel: opts.thinkingLevel };
+  }
+
   return config;
 }
 
-function buildCachedConfig(cacheName) {
-  return {
+function buildCachedConfig(cacheName, opts = {}) {
+  const config = {
     cachedContent: cacheName,
     temperature: 1.0,
     maxOutputTokens: 8192,
   };
+
+  if (opts.thinkingLevel) {
+    config.thinkingConfig = { thinkingLevel: opts.thinkingLevel };
+  }
+
+  return config;
 }
 
 export async function createChat(history, systemInstruction, env, cacheContext = null, model = null, opts = {}) {
   const useModel = model || PRIMARY_TEXT_MODEL;
   const config = cacheContext?.cacheName
-    ? buildCachedConfig(cacheContext.cacheName)
+    ? buildCachedConfig(cacheContext.cacheName, opts)
     : buildConfig(systemInstruction, opts);
 
   console.log(`🤖 Model: ${useModel}`);

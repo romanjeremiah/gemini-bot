@@ -8,12 +8,14 @@
  * - @cf/meta/llama-3.2-1b-instruct: sentiment, tagging, simple extraction (~5 neurons/call)
  * - @cf/meta/llama-3.1-8b-instruct-fp8-fast: triple extraction, observation (~13 neurons/call)
  * - @cf/zai-org/glm-4.7-flash: long-text summarisation, memory consolidation (~25 neurons/call)
+ * - @cf/google/gemma-4-26b-a4b-it: function calling for low-stakes tools (Phase 2)
  */
 
 const MODELS = {
 	tiny: '@cf/meta/llama-3.2-1b-instruct',        // Cheapest: sentiment, tagging
 	balanced: '@cf/meta/llama-3.1-8b-instruct-fp8-fast', // Mid: triples, observations
 	context: '@cf/zai-org/glm-4.7-flash',           // 131K context: summarisation
+	tools: '@cf/google/gemma-4-26b-a4b-it',         // Function calling: low-stakes tools (Phase 2)
 };
 
 /**
@@ -27,7 +29,9 @@ export async function cfAiGenerate(env, model, prompt, systemPrompt = '') {
 		if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
 		messages.push({ role: 'user', content: prompt });
 
-		const result = await env.AI.run(model, { messages, max_tokens: 512 });
+		const result = await env.AI.run(model, { messages, max_tokens: 512 }, {
+			headers: { 'x-session-affinity': 'xaridotis-bg' },
+		});
 		return result?.response || null;
 	} catch (e) {
 		console.error(`CF AI error (${model}):`, e.message);

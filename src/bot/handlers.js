@@ -1088,9 +1088,15 @@ export async function handleMessage(msg, env) {
 		let _passIndex = 0;
 		const runGenerateLoop = async () => {
 		while (!isComplete) {
-			// First pass with no tool calls: use streaming for animated text
-			// Tool-calling passes: use non-streaming (need complete response for function call/response pairs)
-			const useStreaming = isFirstPass;
+			// Streaming vs non-streaming decision:
+			// - First pass with no tool calls: streaming (animated text) UNLESS media
+			//   is present. Voice/audio/video/image uploads increase Gemini's time-to-
+			//   first-chunk significantly (observed 20s+); streaming through the draft
+			//   bubble adds complexity with no UX gain on media replies (user is not
+			//   watching for typing animation after uploading a voice note).
+			// - Tool-calling passes: non-streaming (need complete response for
+			//   function call/response pairs).
+			const useStreaming = isFirstPass && !hasMedia;
 
 			// DIAGNOSTICS: mark start of generation call — if we never see generation_complete
 			// for this pass, it means the model call itself hung or was cancelled mid-stream.

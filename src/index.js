@@ -1381,17 +1381,28 @@ export default {
 		}
 
 		if (task) {
-			// ALWAYS use ctx.waitUntil so we return 200 to Telegram immediately.
-			// The 5-minute CPU limit (set in wrangler.jsonc) gives waitUntil plenty of time.
-			// This prevents Telegram from canceling/retrying the webhook.
-			ctx.waitUntil(
-				task.catch(err => {
-					log.error('task_failed', { msg: err.message, stack: err.stack?.slice(0, 500) });
-					if (env.OWNER_ID) {
-						telegram.sendMessage(env.OWNER_ID, 'default', `⚠️ <b>Error:</b> <code>${(err.message || '').slice(0, 200)}</code>`, env).catch(() => {});
-					}
-				})
-			);
+			// Await the task directly instead of using ctx.waitUntil.
+			//
+			// Why: ctx.waitUntil has a HARD 30-second ceiling (Cloudflare docs:
+			// https://developers.cloudflare.com/workers/runtime-apis/context/#waituntil)
+			// regardless of cpu_ms. This is NOT the CPU limit (which is 5 min on the
+			// paid plan) — it's a separate wall-clock cap on post-response lifetime.
+			// Voice notes and long Pro generations were silently dying at that ceiling.
+			//
+			// Awaiting the task keeps the fetch handler alive for its full budget,
+			// which is governed by CPU ms + the Telegram webhook's ~60s patience.
+			// On the paid plan this comfortably covers voice + Pro generation.
+			//
+			// Heavy Pro messages still route through the queue above (see line ~1363),
+			// so this change affects Flash / owner / media flows specifically.
+			try {
+				await task;
+			} catch (err) {
+				log.error('task_failed', { msg: err.message, stack: err.stack?.slice(0, 500) });
+				if (env.OWNER_ID) {
+					await telegram.sendMessage(env.OWNER_ID, 'default', `⚠️ <b>Error:</b> <code>${(err.message || '').slice(0, 200)}</code>`, env).catch(() => {});
+				}
+			}
 		}
 		return new Response("OK");
 

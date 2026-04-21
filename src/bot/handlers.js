@@ -1,5 +1,5 @@
 import { personas, FORMATTING_RULES, MENTAL_HEALTH_DIRECTIVE, SECOND_BRAIN_DIRECTIVE } from '../config/personas';
-import { createChat, sendChatMessage, sendChatMessageStream, generateImage, setupCache, PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, generateShortResponse, generateWithFallback } from '../lib/ai/gemini';
+import { createChat, sendChatMessage, sendChatMessageStream, generateImage, setupCache, PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, generateShortResponse, generateWithFallback, generateDeepResponse } from '../lib/ai/gemini';
 import { toolRegistry } from '../tools';
 import * as telegram from '../lib/telegram';
 import * as memoryStore from '../services/memoryStore';
@@ -854,9 +854,19 @@ export async function handleMessage(msg, env) {
 			textModel = modelOverride === 'pro' ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
 			log.info('model_override_applied', { model: textModel });
 		} else if (isOwner) {
-			const needsPro = detectComplexTask(userText);
-			textModel = needsPro ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
-			if (needsPro) log.info('model_upgrade', { reason: 'complex_task', model: textModel });
+			// Health check-in replies stay on Flash even if they mention "anxious", "mood",
+			// "tired", etc. These are brief conversational confirmations, not therapeutic
+			// deep-dives. Flash is faster and the Pro preview endpoint is too flaky (503/524)
+			// for what should feel like an instant reply. The /mood command and explicit
+			// emotional messages outside of a check-in still upgrade to Pro.
+			if (healthCheckin) {
+				textModel = FALLBACK_TEXT_MODEL;
+				log.info('model_flash_forced', { reason: 'health_checkin_active', checkin: healthCheckin });
+			} else {
+				const needsPro = detectComplexTask(userText);
+				textModel = needsPro ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
+				if (needsPro) log.info('model_upgrade', { reason: 'complex_task', model: textModel });
+			}
 		}
 
 		const effectivePersona = activePersona;
@@ -977,11 +987,21 @@ export async function handleMessage(msg, env) {
 
 		// Skip code execution when media is present (incompatible with audio/video inline data)
 		// Also skip cache when media is present, because the cache has codeExecution baked in
+		// MENTAL_HEALTH_DIRECTIVE is now baked into the cache alongside persona + formatting
+		// rules, so the clinical protocol reaches the model on cache-hit calls too (register
+		// override inside the directive keeps it inert during casual chat).
 		const _tCacheStart = Date.now();
-		const cacheContext = hasMedia ? null : await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, textModel);
+		const cacheContext = hasMedia ? null : await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, textModel, MENTAL_HEALTH_DIRECTIVE);
 		log.info('cache_setup_done', { elapsed_ms: Date.now() - _tCacheStart, hadCache: !!cacheContext, total_elapsed_ms: _elapsed() });
 
-		const fullSysPrompt = `${personaInstruction}${styleCardSection}\n\n${MENTAL_HEALTH_DIRECTIVE}\n\n${SECOND_BRAIN_DIRECTIVE}\n\n${FORMATTING_RULES}\n${dynamicContext}`;
+		// Context budgeting for the NON-CACHED path only (first message, media, cache expired).
+		// When cache is active, MENTAL_HEALTH_DIRECTIVE is already inside the cache and
+		// fullSysPrompt is dropped by buildCachedConfig anyway.
+		// SECOND_BRAIN_DIRECTIVE stays out of the cache because it's only relevant for
+		// complex technical tasks — gating it saves tokens on the non-cached path.
+		const clinicalDirective = (isEmotionalMsg || healthCheckin) ? `\n\n${MENTAL_HEALTH_DIRECTIVE}` : '';
+		const techDirective = detectComplexTask(userText) ? `\n\n${SECOND_BRAIN_DIRECTIVE}` : '';
+		const fullSysPrompt = `${personaInstruction}${styleCardSection}${clinicalDirective}${techDirective}\n\n${FORMATTING_RULES}\n${dynamicContext}`;
 
 		let chat;
 
@@ -1054,7 +1074,9 @@ export async function handleMessage(msg, env) {
 		if (userParts.length === 0) return;
 
 		// Generate a random draft_id for streaming (non-zero, unique per request)
-		const draftId = Math.floor(Math.random() * 2147483646) + 1;
+		// Mutable so the Pro→Flash fallback path can issue a fresh draftId
+		// to cleanly discard any orphaned Pro draft bubble.
+		let draftId = Math.floor(Math.random() * 2147483646) + 1;
 		let draftActive = false; // tracks if we've sent at least one draft update
 		let lastDraftTime = 0;
 
@@ -1199,8 +1221,15 @@ export async function handleMessage(msg, env) {
 				lastSentMsgId = null;
 				nextMessage = userParts;
 				isFirstPass = true;
+				// Invalidate the orphaned draft bubble from the failed Pro attempt.
+				// Without a fresh draftId, Telegram may show the partial Pro output
+				// and then delete it when Flash finishes, causing the "ghost message"
+				// effect. A new draftId ensures a clean slate.
+				draftId = Math.floor(Math.random() * 2147483646) + 1;
+				draftActive = false;
+				lastDraftTime = 0;
 				// Recreate chat with Flash
-				const flashCache = hasMedia ? null : await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, FALLBACK_TEXT_MODEL);
+				const flashCache = hasMedia ? null : await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, FALLBACK_TEXT_MODEL, MENTAL_HEALTH_DIRECTIVE);
 				chat = await createChat(hist, fullSysPrompt, env, flashCache, FALLBACK_TEXT_MODEL, { skipCodeExecution: hasMedia });
 				await runGenerateLoop();
 			} else {
@@ -1701,20 +1730,38 @@ YOUR RESPONSE (follow this structure naturally, not as a list):
 1. Acknowledge what they shared today. Name the emotions they selected. If the mix of positive and negative is notable (e.g. "inspired but lonely"), explore that tension.
 2. Compare to recent days. Is the score trending up, down, or stable? Are certain emotions recurring? Note any patterns without being clinical.
 3. If past episodes are available, reference what happened in similar emotional states before. What helped? What didn't? Use this to inform your suggestion.
-4. Draw one therapeutic observation. Connect today's emotions to known patterns, triggers, or schemas from the clinical notes. Use AEDP/IFS language gently.
+4. Draw one therapeutic observation. Connect today's emotions to known patterns, triggers, or schemas from the clinical notes. Use therapeutic frameworks (AEDP, IFS, schema therapy) as lenses for YOUR thinking — do NOT name them to the user.
 5. End with ONE natural question that invites deeper conversation but doesn't pressure.
 
 Keep it warm, direct, and personal. 3-5 sentences. No bullet points. No clinical jargon unless it adds genuine insight. You know this person well.`;
 
 			try {
-				const response = await generateShortResponse(contextPrompt, personas.xaridotis.instruction, env);
-				await telegram.sendMessage(chatId, threadId, response || `Thank you for sharing. What has been on your mind today?`, env);
+				// Pro + high thinking for therapeutic synthesis (matching Eukara's pattern).
+				// This is the deepest call in the mood flow — quality matters more than speed.
+				const response = await generateDeepResponse(contextPrompt, personas.xaridotis.instruction, env, {
+					thinkingLevel: 'high',
+					maxOutputTokens: 2000,
+				});
+				const synthesis = response || `Thank you for sharing. What has been on your mind today?`;
+				await telegram.sendMessage(chatId, threadId, synthesis, env);
 
+				// Persist BOTH the synthetic user turn and the synthesis in history.
+				// This gives follow-up messages context about the check-in without
+				// re-encoding the button flow as conversation.
+				const selectionLabel = selected.length
+					? `[I finished my check-in. Selected emotions: ${selected.join(', ')}]`
+					: `[I finished my check-in without selecting specific emotions]`;
 				const histKey = `chat_${chatId}_${threadId}`;
 				let hist = await env.CHAT_KV.get(histKey, { type: 'json' }) || [];
-				hist.push({ role: 'model', parts: [{ text: response }] });
+				hist.push({ role: 'user', parts: [{ text: selectionLabel }] });
+				hist.push({ role: 'model', parts: [{ text: synthesis }] });
 				if (hist.length > 24) hist = hist.slice(-24);
 				await env.CHAT_KV.put(histKey, JSON.stringify(hist), { expirationTtl: 604800 });
+
+				// Clear the check-in active flag — the flow is complete
+				await env.CHAT_KV.delete(`health_checkin_active_${chatId}`);
+
+				log.info('mood_synthesis_sent', { userId, emotionsCount: selected.length, synthesisLen: synthesis.length });
 			} catch (e) {
 				log.error('mood_emotion_response', { msg: e.message });
 				await telegram.sendMessage(chatId, threadId, `You selected: ${selected.join(', ')}. What has been driving those feelings?`, env);

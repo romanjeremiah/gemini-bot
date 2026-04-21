@@ -88,8 +88,10 @@ export async function generateWithFallback(env, contents, config = {}) {
 // ---- Context Caching ----
 const _cacheNames = new Map();
 
-async function getOrCreateCache(personaInstruction, formattingRules, env, model = PRIMARY_TEXT_MODEL) {
-  const cacheKey = `gemini_cache_${model}_${hashStr(personaInstruction).slice(0, 16)}`;
+async function getOrCreateCache(personaInstruction, formattingRules, mentalHealthDirective, env, model = PRIMARY_TEXT_MODEL) {
+  // Hash includes clinical directive so cache invalidates when the clinical
+  // protocol is edited, not just the persona.
+  const cacheKey = `gemini_cache_${model}_${hashStr(personaInstruction + (mentalHealthDirective || '')).slice(0, 16)}`;
 
   // Check in-memory cache first, but validate it's still alive on Google
   if (_cacheNames.has(cacheKey)) {
@@ -114,7 +116,13 @@ async function getOrCreateCache(personaInstruction, formattingRules, env, model 
     }
   }
 
-  const staticContent = `${personaInstruction}\n${formattingRules}`;
+  // Persona + formatting rules + clinical protocol all cached together.
+  // This ensures MENTAL_HEALTH_DIRECTIVE reaches the model on cache-hit calls,
+  // not just on cache-miss calls. The register override inside the directive
+  // means it's inert during casual chat but always available when warm register
+  // activates.
+  const clinicalBlock = mentalHealthDirective ? `\n${mentalHealthDirective}` : '';
+  const staticContent = `${personaInstruction}\n${formattingRules}${clinicalBlock}`;
   const estimatedTokens = Math.ceil(staticContent.length / CHARS_PER_TOKEN);
   const toolsJson = JSON.stringify(normalizedTools);
   const estimatedToolTokens = Math.ceil(toolsJson.length / CHARS_PER_TOKEN);
@@ -207,8 +215,8 @@ export async function createChat(history, systemInstruction, env, cacheContext =
   });
 }
 
-export async function setupCache(personaInstruction, formattingRules, dynamicContext, env, model = PRIMARY_TEXT_MODEL) {
-  const cacheName = await getOrCreateCache(personaInstruction, formattingRules, env, model);
+export async function setupCache(personaInstruction, formattingRules, dynamicContext, env, model = PRIMARY_TEXT_MODEL, mentalHealthDirective = null) {
+  const cacheName = await getOrCreateCache(personaInstruction, formattingRules, mentalHealthDirective, env, model);
   if (!cacheName) return null;
   return { cacheName, dynamicPrefix: dynamicContext };
 }
@@ -331,4 +339,42 @@ export async function generateShortResponse(prompt, systemInstruction, env) {
     if (lastEnd > 0) text = text.slice(0, lastEnd + 1).trim();
   }
   return text;
+}
+
+
+// ---- Deep Response Generation (Pro model, high thinking) ----
+// Used for therapeutic synthesis where quality matters more than speed.
+// No "brief message" override — the caller controls the length via prompt.
+// Pro model with configurable thinkingLevel ('low' | 'medium' | 'high').
+export async function generateDeepResponse(prompt, systemInstruction, env, opts = {}) {
+  const thinkingLevel = opts.thinkingLevel || 'medium';
+  const maxOutputTokens = opts.maxOutputTokens || 2000;
+
+  const config = {
+    systemInstruction,
+    temperature: 1.0,
+    maxOutputTokens,
+    thinkingConfig: { thinkingLevel },
+  };
+
+  const response = await withRetry(
+    () => getAI(env).models.generateContent({
+      model: PRIMARY_TEXT_MODEL,
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config,
+    }),
+    2,
+    // Fallback: retry with Flash if Pro is unavailable
+    () => getAI(env).models.generateContent({
+      model: FALLBACK_TEXT_MODEL,
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config: { systemInstruction, temperature: 1.0, maxOutputTokens },
+    })
+  );
+
+  const text = response.candidates?.[0]?.content?.parts
+    ?.filter(p => p.text && !p.thought)
+    ?.map(p => p.text)
+    ?.join('') || '';
+  return text.trim();
 }

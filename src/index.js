@@ -7,7 +7,7 @@ import * as vectorStore from './services/vectorStore';
 import * as episodeStore from './services/episodeStore';
 import * as telegram from './lib/telegram';
 import { generateSpeech } from './lib/tts';
-import { generateShortResponse, generateWithFallback } from './lib/ai/gemini';
+import { generateShortResponse, generateWithFallback, generateDeepResponse } from './lib/ai/gemini';
 import { storeDiscoveredEffect } from './tools/effect';
 import { personas, MENTAL_HEALTH_DIRECTIVE } from './config/personas';
 import { ARCHITECTURE_SUMMARY } from './config/architecture';
@@ -129,7 +129,12 @@ async function handleHealthCheckIns(env) {
 	else if (currentMins >= eveningMins) {
 		const key = `health_checkin_evening_${today}`;
 		if (await env.CHAT_KV.get(key)) return;
-		if (isUserActive) return;
+
+		// Grace window: defer for 2 hours after the scheduled time if user is active.
+		// After the grace window (22:30 default), send the poll regardless — missing
+		// the evening check-in entirely is worse than a brief interruption.
+		const graceEndMins = eveningMins + 120; // 2-hour grace
+		if (isUserActive && currentMins < graceEndMins) return;
 
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
 		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 1800 });
@@ -466,23 +471,37 @@ ${semanticCtx}
 
 Acknowledge calmly without amplifying the energy. Ask ONE question about sleep or safety. Note any escalating pattern. If past episodes show precedent, reference it.`;
 	} else {
-		contextPrompt = `The user scored ${score}/10 on their mood check-in today.
-Recent mood history (last 7 days):\n${recentScores}
-Clinical notes:\n${clinicalNotes}
-${episodeCtx}
-${semanticCtx}
+		contextPrompt = `The user just logged their mood as ${score}/10 on the bipolar scale. Analyse the data below and respond with a meaningful, grounded acknowledgement.
 
-Respond naturally:
-1. Acknowledge the score briefly.
-2. Compare to recent days. Note any trends (improving, declining, stable).
-3. If past episodes are available, reference what worked or didn't work in similar situations.
-4. From a therapeutic perspective, share one observation about their recent pattern.
-5. Ask them to tap the emotion buttons below to log how they are feeling.
-Keep it warm, concise, and clinically aware. Do not list every data point. Synthesise.`;
+TODAY:
+Mood score: ${score}/10
+
+RECENT MOOD HISTORY:
+${recentScores}
+
+${clinicalNotes ? 'Clinical notes:\n' + clinicalNotes : '(No therapeutic notes on file yet.)'}
+
+${episodeCtx || '(No past episodes to reference.)'}
+
+${semanticCtx || ''}
+
+YOUR RESPONSE (3-5 sentences, natural prose, not a bulleted list):
+1. Acknowledge the score without repeating it numerically. If it stands out against recent days (up, down, stable), note that briefly.
+2. If therapeutic notes or past episodes reveal a pattern relevant to this score, weave one observation in — without sounding clinical.
+3. End with a question that invites the user to say more, worded naturally. Ask EXACTLY one question.
+
+After your message, the user will be shown Positive/Negative emotion buttons to tap — do NOT ask about emotions in your text; the buttons handle that.
+
+Do not mention the data structure, the score number more than once, or how you generated this analysis. Just speak.`;
 	}
 
 	try {
-		const response = await generateShortResponse(contextPrompt, personas.xaridotis.instruction, env);
+		// Pro + medium thinking for initial mood analysis (matching Eukara).
+		// Clinical concern scores (0-1, 9-10) and normal range all get Pro-quality analysis.
+		const response = await generateDeepResponse(contextPrompt, personas.xaridotis.instruction, env, {
+			thinkingLevel: 'medium',
+			maxOutputTokens: 1500,
+		});
 		const aiMsg = response || 'Tap below to tell me about your emotions.';
 
 		// Show emotion buttons for normal range (2-8)
@@ -494,6 +513,17 @@ Keep it warm, concise, and clinically aware. Do not list every data point. Synth
 		} : undefined;
 
 		await telegram.sendMessage(chatId, threadId, aiMsg, env, null, btns);
+
+		// Persist in history so the user's next message has context about the check-in.
+		// Synthetic user turn labels the mood logging event without re-encoding the poll.
+		const threadKey = `chat_${chatId}_${threadId}`;
+		let hist = await env.CHAT_KV.get(threadKey, { type: 'json' }) || [];
+		hist.push({ role: 'user', parts: [{ text: `[I just logged my mood as ${score}/10]` }] });
+		hist.push({ role: 'model', parts: [{ text: aiMsg }] });
+		if (hist.length > 24) hist = hist.slice(-24);
+		await env.CHAT_KV.put(threadKey, JSON.stringify(hist), { expirationTtl: 604800 });
+
+		log.info('mood_analysis_sent', { userId, score, analysisLen: aiMsg.length });
 	} catch (e) {
 		log.error('mood_poll_response_error', { msg: e.message });
 		await telegram.sendMessage(chatId, threadId, 'How are your emotions today?', env, null, {
@@ -1112,9 +1142,15 @@ async function enqueueHealthTasks(env) {
 		}
 	}
 	// Evening check-in
+	// Grace window: defer for 2 hours if user is active. After the grace window,
+	// send the poll regardless — missing the evening mood check entirely is worse
+	// than a brief interruption. This prevents late-working days from skipping
+	// the day's evening entry entirely.
 	else if (currentMins >= eveningMins) {
 		const key = `health_checkin_evening_${today}`;
-		if (!(await env.CHAT_KV.get(key)) && !isUserActive) {
+		const graceEndMins = eveningMins + 120; // 2-hour grace
+		const shouldDefer = isUserActive && currentMins < graceEndMins;
+		if (!(await env.CHAT_KV.get(key)) && !shouldDefer) {
 			await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
 			if (!(await moodStore.hasCheckedInToday(env, userId, 'evening'))) {
 				await env.TASK_QUEUE.send({ type: 'mood_poll', chatId });
@@ -1317,7 +1353,15 @@ export default {
 			const isCommand = /^\/\w+/.test(userText);
 			const isOwner = env.OWNER_ID && String(update.message.from?.id) === String(env.OWNER_ID);
 
-			if (!isCommand && isOwner && env.TASK_QUEUE && detectComplexTask(userText)) {
+			// Replies during an active health check-in MUST stay on the fast path (Flash + waitUntil).
+			// detectComplexTask matches on "anxious", "mood", "sleep", etc — exactly the words
+			// morning/evening check-ins invite. Without this override, simple med-confirmation
+			// replies get queued to Pro, hit 503/524 on preview, and silently fail.
+			const activeCheckin = isOwner
+				? await env.CHAT_KV.get(`health_checkin_active_${update.message.chat.id}`).catch(() => null)
+				: null;
+
+			if (!isCommand && isOwner && !activeCheckin && env.TASK_QUEUE && detectComplexTask(userText)) {
 				try {
 					await env.TASK_QUEUE.send({ type: 'user_message', message: update.message });
 					log.info('message_queued', { chatId: update.message.chat.id, len: userText.length });
@@ -1329,6 +1373,9 @@ export default {
 					task = handleMessage(update.message, env);
 				}
 			} else {
+				if (activeCheckin) {
+					log.info('checkin_fast_path', { chatId: update.message.chat.id, checkin: activeCheckin });
+				}
 				task = handleMessage(update.message, env);
 			}
 		}
@@ -1413,9 +1460,15 @@ export default {
 						await handleMessage(task.message, env);
 						log.info('queue_user_message_done', { chatId: qChatId });
 					} catch (hmErr) {
-						// If handleMessage crashes, send the error to Telegram so we can SEE it
-						const errText = `⚠️ <b>Queue handleMessage error:</b>\n<code>${(hmErr.message || '').slice(0, 300)}</code>\n<code>${(hmErr.stack || '').slice(0, 300)}</code>`;
-						await telegram.sendMessage(qChatId, qThreadId, errText, env).catch(() => {});
+						// Only notify the user on the FINAL retry attempt. Otherwise the user
+						// gets spammed with the same error 3 times in a row when a message fails permanently.
+						// Cloudflare Queues default max_retries = 3, so attempts reach 3 on the last try.
+						const attempts = msg.attempts || 1;
+						log.error('queue_handleMessage_error', { chatId: qChatId, attempt: attempts, msg: hmErr.message });
+						if (attempts >= 3) {
+							const errText = `⚠️ <b>Message failed after ${attempts} attempts:</b>\n<code>${(hmErr.message || '').slice(0, 300)}</code>`;
+							await telegram.sendMessage(qChatId, qThreadId, errText, env).catch(() => {});
+						}
 						throw hmErr; // re-throw for queue retry
 					}
 				}

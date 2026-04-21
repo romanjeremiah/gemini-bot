@@ -174,7 +174,6 @@ function buildConfig(systemInstruction, opts = {}) {
     tools,
     toolConfig: { includeServerSideToolInvocations: true },
     temperature: 1.0,
-    maxOutputTokens: 8192,
   };
 
   // Gemini 3.1 Pro supports 'low', 'medium', 'high' thinking levels.
@@ -191,7 +190,6 @@ function buildCachedConfig(cacheName, opts = {}) {
   const config = {
     cachedContent: cacheName,
     temperature: 1.0,
-    maxOutputTokens: 8192,
   };
 
   if (opts.thinkingLevel) {
@@ -241,34 +239,73 @@ export async function* sendChatMessage(chat, message) {
 
 // ---- True streaming: yields text chunks as Gemini generates them ----
 // Used for the animated text appearing effect via Telegram's sendMessageDraft.
-// Falls back to non-streaming if sendMessageStream is unavailable.
-export async function* sendChatMessageStream(chat, message) {
-  try {
-    const stream = await chat.sendMessageStream({ message });
-    for await (const chunk of stream) {
-      const parts = chunk.candidates?.[0]?.content?.parts || [];
-      for (const part of parts) {
-        if (part.text && !part.thought) {
-          yield { type: 'text', text: part.text };
-        }
-        if (part.executableCode) {
-          yield { type: 'text', text: `\n<i>⚙️ Computing...</i>\n` };
-        }
-        if (part.codeExecutionResult) {
-          yield { type: 'text', text: `\n<b>Result:</b> <code>${part.codeExecutionResult.output.trim()}</code>\n` };
-        }
-      }
-      // Function calls in streaming come in the final chunk
-      const calls = parts.filter(p => p.functionCall && p.functionCall.name !== 'googleSearch');
-      if (calls.length) yield { type: 'functionCall', calls };
+//
+// READ-IDLE WATCHDOG: If no chunk arrives for STREAM_IDLE_MS while the
+// connection is still open, throw StreamIdleError. This surfaces silent
+// stalls as a distinct signal instead of letting Cloudflare kill the
+// invocation with no trace. The handler can then fall back cleanly.
+// This is NOT a total-generation timeout — there is no cap on overall
+// response length, only on inter-chunk silence.
+const STREAM_IDLE_MS = 25000;
 
-      const gm = chunk.candidates?.[0]?.groundingMetadata;
-      if (gm) yield { type: 'groundingMetadata', metadata: gm };
-    }
+export class StreamIdleError extends Error {
+  constructor(idleMs) {
+    super(`STREAM_IDLE: no chunk received for ${idleMs}ms`);
+    this.name = 'StreamIdleError';
+    this.code = 'STREAM_IDLE';
+    this.idleMs = idleMs;
+  }
+}
+
+export async function* sendChatMessageStream(chat, message) {
+  let stream;
+  try {
+    stream = await chat.sendMessageStream({ message });
   } catch (err) {
-    // If streaming fails, fall back to non-streaming
-    console.warn('⚠️ Stream fallback to non-streaming:', err.message);
+    // Initial call failed (network, 4xx, 5xx). Surface error details
+    // before falling back so logs capture what Gemini actually returned.
+    console.warn('⚠️ Stream open failed:', err.status || '', err.message);
     yield* sendChatMessage(chat, message);
+    return;
+  }
+
+  const iterator = stream[Symbol.asyncIterator]();
+
+  while (true) {
+    let idleTimer;
+    const idlePromise = new Promise((_, reject) => {
+      idleTimer = setTimeout(() => reject(new StreamIdleError(STREAM_IDLE_MS)), STREAM_IDLE_MS);
+    });
+
+    let result;
+    try {
+      result = await Promise.race([iterator.next(), idlePromise]);
+    } finally {
+      clearTimeout(idleTimer);
+    }
+
+    if (result.done) return;
+    const chunk = result.value;
+
+    const parts = chunk.candidates?.[0]?.content?.parts || [];
+    for (const part of parts) {
+      if (part.text && !part.thought) yield { type: 'text', text: part.text };
+      if (part.executableCode) yield { type: 'text', text: `\n<i>⚙️ Computing...</i>\n` };
+      if (part.codeExecutionResult) yield { type: 'text', text: `\n<b>Result:</b> <code>${part.codeExecutionResult.output.trim()}</code>\n` };
+    }
+    const calls = parts.filter(p => p.functionCall && p.functionCall.name !== 'googleSearch');
+    if (calls.length) yield { type: 'functionCall', calls };
+
+    // Observability: surface finishReason + blockReason so the handler can log them
+    const candidate = chunk.candidates?.[0];
+    if (candidate?.finishReason && candidate.finishReason !== 'STOP') {
+      yield { type: 'finishReason', reason: candidate.finishReason };
+    }
+    const pf = chunk.promptFeedback;
+    if (pf?.blockReason) yield { type: 'blockReason', reason: pf.blockReason };
+
+    const gm = candidate?.groundingMetadata;
+    if (gm) yield { type: 'groundingMetadata', metadata: gm };
   }
 }
 

@@ -147,6 +147,16 @@ export async function sendMessageDraft(chatId, threadId, draftId, text, env, rep
 	return await tgApi("sendMessageDraft", env, payload);
 }
 
+// ---- Clear a draft bubble (Bot API 9.3+) ----
+// Sending sendMessageDraft with empty text clears the animating draft bubble.
+// Used to discard orphaned drafts after a failed Pro attempt before retrying
+// with Flash, so the user doesn't see a ghost "..." message next to the real reply.
+export async function clearMessageDraft(chatId, threadId, draftId, env) {
+	const payload = { chat_id: chatId, draft_id: draftId, text: '' };
+	if (threadId && threadId !== "default") payload.message_thread_id = Number(threadId);
+	return await tgApi("sendMessageDraft", env, payload);
+}
+
 // ---- Edit existing message ----
 export async function editMessage(chatId, msgId, text, env, markup = null) {
 	const cleanText = sanitizeTelegramHTML(text);

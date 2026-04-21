@@ -1,5 +1,5 @@
 import { personas, FORMATTING_RULES, MENTAL_HEALTH_DIRECTIVE, SECOND_BRAIN_DIRECTIVE } from '../config/personas';
-import { createChat, sendChatMessage, sendChatMessageStream, generateImage, setupCache, PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, generateShortResponse, generateWithFallback, generateDeepResponse } from '../lib/ai/gemini';
+import { createChat, sendChatMessage, sendChatMessageStream, generateImage, setupCache, PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, generateShortResponse, generateWithFallback, generateDeepResponse, StreamIdleError } from '../lib/ai/gemini';
 import { toolRegistry } from '../tools';
 import * as telegram from '../lib/telegram';
 import * as memoryStore from '../services/memoryStore';
@@ -1110,6 +1110,8 @@ export async function handleMessage(msg, env) {
 
 			let passText = "", toolCalls = [];
 			let _firstChunkTime = null;
+			let _finishReason = null;
+			let _blockReason = null;
 
 			for await (const chunk of stream) {
 				if (_firstChunkTime === null) _firstChunkTime = Date.now();
@@ -1132,6 +1134,10 @@ export async function handleMessage(msg, env) {
 					}
 				} else if (chunk.type === 'functionCall') {
 					toolCalls.push(...chunk.calls);
+				} else if (chunk.type === 'finishReason') {
+					_finishReason = chunk.reason;
+				} else if (chunk.type === 'blockReason') {
+					_blockReason = chunk.reason;
 				}
 			}
 
@@ -1143,6 +1149,8 @@ export async function handleMessage(msg, env) {
 				ttfb_ms: _firstChunkTime ? _firstChunkTime - _tGenStart : null,
 				response_chars: passText.length,
 				tool_calls: toolCalls.length,
+				finish_reason: _finishReason,
+				block_reason: _blockReason,
 				total_elapsed_ms: _elapsed(),
 			});
 
@@ -1208,29 +1216,74 @@ export async function handleMessage(msg, env) {
 		try {
 			await runGenerateLoop();
 		} catch (proErr) {
-			const msg = proErr?.message || '';
-			const isRetryable = msg.includes('503') || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')
-				|| msg.includes('overloaded') || msg.includes('unavailable') || msg.includes('UNAVAILABLE')
-				|| proErr?.status === 503 || proErr?.status === 429;
+			const errMsg = proErr?.message || '';
+			const errCode = proErr?.code || proErr?.status || null;
+			const isIdle = proErr instanceof StreamIdleError || proErr?.code === 'STREAM_IDLE';
+			const isOverload = errMsg.includes('503') || errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED')
+				|| errMsg.includes('overloaded') || errMsg.includes('unavailable') || errMsg.includes('UNAVAILABLE')
+				|| errMsg.includes('DEADLINE_EXCEEDED') || errMsg.includes('INTERNAL')
+				|| proErr?.status === 503 || proErr?.status === 429 || proErr?.status === 500 || proErr?.status === 504;
+			const isRetryable = isIdle || isOverload;
+
+			// Full error signal capture for observability — so we can see in logs
+			// exactly what Gemini returned (or failed to return).
+			log.warn('generation_failed', {
+				chatId,
+				model: textModel,
+				retryable: isRetryable,
+				is_idle_stall: isIdle,
+				err_code: errCode,
+				err_name: proErr?.name,
+				err_status: proErr?.status,
+				retry_after: proErr?.headers?.['retry-after'] || proErr?.retryAfter || null,
+				err_msg: errMsg.slice(0, 200),
+			});
+
 			if (isRetryable && textModel === PRIMARY_TEXT_MODEL) {
-				log.warn('pro_fallback_to_flash', { error: msg.slice(0, 100), model: textModel });
+				log.warn('pro_fallback_to_flash', { error: errMsg.slice(0, 100), model: textModel, reason: isIdle ? 'stream_idle' : 'overload' });
+
+				// Delete the orphaned draft bubble from the failed attempt so Telegram
+				// doesn't show a ghost "..." message alongside the Flash reply.
+				if (draftActive) {
+					try {
+						await telegram.clearMessageDraft(chatId, threadId, draftId, env);
+					} catch { /* best-effort cleanup */ }
+				}
+
+				// Reset state for retry — nextMessage keeps the ORIGINAL userParts
+				// so the user never has to resend.
 				textModel = FALLBACK_TEXT_MODEL;
-				// Reset state for retry
 				isComplete = false;
 				fullText = "";
 				lastSentMsgId = null;
 				nextMessage = userParts;
 				isFirstPass = true;
-				// Invalidate the orphaned draft bubble from the failed Pro attempt.
-				// Without a fresh draftId, Telegram may show the partial Pro output
-				// and then delete it when Flash finishes, causing the "ghost message"
-				// effect. A new draftId ensures a clean slate.
 				draftId = Math.floor(Math.random() * 2147483646) + 1;
 				draftActive = false;
 				lastDraftTime = 0;
-				// Recreate chat with Flash
+
 				const flashCache = hasMedia ? null : await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, FALLBACK_TEXT_MODEL, MENTAL_HEALTH_DIRECTIVE);
 				chat = await createChat(hist, fullSysPrompt, env, flashCache, FALLBACK_TEXT_MODEL, { skipCodeExecution: hasMedia });
+				await runGenerateLoop();
+			} else if (isIdle && textModel === FALLBACK_TEXT_MODEL) {
+				// Flash streamed-and-stalled. Last-resort safety net: retry same model
+				// but force non-streaming. This catches the "stream never emits first chunk"
+				// case without changing models. User message is preserved.
+				log.warn('flash_stall_nonstream_retry', { error: errMsg.slice(0, 100) });
+
+				if (draftActive) {
+					try {
+						await telegram.clearMessageDraft(chatId, threadId, draftId, env);
+					} catch { /* best-effort cleanup */ }
+				}
+
+				isComplete = false;
+				fullText = "";
+				lastSentMsgId = null;
+				nextMessage = userParts;
+				isFirstPass = false; // force non-streaming path inside runGenerateLoop
+				draftActive = false;
+
 				await runGenerateLoop();
 			} else {
 				throw proErr;

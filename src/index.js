@@ -1381,26 +1381,37 @@ export default {
 		}
 
 		if (task) {
-			// Await the task directly instead of using ctx.waitUntil.
+			// Hybrid dispatch: split by known-slow cases.
 			//
-			// Why: ctx.waitUntil has a HARD 30-second ceiling (Cloudflare docs:
-			// https://developers.cloudflare.com/workers/runtime-apis/context/#waituntil)
-			// regardless of cpu_ms. This is NOT the CPU limit (which is 5 min on the
-			// paid plan) — it's a separate wall-clock cap on post-response lifetime.
-			// Voice notes and long Pro generations were silently dying at that ceiling.
-			//
-			// Awaiting the task keeps the fetch handler alive for its full budget,
-			// which is governed by CPU ms + the Telegram webhook's ~60s patience.
-			// On the paid plan this comfortably covers voice + Pro generation.
-			//
-			// Heavy Pro messages still route through the queue above (see line ~1363),
-			// so this change affects Flash / owner / media flows specifically.
-			try {
-				await task;
-			} catch (err) {
-				log.error('task_failed', { msg: err.message, stack: err.stack?.slice(0, 500) });
-				if (env.OWNER_ID) {
-					await telegram.sendMessage(env.OWNER_ID, 'default', `⚠️ <b>Error:</b> <code>${(err.message || '').slice(0, 200)}</code>`, env).catch(() => {});
+			// - Fast path (await): text messages, short callbacks. Telegram waits
+			//   for our 200 OK (typically <10s). No waitUntil ceiling concern.
+			// - Background path (waitUntil): media uploads (voice/image/video/audio)
+			//   and long-running callbacks. Telegram gets 200 OK instantly so it
+			//   doesn't cancel + retry. Work completes within the 30s waitUntil
+			//   budget (Cloudflare docs: https://developers.cloudflare.com/workers/runtime-apis/context/#waituntil).
+			//   Known gap: if a media task exceeds 30s, it dies silently. Fix in
+			//   Part B by routing to env.TASK_QUEUE (15-min wall clock).
+			const msg = update.message || update.business_message;
+			const hasMedia = !!(msg && (msg.photo || msg.voice || msg.audio || msg.video || msg.video_note || msg.document || msg.sticker));
+			const useBackground = hasMedia || !!update.callback_query;
+
+			if (useBackground) {
+				ctx.waitUntil(
+					task.catch(err => {
+						log.error('bg_task_failed', { msg: err.message, stack: err.stack?.slice(0, 500) });
+						if (env.OWNER_ID) {
+							telegram.sendMessage(env.OWNER_ID, 'default', `⚠️ <b>Error:</b> <code>${(err.message || '').slice(0, 200)}</code>`, env).catch(() => {});
+						}
+					})
+				);
+			} else {
+				try {
+					await task;
+				} catch (err) {
+					log.error('task_failed', { msg: err.message, stack: err.stack?.slice(0, 500) });
+					if (env.OWNER_ID) {
+						await telegram.sendMessage(env.OWNER_ID, 'default', `⚠️ <b>Error:</b> <code>${(err.message || '').slice(0, 200)}</code>`, env).catch(() => {});
+					}
 				}
 			}
 		}

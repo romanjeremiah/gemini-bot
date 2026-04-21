@@ -220,10 +220,13 @@ export async function setupCache(personaInstruction, formattingRules, dynamicCon
 }
 
 // ---- Non-streaming: waits for full response (needed for function calling) ----
-export async function* sendChatMessage(chat, message) {
+// opts.fastFail: skip the retry loop — used when we're already recovering
+// from a 503 on a different transport and don't want to compound the wait.
+export async function* sendChatMessage(chat, message, opts = {}) {
+  const maxRetries = opts.fastFail ? 1 : 3;
   const response = await withRetry(
     () => chat.sendMessage({ message }),
-    3, null
+    maxRetries, null
   );
   const parts = response.candidates?.[0]?.content?.parts || [];
   for (const part of parts) {
@@ -264,8 +267,12 @@ export async function* sendChatMessageStream(chat, message) {
   } catch (err) {
     // Initial call failed (network, 4xx, 5xx). Surface error details
     // before falling back so logs capture what Gemini actually returned.
+    // fastFail: skip the 3x retry loop inside sendChatMessage — we already
+    // have one failure from the streaming attempt; burning 7s of backoff
+    // against the same overloaded model just causes Telegram to cancel
+    // the webhook.
     console.warn('⚠️ Stream open failed:', err.status || '', err.message);
-    yield* sendChatMessage(chat, message);
+    yield* sendChatMessage(chat, message, { fastFail: true });
     return;
   }
 

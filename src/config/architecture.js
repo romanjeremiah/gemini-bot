@@ -93,7 +93,7 @@ DATABASE TABLES:
 - user_profiles (9 columns)
 
 KNOWN LIMITATIONS:
-- Hardcoded Europe/London timezone (no travel support)
+- Per-chat timezone via location pin (Google Time Zone API) or /timezone command, stored in KV (timezone_<chatId>), defaults to UTC
 - generateShortResponse uses Flash (Pro causes token exhaustion)
 - D1 can timeout under heavy concurrent load
 - No end-to-end encryption for therapeutic data

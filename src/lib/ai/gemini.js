@@ -3,6 +3,7 @@ import { toolDefinitions } from '../../tools/index.js';
 
 export const PRIMARY_TEXT_MODEL   = 'gemini-3.1-pro-preview';
 export const FALLBACK_TEXT_MODEL  = 'gemini-3-flash-preview';
+export const FLASH_LITE_TEXT_MODEL = 'gemini-3.1-flash-lite-preview';
 const PRIMARY_IMAGE_MODEL  = 'gemini-3-pro-image-preview';     // Nano Banana Pro — best quality gen + edit
 const FALLBACK_IMAGE_MODEL = 'gemini-3.1-flash-image-preview'; // Nano Banana 2 — fast fallback
 
@@ -351,11 +352,13 @@ export async function generateImage(prompt, env, inputImageBase64 = null, inputM
 
 
 // ---- UI Text Generation (Fast & Contextual) ----
-// Uses Flash model via direct connection for speed. No tools, no history.
+// Uses Flash-Lite via direct connection for speed and cost. No tools, no history.
+// Flash-Lite ($0.25/$1.50 per 1M) is ~half the price of Flash and designed for
+// exactly this workload: short, high-volume, agentic text generation.
 export async function generateShortResponse(prompt, systemInstruction, env) {
   const response = await withRetry(
     () => getAI(env).models.generateContent({
-      model: FALLBACK_TEXT_MODEL,
+      model: FLASH_LITE_TEXT_MODEL,
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       config: {
         systemInstruction: `${systemInstruction}\n\nYou are generating a brief message for a Telegram bot. Keep it to 2-4 complete sentences. Be fully in character. No asterisks, no markdown, no HTML tags. You MUST finish every sentence completely. Never stop mid-sentence or mid-thought.`,

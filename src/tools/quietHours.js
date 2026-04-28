@@ -58,10 +58,11 @@ export const quietHoursTool = {
 			{ expirationTtl: secondsUntil + 60 } // small buffer so the check succeeds right at the boundary
 		);
 
-		// Format end time in London 24h for acknowledgement
+		// Format end time in the user's local timezone for acknowledgement
 		const endDate = new Date(cappedEnd * 1000);
+		const userTz = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Etc/UTC';
 		const endLabel = endDate.toLocaleString('en-GB', {
-			timeZone: 'Europe/London',
+			timeZone: userTz,
 			hour: '2-digit',
 			minute: '2-digit',
 			hour12: false,

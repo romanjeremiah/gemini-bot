@@ -46,12 +46,13 @@ export const searchResearchTool = {
 
 			if (!results?.length) return { status: "empty", message: "No deep research results found yet. Ask me to research any topic and I will investigate it deeply." };
 
-			// Build numbered list
+			// Build numbered list — uses the user's stored timezone for date display
+			const userTz = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Etc/UTC';
 			const items = results.map((r, i) => {
 				const topicMatch = r.fact.match(/^Deep Research \(([^)]+)\):/);
 				const topic = topicMatch ? topicMatch[1] : 'Unknown topic';
 				const date = new Date(r.created_at + 'Z').toLocaleDateString('en-GB', {
-					timeZone: 'Europe/London', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'
+					timeZone: userTz, day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'
 				});
 				const summary = r.fact.replace(/^Deep Research \([^)]+\):\s*/, '').slice(0, 120);
 				return { num: i + 1, topic, date, summary, category: r.category, id: r.id };

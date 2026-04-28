@@ -47,12 +47,16 @@ export function buildUserIdentity(msg) {
 
 /**
  * Get user's timezone from their profile.
+ * Defaults to UTC if no profile or no timezone column set. The canonical store
+ * for active users is the KV key `timezone_${chatId}` (set via location pin or
+ * /timezone command); this function is currently unused and exists for D1
+ * cross-device sync that may come later.
  */
 export async function getUserTimezone(env, userId) {
 	const row = await env.DB.prepare(
 		'SELECT timezone FROM user_profiles WHERE user_id = ?'
 	).bind(userId).first();
-	return row?.timezone || 'Europe/London';
+	return row?.timezone || 'Etc/UTC';
 }
 
 /**

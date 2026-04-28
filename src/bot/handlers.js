@@ -1,5 +1,6 @@
 import { personas, FORMATTING_RULES, MENTAL_HEALTH_DIRECTIVE, SECOND_BRAIN_DIRECTIVE } from '../config/personas';
-import { createChat, sendChatMessage, sendChatMessageStream, generateImage, setupCache, PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, generateShortResponse, generateWithFallback, generateDeepResponse, StreamIdleError } from '../lib/ai/gemini';
+import { MOOD_POLL_OPTIONS } from '../config/moodScale';
+import { createChat, sendChatMessage, sendChatMessageStream, generateImage, setupCache, PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, FLASH_LITE_TEXT_MODEL, generateShortResponse, generateWithFallback, generateDeepResponse, StreamIdleError } from '../lib/ai/gemini';
 import { toolRegistry } from '../tools';
 import * as telegram from '../lib/telegram';
 import * as memoryStore from '../services/memoryStore';
@@ -154,6 +155,31 @@ export function detectComplexTask(text) {
 
 	// Long messages
 	if (text.length > 300) return true;
+
+	return false;
+}
+
+/**
+ * Detect simple messages suitable for Flash-Lite.
+ * Short casual chat, acknowledgments, data points, one-liners.
+ * Runs AFTER detectComplexTask — complex wins.
+ */
+export function isSimpleMessage(text) {
+	if (!text) return true; // empty/media-only → Flash-Lite by default
+	const trimmed = text.trim();
+
+	// Very short: always simple
+	if (trimmed.length < 30) return true;
+
+	// Acknowledgments, confirmations, reactions
+	if (/^(ok|okay|yes|yep|yeah|no|nope|nah|thanks|ty|cool|nice|sure|done|sound|sounds good|got it|right|alright|cheers|k|kk)\b/i.test(trimmed)) return true;
+
+	// Data point reports (sleep hours, meds, quick mood notes)
+	// Examples: "slept 7h", "meds done", "8 hours last night", "took them"
+	if (/^(slept|sleep|meds|medication|took|had|feeling|mood)\b/i.test(trimmed) && trimmed.length < 80) return true;
+
+	// Short statements without questions (conversational flow, not substantive query)
+	if (!/[?]/.test(trimmed) && trimmed.length < 60) return true;
 
 	return false;
 }
@@ -455,24 +481,11 @@ async function handleCommand(command, msg, env) {
 		case "/mood": {
 			await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 1800 });
 
-			// Send mood poll (0-10 bipolar scale)
-			const moodOptions = [
-				'0: Crisis. Suicidal thoughts, total despair.',
-				'1: Severe. Hopeless, guilt, can\'t function.',
-				'2: Low. Persistent sadness, withdrawn.',
-				'3: Struggling. Anxious, irritable.',
-				'4: Below average. Flat, low energy.',
-				'5: Neutral. Steady baseline.',
-				'6: Good. Positive, engaged.',
-				'7: Very good. Productive, optimistic.',
-				'8: Elevated. Racing thoughts, less sleep.',
-				'9: Hypomanic. Impulsive, grandiose.',
-				'10: Manic. Reckless, detached.',
-			];
-
+			// Send mood poll (0-10 bipolar scale). Uses the canonical MOOD_POLL_OPTIONS
+			// imported from config/moodScale.js — same text as the scheduled evening poll.
 			const pollRes = await telegram.sendPoll(chatId, threadId,
 				'How do you feel right now?',
-				moodOptions,
+				MOOD_POLL_OPTIONS,
 				env, { is_anonymous: false }
 			);
 
@@ -487,19 +500,39 @@ async function handleCommand(command, msg, env) {
 		case "/timezone": {
 			const tz = (msg.text || '').replace('/timezone', '').trim();
 			if (!tz) {
-				const current = await env.CHAT_KV.get('user_timezone') || 'Europe/London';
+				// Read from canonical per-chat key. Fallback to UTC matches the
+				// default in src/lib/timezone.js when nothing is stored.
+				const current = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Etc/UTC';
 				await telegram.sendMessage(chatId, threadId,
-					`Current timezone: <b>${current}</b>\n\nTo change: <code>/timezone America/New_York</code>\n\nOr share your location and I will detect it automatically.`, env);
+					`Current timezone: <b>${current}</b>\n\nTo change: <code>/timezone America/New_York</code>\n\nOr send your location (paperclip → Location, or use /setlocation) and I'll detect it automatically.`, env);
 				return true;
 			}
 			// Validate timezone
 			try {
 				new Date().toLocaleString('en-US', { timeZone: tz });
-				await env.CHAT_KV.put('user_timezone', tz);
+				// Write to per-chat key (canonical). Old global `user_timezone`
+				// key is left in place for now; migration cleanup in step 6 below.
+				await env.CHAT_KV.put(`timezone_${chatId}`, tz);
 				await telegram.sendMessage(chatId, threadId, `Timezone updated to <b>${tz}</b>. All check-ins and schedules will use this timezone.`, env);
 			} catch {
 				await telegram.sendMessage(chatId, threadId, `Invalid timezone: "${tz}". Use IANA format, e.g. <code>Europe/London</code>, <code>America/New_York</code>, <code>Asia/Tokyo</code>`, env);
 			}
+			return true;
+		}
+		case "/setlocation": {
+			// Send a one-shot reply keyboard with a "Share location" button.
+			// The user taps once, location arrives at the location handler in
+			// src/index.js, which calls Google Time Zone API and updates the
+			// per-chat timezone. The keyboard is removed automatically after use
+			// via one_time_keyboard:true.
+			const replyMarkup = {
+				keyboard: [[{ text: '📍 Share my location', request_location: true }]],
+				one_time_keyboard: true,
+				resize_keyboard: true,
+			};
+			await telegram.sendMessage(chatId, threadId,
+				'Tap below to share your current location. I\'ll detect the timezone and use it for all schedules.',
+				env, null, replyMarkup);
 			return true;
 		}
 		case "/testpoll": {
@@ -596,8 +629,9 @@ async function handleCommand(command, msg, env) {
 				}
 
 				let text = `<b>Deep Research History</b> (${results.length} results)\n\n`;
+				const userTz = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Etc/UTC';
 				for (const r of results) {
-					const date = new Date(r.created_at + 'Z').toLocaleDateString('en-GB', { timeZone: 'Europe/London', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+					const date = new Date(r.created_at + 'Z').toLocaleDateString('en-GB', { timeZone: userTz, day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 					const topicMatch = r.fact.match(/^Deep Research \(([^)]+)\):/);
 					const topic = topicMatch ? topicMatch[1] : 'Unknown';
 					const summary = r.fact.replace(/^Deep Research \([^)]+\):\s*/, '').slice(0, 200);
@@ -803,7 +837,8 @@ export async function handleMessage(msg, env) {
 		if (isListening) {
 			const bufferStr = await env.CHAT_KV.get(`listen_buffer_${chatId}`) || '[]';
 			const buffer = JSON.parse(bufferStr);
-			const timestamp = new Date().toLocaleTimeString('en-GB', { timeZone: 'Europe/London' });
+			const listenTz = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Etc/UTC';
+			const timestamp = new Date().toLocaleTimeString('en-GB', { timeZone: listenTz });
 			buffer.push(`[${timestamp}] ${userText || '(Media uploaded)'}`);
 			await env.CHAT_KV.put(`listen_buffer_${chatId}`, JSON.stringify(buffer), { expirationTtl: 86400 });
 
@@ -844,29 +879,41 @@ export async function handleMessage(msg, env) {
 		// Check health check-in state early (needed for model selection + context gating)
 		const healthCheckin = isOwner ? await env.CHAT_KV.get(`health_checkin_active_${chatId}`) : null;
 
-		// Smart model selection: Pro for complex tasks, Flash for casual conversation
-		// modelOverride from /model command only applies to the NEXT message, then clears
+		// Smart model selection — same chain for everyone, no owner/guest asymmetry.
+		// Ternary tiers:
+		//   Pro  → complex tasks, warm register, mental health (detectComplexTask matches these)
+		//   Flash → medium: substantive chat that isn't a deep request
+		//   Flash-Lite → simple: short, casual, data-point confirmations, check-in replies
+		//
+		// modelOverride from /model command is a one-shot override.
 		const modelOverride = await env.CHAT_KV.get(`model_override_${chatId}_${threadId}`);
-		if (modelOverride) await env.CHAT_KV.delete(`model_override_${chatId}_${threadId}`); // One-shot override
+		if (modelOverride) await env.CHAT_KV.delete(`model_override_${chatId}_${threadId}`);
 
-		let textModel = FALLBACK_TEXT_MODEL;
+		let textModel;
 		if (modelOverride) {
-			textModel = modelOverride === 'pro' ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
+			// User explicitly picked a tier
+			textModel = modelOverride === 'pro' ? PRIMARY_TEXT_MODEL
+				: modelOverride === 'flash' ? FALLBACK_TEXT_MODEL
+				: modelOverride === 'lite' ? FLASH_LITE_TEXT_MODEL
+				: FALLBACK_TEXT_MODEL;
 			log.info('model_override_applied', { model: textModel });
-		} else if (isOwner) {
-			// Health check-in replies stay on Flash even if they mention "anxious", "mood",
-			// "tired", etc. These are brief conversational confirmations, not therapeutic
-			// deep-dives. Flash is faster and the Pro preview endpoint is too flaky (503/524)
-			// for what should feel like an instant reply. The /mood command and explicit
-			// emotional messages outside of a check-in still upgrade to Pro.
-			if (healthCheckin) {
-				textModel = FALLBACK_TEXT_MODEL;
-				log.info('model_flash_forced', { reason: 'health_checkin_active', checkin: healthCheckin });
-			} else {
-				const needsPro = detectComplexTask(userText);
-				textModel = needsPro ? PRIMARY_TEXT_MODEL : FALLBACK_TEXT_MODEL;
-				if (needsPro) log.info('model_upgrade', { reason: 'complex_task', model: textModel });
-			}
+		} else if (healthCheckin) {
+			// Check-in replies are short data-point confirmations. Flash-Lite is ideal:
+			// fast, cheap, and built for this exact workload. Previously forced to Flash.
+			textModel = FLASH_LITE_TEXT_MODEL;
+			log.info('model_lite_forced', { reason: 'health_checkin_active', checkin: healthCheckin });
+		} else if (detectComplexTask(userText)) {
+			// Complex tasks include: code, architecture, mental health keywords,
+			// analytical requests, research triggers, messages >300 chars.
+			// These cover the warm-register triggers at the JS routing layer.
+			textModel = PRIMARY_TEXT_MODEL;
+			log.info('model_upgrade', { reason: 'complex_task', model: textModel });
+		} else if (isSimpleMessage(userText)) {
+			// Simple: short casual chat, acknowledgments, data points
+			textModel = FLASH_LITE_TEXT_MODEL;
+		} else {
+			// Medium default: substantive-but-not-complex
+			textModel = FALLBACK_TEXT_MODEL;
 		}
 
 		const effectivePersona = activePersona;
@@ -965,7 +1012,13 @@ export async function handleMessage(msg, env) {
 		const styleCard = await getStyleCard(env, userId);
 		const styleCardSection = styleCard ? `\n\n=== USER STYLE CARD ===\n${styleCard}\n=== END STYLE CARD ===` : '';
 
-		const dynamicContext = `[Context] Current speaker: ${userIdentity} | London Time: ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })} | Unix: ${Math.floor(Date.now() / 1000)}${weatherCtx ? ` | ${weatherCtx}` : ''} | Relationship: ${daysKnown} days | Persona: ${personaConfig?.display_name || effectivePersona}${checkinProgress}${personaTraits ? `\n\nPERSONA TRAITS FOR THIS USER:\n${personaTraits}` : ''}${customInstruction ? `\n\nCUSTOM INSTRUCTION:\n${customInstruction}` : ''}\n\nMEMORY:\n${memCtx}${semanticCtx}${episodeCtx ? `\n\n${episodeCtx}` : ''}${proceduralCtx ? `\n\n${proceduralCtx}` : ''}${graphCtx ? `\n\n${graphCtx}` : ''}${planCtx}`;
+		// Use the user's stored timezone (from location pin or /timezone) for the
+		// "Local Time" context line passed to Gemini. Falls back to UTC when nothing
+		// stored, matching the policy in src/lib/timezone.js.
+		const promptTz = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Etc/UTC';
+		const localTimeLabel = new Date().toLocaleString("en-GB", { timeZone: promptTz, day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
+
+		const dynamicContext = `[Context] Current speaker: ${userIdentity} | Local Time (${promptTz}): ${localTimeLabel} | Unix: ${Math.floor(Date.now() / 1000)}${weatherCtx ? ` | ${weatherCtx}` : ''} | Relationship: ${daysKnown} days | Persona: ${personaConfig?.display_name || effectivePersona}${checkinProgress}${personaTraits ? `\n\nPERSONA TRAITS FOR THIS USER:\n${personaTraits}` : ''}${customInstruction ? `\n\nCUSTOM INSTRUCTION:\n${customInstruction}` : ''}\n\nMEMORY:\n${memCtx}${semanticCtx}${episodeCtx ? `\n\n${episodeCtx}` : ''}${proceduralCtx ? `\n\n${proceduralCtx}` : ''}${graphCtx ? `\n\n${graphCtx}` : ''}${planCtx}`;
 
 		// DIAGNOSTICS: size breakdown — tells us which dynamic section is bloating the prompt
 		log.info('prompt_sizes', {
@@ -984,6 +1037,23 @@ export async function handleMessage(msg, env) {
 			isEmotionalMsg,
 			elapsed_ms: _elapsed(),
 		});
+
+		// TEMP DIAGNOSTIC: dump full dynamicContext for owner on substantive messages.
+		// Used to identify what memory / style card content is driving persona drift
+		// (repeated sleep-data mentions, clinical terminology in casual chat, etc.).
+		// Remove this log once persona tuning is complete.
+		if (isOwner && (userText.length > 30 || hasMedia)) {
+			log.info('dynamic_context_dump', {
+				chatId,
+				userText: userText.slice(0, 300),
+				memCtx_preview: memCtx.slice(0, 4000),
+				semanticCtx_preview: semanticCtx.slice(0, 1500),
+				episodeCtx_preview: episodeCtx.slice(0, 1500),
+				proceduralCtx_preview: proceduralCtx.slice(0, 1500),
+				graphCtx_preview: graphCtx.slice(0, 1500),
+				styleCard_preview: styleCardSection.slice(0, 2000),
+			});
+		}
 
 		// Skip code execution when media is present (incompatible with audio/video inline data)
 		// Also skip cache when media is present, because the cache has codeExecution baked in
@@ -1086,8 +1156,48 @@ export async function handleMessage(msg, env) {
 
 		// Pro→Flash fallback: if Pro fails with overload/rate-limit, retry with Flash
 		let _passIndex = 0;
+
+		// Cap total generation passes to prevent infinite tool-call loops that blow
+		// through the 30s waitUntil ceiling. 4 passes = up to 4 tool-call round-trips,
+		// which is plenty for any legitimate use case. If we hit the cap, we force
+		// Gemini to emit a final text response using existing tool results.
+		const MAX_PASSES = 4;
+
 		const runGenerateLoop = async () => {
 		while (!isComplete) {
+			// Hard cap on passes: after MAX_PASSES, force a final text pass by
+			// injecting a system-level nudge telling the model to respond to the user
+			// without calling any more tools. This prevents infinite tool loops.
+			if (_passIndex >= MAX_PASSES) {
+				log.warn('max_passes_hit', {
+					chatId,
+					pass: _passIndex,
+					response_chars: fullText.length,
+					total_elapsed_ms: _elapsed(),
+				});
+				// Append a forcing instruction to the next message. The next iteration
+				// will be a plain text request — Gemini should produce a final reply.
+				nextMessage = [{
+					text: 'SYSTEM: You have already gathered sufficient context via tool calls. Respond to the user now with a natural language message. Do not call any more tools.'
+				}];
+				// Temporarily hide tools on the next call by using the non-streaming path.
+				// Note: we can't remove tools mid-session, but we can tell the model not
+				// to use them. If it still calls a tool, we break out anyway.
+			}
+			// Safety valve: absolute ceiling at MAX_PASSES + 1 to avoid any possibility
+			// of an infinite loop if the forcing instruction is ignored.
+			if (_passIndex >= MAX_PASSES + 1) {
+				log.error('runaway_loop_break', {
+					chatId,
+					pass: _passIndex,
+					total_elapsed_ms: _elapsed(),
+				});
+				if (!fullText.trim()) {
+					fullText = 'I gathered some information but ran out of time composing a reply. Could you rephrase what you were asking?';
+				}
+				isComplete = true;
+				break;
+			}
 			// Streaming vs non-streaming decision:
 			// - First pass with no tool calls: streaming (animated text) UNLESS media
 			//   is present. Voice/audio/video/image uploads increase Gemini's time-to-
@@ -1155,6 +1265,7 @@ export async function handleMessage(msg, env) {
 				ttfb_ms: _firstChunkTime ? _firstChunkTime - _tGenStart : null,
 				response_chars: passText.length,
 				tool_calls: toolCalls.length,
+				tool_names: toolCalls.map(c => c.functionCall?.name).filter(Boolean),
 				finish_reason: _finishReason,
 				block_reason: _blockReason,
 				total_elapsed_ms: _elapsed(),

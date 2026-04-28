@@ -7,9 +7,11 @@ import * as vectorStore from './services/vectorStore';
 import * as episodeStore from './services/episodeStore';
 import * as telegram from './lib/telegram';
 import { generateSpeech } from './lib/tts';
+import { setTimezoneFromCoords, getTimezone, getLocalTime, describeOffset } from './lib/timezone';
 import { generateShortResponse, generateWithFallback, generateDeepResponse } from './lib/ai/gemini';
 import { storeDiscoveredEffect } from './tools/effect';
 import { personas, MENTAL_HEALTH_DIRECTIVE } from './config/personas';
+import { MOOD_POLL_OPTIONS } from './config/moodScale';
 import { ARCHITECTURE_SUMMARY } from './config/architecture';
 import { getSchedule, matchesSchedule } from './config/schedules';
 import { toolRegistry } from './tools/index';
@@ -55,7 +57,7 @@ function extractEffectEmoji(msg, effectId) {
 async function handleHealthCheckIns(env) {
 	const chatId = Number(env.OWNER_ID);
 	const userId = chatId; // Owner's private chat: chatId == userId
-	const userTz = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Europe/London';
+	const userTz = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Etc/UTC';
 	const now = new Date();
 	const localTime = new Date(now.toLocaleString('en-US', { timeZone: userTz }));
 	const hour = localTime.getHours();
@@ -154,7 +156,7 @@ async function handleMedicationNudge(env) {
 	const chatId = Number(env.OWNER_ID);
 	const userId = chatId; // Owner's private chat: chatId == userId
 	const now = Date.now();
-	const londonTime = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const londonTime = await getLocalTime(chatId, env);
 	const hour = londonTime.getHours();
 
 	// Only check during relevant hours to avoid unnecessary D1 queries
@@ -207,7 +209,7 @@ async function handleMedicationNudge(env) {
 // Runs Sunday at 20:00 London time. Pulls the week's mood data and generates an analysis.
 async function handleWeeklyReport(env) {
 	const now = new Date();
-	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const londonTime = await getLocalTime(env.OWNER_ID, env, now);
 	const schedule = await getSchedule(env, 'weekly_report');
 
 	if (londonTime.getDay() !== schedule.day || londonTime.getHours() !== schedule.hour) return;
@@ -269,7 +271,7 @@ Do not give advice. Do not prescribe solutions. Present the data, prove your wor
 // Runs Wednesday at 16:00 London time. Checks for active homework or coping strategies.
 async function handleAccountabilityNudge(env) {
 	const now = new Date();
-	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const londonTime = await getLocalTime(env.OWNER_ID, env, now);
 	const schedule = await getSchedule(env, 'accountability_nudge');
 
 	if (londonTime.getDay() !== schedule.day || londonTime.getHours() !== schedule.hour) return;
@@ -314,7 +316,7 @@ Keep it to 2-3 sentences. Be warm and curious, not demanding.`;
 // Runs on the 1st of every month at 03:00 London time.
 async function handleMemoryConsolidation(env) {
 	const now = new Date();
-	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const londonTime = await getLocalTime(env.OWNER_ID, env, now);
 	const schedule = await getSchedule(env, 'memory_consolidation');
 
 	if (londonTime.getDate() !== schedule.date || londonTime.getHours() !== schedule.hour) return;
@@ -351,7 +353,7 @@ async function handleMemoryConsolidation(env) {
 // and merges them into the user's style card using Workers AI.
 async function handleStyleCardConsolidation(env) {
 	const now = new Date();
-	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const londonTime = await getLocalTime(env.OWNER_ID, env, now);
 
 	// Only run at 04:00
 	if (londonTime.getHours() !== 4 || londonTime.getMinutes() > 0) return;
@@ -395,20 +397,8 @@ async function handleStyleCardConsolidation(env) {
 }
 
 // ---- Mood Poll System ----
-// Condensed 0-10 bipolar mood scale descriptions (max 100 chars per option)
-const MOOD_POLL_OPTIONS = [
-	'0: Crisis. Suicidal thoughts, no movement, total despair.',
-	'1: Severe. Hopeless, guilt, feels impossible to function.',
-	'2: Low. Persistent sadness, withdrawn, little motivation.',
-	'3: Struggling. Anxious, irritable, getting through the day.',
-	'4: Below average. Flat mood, low energy but managing.',
-	'5: Neutral. Neither good nor bad, steady baseline.',
-	'6: Good. Positive outlook, engaged, making good choices.',
-	'7: Very good. Productive, social, optimistic and sharp.',
-	'8: Elevated. High energy, racing thoughts, reduced sleep.',
-	'9: Hypomanic. Impulsive, grandiose, poor judgement.',
-	'10: Manic. Reckless, detached from reality, dangerous.',
-];
+// MOOD_POLL_OPTIONS is imported at the top of this file from config/moodScale.js.
+// Canonical 0-10 bipolar mood scale, shared with the manual /mood command.
 
 async function sendMoodPoll(chatId, threadId, env) {
 	const pollRes = await telegram.sendPoll(chatId, threadId,
@@ -539,7 +529,7 @@ Do not mention the data structure, the score number more than once, or how you g
 // Runs every hour 10:00-19:00 London time, triggers ~5% of the time (avg once every few days).
 async function handleSpontaneousOutreach(env) {
 	const now = new Date();
-	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const londonTime = await getLocalTime(env.OWNER_ID, env, now);
 	const hour = londonTime.getHours();
 
 	// Only during sociable hours
@@ -625,7 +615,7 @@ Keep it to 1-2 sentences. DO NOT offer help. DO NOT be a therapist. Just share i
 // Runs Saturday at 10:00 London time. Searches for interesting developments in user's interests.
 async function handleCuriosityDigest(env) {
 	const now = new Date();
-	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const londonTime = await getLocalTime(env.OWNER_ID, env, now);
 	const schedule = await getSchedule(env, 'curiosity_digest');
 
 	if (londonTime.getDay() !== schedule.day || londonTime.getHours() !== schedule.hour) return;
@@ -688,7 +678,7 @@ ${digest}`;
 // Runs Tuesday and Friday at 04:00 London time. Searches ONE random domain deeply.
 async function handleAutonomousResearch(env) {
 	const now = new Date();
-	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const londonTime = await getLocalTime(env.OWNER_ID, env, now);
 	const day = londonTime.getDay();
 	const sched1 = await getSchedule(env, 'autonomous_research_1');
 	const sched2 = await getSchedule(env, 'autonomous_research_2');
@@ -736,7 +726,7 @@ async function handleAutonomousResearch(env) {
 // Researches best practices, compares against architecture, suggests improvements.
 async function handleSelfImprovement(env) {
 	const now = new Date();
-	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const londonTime = await getLocalTime(env.OWNER_ID, env, now);
 	const schedule = await getSchedule(env, 'self_improvement');
 
 	if (londonTime.getDate() !== schedule.date || londonTime.getHours() !== schedule.hour) return;
@@ -795,7 +785,7 @@ ${suggestions}`;
 // ---- Autonomous Architecture Evolution (Hourly Deep Search) ----
 async function handleArchitectureEvolution(env) {
 	const now = new Date();
-	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const londonTime = await getLocalTime(env.OWNER_ID, env, now);
 
 	if (londonTime.getMinutes() !== 0) return;
 
@@ -881,7 +871,7 @@ Keep it under 500 words. End with: "Awaiting your manual review."` }] }],
 // and sometimes shares an insight naturally.
 async function handleDailyStudy(env) {
 	const now = new Date();
-	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+	const londonTime = await getLocalTime(env.OWNER_ID, env, now);
 	const hour = londonTime.getHours();
 
 	// Sleep between 23:00 and 07:00
@@ -1100,14 +1090,22 @@ async function handleReactionFeedback(reaction, env) {
 
 // ---- Queue-based task enqueuing (decouples LLM calls from cron) ----
 async function enqueueHealthTasks(env) {
-	const now = new Date();
-	const londonTime = new Date(now.toLocaleString('en-US', { timeZone: await getUserTimezone(env) }));
-	const hour = londonTime.getHours();
-	const minute = londonTime.getMinutes();
 	const chatId = Number(env.OWNER_ID);
 	const userId = chatId; // Owner's private chat
-	const today = londonTime.toISOString().split('T')[0];
+
+	// Use the per-chat stored timezone (set via location pin or /timezone).
+	// Falls back to UTC if nothing stored (set in src/lib/timezone.js).
+	const localTime = await getLocalTime(chatId, env);
+	const hour = localTime.getHours();
+	const minute = localTime.getMinutes();
+	const today = localTime.toISOString().split('T')[0];
 	const currentMins = hour * 60 + minute;
+
+	// DIAGNOSTIC: log every cron pass so we can see in tail logs what window
+	// the scheduler is in and which guards fire. Cheap (1 log/min) but invaluable
+	// when a check-in mysteriously doesn't fire. Remove once schedule trust restored.
+	const tzForLog = await getTimezone(chatId, env);
+	log.info('cron_run', { chatId, tz: tzForLog, hour, minute, currentMins, today });
 
 	const morning = await getSchedule(env, 'morning_checkin');
 	const midday = await getSchedule(env, 'midday_checkin');
@@ -1124,11 +1122,21 @@ async function enqueueHealthTasks(env) {
 	// Morning check-in
 	if (currentMins >= morningMins && currentMins < middayMins) {
 		const key = `health_checkin_morning_${today}`;
-		if (!(await env.CHAT_KV.get(key)) && !isUserActive) {
+		const alreadyLocked = await env.CHAT_KV.get(key);
+		if (!alreadyLocked && !isUserActive) {
 			await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
-			if (!(await moodStore.hasCheckedInToday(env, userId, 'morning'))) {
+			const alreadyLogged = await moodStore.hasCheckedInToday(env, userId, 'morning');
+			if (!alreadyLogged) {
+				log.info('cron_morning_enqueue', { chatId, today });
 				await env.TASK_QUEUE.send({ type: 'health_checkin', period: 'morning', chatId });
+			} else {
+				log.info('cron_window_skip', { period: 'morning', reason: 'already_logged_today' });
 			}
+		} else if (alreadyLocked) {
+			// Spammy if logged every minute — only log on a transition, every 10 min
+			if (minute % 10 === 0) log.info('cron_window_skip', { period: 'morning', reason: 'already_locked' });
+		} else if (isUserActive) {
+			if (minute % 10 === 0) log.info('cron_window_skip', { period: 'morning', reason: 'user_active' });
 		}
 	}
 	// Midday check-in
@@ -1171,11 +1179,11 @@ async function enqueueHealthTasks(env) {
 	}
 }
 
-// Get user timezone (stored in KV, defaults to Europe/London)
-async function getUserTimezone(env) {
-	const tz = await env.CHAT_KV.get('user_timezone');
-	return tz || 'Europe/London';
-}
+// REMOVED: getUserTimezone helper that read the global `user_timezone` KV key.
+// Replaced by per-chat getTimezone(chatId, env) in src/lib/timezone.js.
+// The dual-key confusion between `user_timezone` (global, single-user) and
+// `timezone_${chatId}` (per-chat) caused cron schedules to use a different
+// timezone from message handling. Now there is one canonical key per chat.
 
 export default {
 	async fetch(request, env, ctx) {
@@ -1272,6 +1280,24 @@ export default {
 
 		let task;
 
+		// ---- Edited live location → debounced timezone update ----
+		// Live locations send edited_message updates as the user moves. To avoid
+		// burning the Time Zone API quota on every tick we debounce per chat to
+		// once every 30 minutes. The first static-pin path (update.message.location
+		// further below) handles fresh non-live pins.
+		if (update.edited_message?.location && update.edited_message.chat?.type === 'private') {
+			const elChatId = update.edited_message.chat.id;
+			const lastCheckRaw = await env.CHAT_KV.get(`tz_lastcheck_${elChatId}`);
+			const now = Date.now();
+			if (!lastCheckRaw || (now - parseInt(lastCheckRaw)) > 30 * 60 * 1000) {
+				await env.CHAT_KV.put(`tz_lastcheck_${elChatId}`, String(now), { expirationTtl: 86400 });
+				const loc = update.edited_message.location;
+				const newTz = await setTimezoneFromCoords(elChatId, loc.latitude, loc.longitude, env);
+				if (newTz) log.info('live_location_tz_updated', { chatId: elChatId, tz: newTz });
+			}
+			return new Response("OK");
+		}
+
 		// Handle emoji reactions on bot messages (RLHF feedback)
 		if (update.message_reaction) {
 			log.info('reaction_received', { chatId: update.message_reaction.chat?.id, msgId: update.message_reaction.message_id });
@@ -1315,7 +1341,33 @@ export default {
 			if (pollCtx) {
 				const score = pa.option_ids?.[0]; // 0-10, maps directly to mood score
 				if (score != null) {
-					task = handleMoodPollAnswer(pa.user?.id || pollCtx.chatId, pollCtx.chatId, pollCtx.threadId, score, env);
+					// Mood poll responses do heavy work: Pro + medium thinking, D1 queries,
+					// Vectorize semantic search, episode retrieval. On preview-overload days
+					// this can exceed the 30s waitUntil ceiling and silently drop.
+					//
+					// Route through the Queue (15-min wall clock, automatic retries) so the
+					// user always gets a response, even if Gemini preview is unstable.
+					if (env.TASK_QUEUE) {
+						try {
+							await env.TASK_QUEUE.send({
+								type: 'mood_poll_answer',
+								userId: pa.user?.id || pollCtx.chatId,
+								chatId: pollCtx.chatId,
+								threadId: pollCtx.threadId,
+								score
+							});
+							log.info('mood_poll_queued', { chatId: pollCtx.chatId, score });
+							// Light acknowledgement so the user sees SOMETHING while Pro is working
+							await telegram.sendChatAction(pollCtx.chatId, pollCtx.threadId, 'typing', env).catch(() => {});
+						} catch (queueErr) {
+							log.warn('mood_poll_queue_failed', { msg: queueErr.message });
+							// Fallback: run inline (may hit 30s ceiling, but better than nothing)
+							task = handleMoodPollAnswer(pa.user?.id || pollCtx.chatId, pollCtx.chatId, pollCtx.threadId, score, env);
+						}
+					} else {
+						// No queue binding — run inline
+						task = handleMoodPollAnswer(pa.user?.id || pollCtx.chatId, pollCtx.chatId, pollCtx.threadId, score, env);
+					}
 				}
 				await env.CHAT_KV.delete(`mood_poll_${pa.poll_id}`);
 			} else {
@@ -1340,6 +1392,36 @@ export default {
 				// Owner messaging a different private chat — business-forwarded, ignore
 				return new Response("OK");
 			}
+
+			// ---- Location messages: update timezone via Google Time Zone API ----
+			// Handled here (before the general message router) so coordinate pins
+			// don't fall through to handleMessage and trigger a Gemini reply.
+			// Both fresh location messages and edited live-period messages are accepted.
+			if (update.message.location && update.message.chat?.type === 'private') {
+				const loc = update.message.location;
+				const locChatId = update.message.chat.id;
+				const threadId = update.message.message_thread_id || 'default';
+				log.info('location_received', { chatId: locChatId, lat: loc.latitude, lng: loc.longitude });
+				try {
+					const tz = await setTimezoneFromCoords(locChatId, loc.latitude, loc.longitude, env);
+					if (tz) {
+						const offset = describeOffset(tz);
+						await telegram.sendMessage(locChatId, threadId,
+							`📍 Got it. Timezone set to <b>${tz}</b> (${offset}). Schedules will use this from now on.`,
+							env, update.message.message_id
+						);
+					} else {
+						await telegram.sendMessage(locChatId, threadId,
+							`📍 I got your location but couldn't resolve the timezone — keeping the previous setting. (Check the Google Maps API key is configured.)`,
+							env, update.message.message_id
+						);
+					}
+				} catch (locErr) {
+					log.error('location_handler_error', { msg: locErr.message });
+				}
+				return new Response("OK");
+			}
+
 			if (update.message.effect_id) {
 				const emoji = extractEffectEmoji(update.message, update.message.effect_id);
 				console.log(`✨ Effect discovered: ${update.message.effect_id} emoji: ${emoji}`);
@@ -1493,6 +1575,34 @@ export default {
 						}
 						throw hmErr; // re-throw for queue retry
 					}
+
+				} else if (task.type === 'mood_poll_answer') {
+					// Mood poll responses run here for 15-min wall clock budget. The inline
+					// path only had 30s via waitUntil, which wasn't enough when Pro is slow
+					// or preview-overloaded. Queue retries (max 3) give resilience.
+					const { userId: muserId, chatId: mchatId, threadId: mthreadId, score } = task;
+					log.info('queue_mood_poll_start', { chatId: mchatId, score });
+					try {
+						await telegram.sendChatAction(mchatId, mthreadId, 'typing', env).catch(() => {});
+						await handleMoodPollAnswer(muserId, mchatId, mthreadId, score, env);
+						log.info('queue_mood_poll_done', { chatId: mchatId });
+					} catch (mpErr) {
+						const attempts = msg.attempts || 1;
+						log.error('queue_mood_poll_error', { chatId: mchatId, attempt: attempts, msg: mpErr.message });
+						if (attempts >= 3) {
+							// Final retry failed — tell the user, with the emotion buttons as a fallback path
+							await telegram.sendMessage(mchatId, mthreadId,
+								`Got your score of ${score}/10. Having trouble generating a fuller response right now. Tap below to keep going.`,
+								env, null, {
+									inline_keyboard: [[
+										{ text: '☀️ Positive', callback_data: 'mood_cat_positive', style: 'success' },
+										{ text: '🌧 Negative', callback_data: 'mood_cat_negative', style: 'danger' }
+									]]
+								}
+							).catch(() => {});
+						}
+						throw mpErr; // re-throw for queue retry
+					}
 				}
 
 				msg.ack();
@@ -1530,7 +1640,7 @@ export default {
 			try {
 				const now = new Date();
 				const chatId = Number(env.OWNER_ID);
-				const londonTime = new Date(now.toLocaleString('en-US', { timeZone: await env.CHAT_KV.get(`timezone_${chatId}`) || 'Europe/London' }));
+				const londonTime = await getLocalTime(chatId, env, now);
 				const hour = londonTime.getHours();
 				const today = londonTime.toISOString().split('T')[0];
 				if (hour >= 10 && hour <= 19 && Math.random() <= 0.05) {
@@ -1572,8 +1682,11 @@ export default {
 			// mutually exclusive with entities and we want <blockquote expandable>
 			// for the context section.
 			const dueDate = new Date(r.due_at * 1000);
+			// Use the chat-owner's stored timezone (set via location pin or /timezone)
+			// rather than hardcoded London. Falls back to UTC when nothing stored.
+			const reminderTz = await getTimezone(r.chat_id, env);
 			const scheduledLabel = dueDate.toLocaleString('en-GB', {
-				timeZone: 'Europe/London',
+				timeZone: reminderTz,
 				day: '2-digit',
 				month: 'short',
 				year: 'numeric',

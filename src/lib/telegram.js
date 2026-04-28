@@ -40,6 +40,9 @@ export function buildDateTimeMessage(before, unixTime, after = '', format = 'DT'
 	// The placeholder text is what users on old clients see.
 	// Force 24-hour format explicitly — timeStyle: 'short' is locale-dependent and
 	// can fall back to 12h (AM/PM) on some clients even with en-GB.
+	// TODO(timezone): currently hardcoded to London. This helper has no chatId
+	// in scope, so when callers are reintroduced they should pass the user's
+	// stored tz explicitly. Until then this function is dead code.
 	const date = new Date(unixTime * 1000);
 	const placeholder = date.toLocaleString('en-GB', {
 		timeZone: 'Europe/London',

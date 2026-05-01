@@ -1117,7 +1117,7 @@ export async function handleMessage(msg, env) {
 		// rules, so the clinical protocol reaches the model on cache-hit calls too (register
 		// override inside the directive keeps it inert during casual chat).
 		const _tCacheStart = Date.now();
-		const cacheContext = hasMedia ? null : await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, textModel, MENTAL_HEALTH_DIRECTIVE);
+		let cacheContext = hasMedia ? null : await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, textModel, MENTAL_HEALTH_DIRECTIVE);
 		log.info('cache_setup_done', { elapsed_ms: Date.now() - _tCacheStart, hadCache: !!cacheContext, total_elapsed_ms: _elapsed() });
 
 		// Context budgeting for the NON-CACHED path only (first message, media, cache expired).
@@ -1146,7 +1146,7 @@ export async function handleMessage(msg, env) {
 		});
 		if (!route.isDefault) log.info('model_route', { provider: route.provider, model: route.model, reason: route.reason });
 
-		if (route.provider === 'cloudflare' && !modelOverride) {
+		if (route.provider === 'cloudflare' && !modelOverride && env.AI) {
 			try {
 				const provider = createProvider(route, env);
 				const cfMessages = [];
@@ -1157,21 +1157,45 @@ export async function handleMessage(msg, env) {
 				}
 				cfMessages.push({ role: 'user', content: userText });
 
-				// Collect the response (no streaming animation in this path —
-				// CF AI streaming is event-source format and our draft helpers
-				// expect a different shape; we send the complete reply when ready).
+				// Animated streaming via Telegram draft bubble.
+				// Pattern mirrors the existing Gemini path: random non-zero
+				// draft_id, throttled at DRAFT_THROTTLE_MS, finalised with
+				// sendMessage which replaces the draft. On error we clear
+				// the draft so the user doesn't see a ghost "..." bubble.
 				const tStream = Date.now();
+				const cfDraftId = Math.floor(Math.random() * 2147483646) + 1;
+				let cfDraftActive = false;
+				let cfLastDraft = 0;
 				let finalText = '';
+
 				try {
 					for await (const chunk of provider.chatStream(cfMessages, [], {
 						systemInstruction: fullSysPrompt,
 						temperature: 1.0,
 						maxTokens: 1200,
 					})) {
-						if (chunk.type === 'text' && chunk.text) finalText += chunk.text;
+						if (chunk.type === 'text' && chunk.text) {
+							finalText += chunk.text;
+							const now = Date.now();
+							if (now - cfLastDraft >= DRAFT_THROTTLE_MS && finalText.trim()) {
+								// Strip incomplete HTML at the tail to avoid mid-stream parse errors
+								const safeDraft = finalText.replace(/<[^>]*$/, '');
+								if (safeDraft.trim()) {
+									// Fire-and-forget so the next chunk doesn't wait on the network
+									telegram.sendMessageDraft(chatId, threadId, cfDraftId, safeDraft, env, msg.message_id);
+									cfDraftActive = true;
+									cfLastDraft = now;
+								}
+							}
+						}
 					}
 				} catch (streamErr) {
-					// If streaming fails, retry non-streaming
+					// Streaming failed mid-flight. Clear the draft and try
+					// non-streaming chat() for a clean retry on the same provider.
+					if (cfDraftActive) {
+						await telegram.clearMessageDraft(chatId, threadId, cfDraftId, env).catch(() => {});
+						cfDraftActive = false;
+					}
 					log.warn('cf_stream_failed_retry_chat', { msg: streamErr.message });
 					const r = await provider.chat(cfMessages, [], {
 						systemInstruction: fullSysPrompt,
@@ -1183,7 +1207,17 @@ export async function handleMessage(msg, env) {
 				finalText = (finalText || '').trim();
 				if (!finalText) throw new Error('cf_empty_response');
 
+				// Finalise: send the complete reply. This implicitly replaces
+				// the draft bubble (Telegram pairs the draft_id with the next
+				// real send to the same chat). If draft was never started
+				// (very fast response under throttle), this is the only send.
 				await telegram.sendMessage(chatId, threadId, finalText, env, msg.message_id);
+
+				// Defensive: if for any reason the draft bubble didn't auto-clear,
+				// explicitly discard it so the user doesn't see a stale "..." 
+				if (cfDraftActive) {
+					await telegram.clearMessageDraft(chatId, threadId, cfDraftId, env).catch(() => {});
+				}
 
 				try {
 					const newHist = [...hist,
@@ -1200,12 +1234,21 @@ export async function handleMessage(msg, env) {
 					reason: route.reason,
 					chars: finalText.length,
 					elapsed_ms: Date.now() - tStream,
+					animated: cfDraftActive,
 				});
 				log.info('handler_end', { chatId, total_elapsed_ms: _elapsed(), outcome: 'success_cf' });
 				return;
 			} catch (cfErr) {
 				log.warn('cf_path_failed_falling_through', { msg: cfErr.message, model: route.model });
+				// CRITICAL: when we fall through from the CF path to Gemini, we
+				// must invalidate the cache that was built for the original
+				// (pre-fallthrough) Gemini tier. The cache was created earlier
+				// for whatever textModel was selected before the router decision;
+				// reusing it with a different model causes a 400 from Gemini:
+				//   "Model used by GenerateContent and CachedContent has to be the same."
+				// Set cacheContext to null so createChat rebuilds without it.
 				textModel = FALLBACK_TEXT_MODEL;
+				cacheContext = null;
 			}
 		}
 		// =========================================================

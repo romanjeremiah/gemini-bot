@@ -1,6 +1,9 @@
 import { personas, FORMATTING_RULES, MENTAL_HEALTH_DIRECTIVE, SECOND_BRAIN_DIRECTIVE } from '../config/personas';
 import { MOOD_POLL_OPTIONS } from '../config/moodScale';
 import { createChat, sendChatMessage, sendChatMessageStream, generateImage, setupCache, PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, FLASH_LITE_TEXT_MODEL, generateShortResponse, generateWithFallback, generateDeepResponse, StreamIdleError } from '../lib/ai/gemini';
+import { routeMessage, createProvider } from '../ai/router';
+import { CF_MODELS, MAX_TOOL_ROUNDS } from '../config/models';
+import { buildSystemInstruction, ensurePersonaConfig } from '../services/persona';
 import { toolRegistry } from '../tools';
 import * as telegram from '../lib/telegram';
 import * as memoryStore from '../services/memoryStore';
@@ -533,6 +536,59 @@ async function handleCommand(command, msg, env) {
 			await telegram.sendMessage(chatId, threadId,
 				'Tap below to share your current location. I\'ll detect the timezone and use it for all schedules.',
 				env, null, replyMarkup);
+			return true;
+		}
+		case "/firecron": {
+			// Owner-only debug command. Bypasses time-window and lock checks and
+			// queues a scheduled task immediately so we can trace where the chain
+			// breaks. Useful when scheduled jobs silently fail.
+			//
+			// Usage:
+			//   /firecron morning              → health_checkin (morning)
+			//   /firecron midday               → health_checkin (midday)
+			//   /firecron evening              → health_checkin (evening) — text greeting
+			//   /firecron mood_poll            → mood poll (the 0-10 bipolar scale)
+			//   /firecron med_nudge            → medication follow-up
+			//   /firecron spontaneous_outreach → random knowledge / proactive outreach
+			//   /firecron queue_test           → bare consumer test
+			if (!env.OWNER_ID || String(msg.from.id) !== String(env.OWNER_ID)) {
+				await telegram.sendMessage(chatId, threadId, "This command is owner-only.", env);
+				return true;
+			}
+			const arg = (msg.text || '').replace('/firecron', '').trim().toLowerCase();
+			const validPeriods = ['morning', 'midday', 'evening'];
+			const validTypes = ['mood_poll', 'med_nudge', 'spontaneous_outreach', 'queue_test'];
+
+			let queueMsg = null;
+			if (validPeriods.includes(arg)) {
+				queueMsg = { type: 'health_checkin', period: arg, chatId };
+			} else if (validTypes.includes(arg)) {
+				queueMsg = { type: arg, chatId };
+			} else {
+				await telegram.sendMessage(chatId, threadId,
+					`Usage: <code>/firecron &lt;type&gt;</code>\n\n` +
+					`Valid: <code>morning</code>, <code>midday</code>, <code>evening</code>, ` +
+					`<code>mood_poll</code>, <code>med_nudge</code>, ` +
+					`<code>spontaneous_outreach</code>, <code>queue_test</code>`,
+					env);
+				return true;
+			}
+
+			if (!env.TASK_QUEUE) {
+				await telegram.sendMessage(chatId, threadId,
+					'⚠️ TASK_QUEUE binding not available — cannot queue task.', env);
+				return true;
+			}
+
+			try {
+				await env.TASK_QUEUE.send(queueMsg);
+				await telegram.sendMessage(chatId, threadId,
+					`✅ Queued: <code>${JSON.stringify(queueMsg)}</code>\n\nWatch <code>wrangler tail</code> for the consumer trace.`,
+					env);
+			} catch (err) {
+				await telegram.sendMessage(chatId, threadId,
+					`❌ Queue send failed: <code>${(err.message || '').slice(0, 200)}</code>`, env);
+			}
 			return true;
 		}
 		case "/testpoll": {
@@ -1072,6 +1128,89 @@ export async function handleMessage(msg, env) {
 		const clinicalDirective = (isEmotionalMsg || healthCheckin) ? `\n\n${MENTAL_HEALTH_DIRECTIVE}` : '';
 		const techDirective = detectComplexTask(userText) ? `\n\n${SECOND_BRAIN_DIRECTIVE}` : '';
 		const fullSysPrompt = `${personaInstruction}${styleCardSection}${clinicalDirective}${techDirective}\n\n${FORMATTING_RULES}\n${dynamicContext}`;
+
+		// =========================================================
+		// Path B fast-path — Cloudflare provider for casual chat
+		// =========================================================
+		// Routes ~80% of messages (casual, code, analytical, long) to free
+		// Cloudflare Workers AI (Gemma 4 / Qwen3 30B) instead of Gemini.
+		// Bypasses Gemini cache + tool loop because:
+		//   - Gemma/Qwen handle tool calls via OpenAI-compat (different shape)
+		//   - Cache is Gemini-specific (cachedContent on Google's models)
+		//   - For casual chat we don't need the heavyweight Gemini setup
+		// Multimodal, emotional, and active-checkin messages still go to Gemini.
+		const route = routeMessage({
+			userText,
+			healthCheckinActive: !!currentCheckin,
+			hasMedia,
+		});
+		if (!route.isDefault) log.info('model_route', { provider: route.provider, model: route.model, reason: route.reason });
+
+		if (route.provider === 'cloudflare' && !modelOverride) {
+			try {
+				const provider = createProvider(route, env);
+				const cfMessages = [];
+				for (const turn of hist) {
+					const role = turn.role === 'model' ? 'model' : 'user';
+					const text = (turn.parts || []).map(p => p.text).filter(Boolean).join('');
+					if (text) cfMessages.push({ role, content: text });
+				}
+				cfMessages.push({ role: 'user', content: userText });
+
+				// Collect the response (no streaming animation in this path —
+				// CF AI streaming is event-source format and our draft helpers
+				// expect a different shape; we send the complete reply when ready).
+				const tStream = Date.now();
+				let finalText = '';
+				try {
+					for await (const chunk of provider.chatStream(cfMessages, [], {
+						systemInstruction: fullSysPrompt,
+						temperature: 1.0,
+						maxTokens: 1200,
+					})) {
+						if (chunk.type === 'text' && chunk.text) finalText += chunk.text;
+					}
+				} catch (streamErr) {
+					// If streaming fails, retry non-streaming
+					log.warn('cf_stream_failed_retry_chat', { msg: streamErr.message });
+					const r = await provider.chat(cfMessages, [], {
+						systemInstruction: fullSysPrompt,
+						temperature: 1.0,
+						maxTokens: 1200,
+					});
+					finalText = r.text || '';
+				}
+				finalText = (finalText || '').trim();
+				if (!finalText) throw new Error('cf_empty_response');
+
+				await telegram.sendMessage(chatId, threadId, finalText, env, msg.message_id);
+
+				try {
+					const newHist = [...hist,
+						{ role: 'user', parts: [{ text: userText }] },
+						{ role: 'model', parts: [{ text: finalText }] },
+					];
+					await env.CHAT_KV.put(`history_${chatId}_${threadId}`, JSON.stringify(newHist), { expirationTtl: 86400 * 7 });
+				} catch (histErr) {
+					log.warn('cf_history_save_failed', { msg: histErr.message });
+				}
+
+				log.info('cf_path_complete', {
+					model: route.model,
+					reason: route.reason,
+					chars: finalText.length,
+					elapsed_ms: Date.now() - tStream,
+				});
+				log.info('handler_end', { chatId, total_elapsed_ms: _elapsed(), outcome: 'success_cf' });
+				return;
+			} catch (cfErr) {
+				log.warn('cf_path_failed_falling_through', { msg: cfErr.message, model: route.model });
+				textModel = FALLBACK_TEXT_MODEL;
+			}
+		}
+		// =========================================================
+		// End Path B fast-path
+		// =========================================================
 
 		let chat;
 

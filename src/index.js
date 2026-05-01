@@ -394,6 +394,16 @@ async function handleStyleCardConsolidation(env) {
 	} catch (e) {
 		log.error('style_card_consolidation_error', { msg: e.message });
 	}
+
+	// Persona evolution: refresh evolved_traits and communication_notes based
+	// on recent chat patterns. Cheap CF AI background job — best-effort, never
+	// blocks the cron tick. Same daily 04:00 cadence as the style card.
+	try {
+		const { evolvePersona } = await import('./services/personaEvolution');
+		await evolvePersona(env, userId);
+	} catch (e) {
+		log.error('persona_evolution_error', { msg: e.message });
+	}
 }
 
 // ---- Mood Poll System ----

@@ -351,39 +351,84 @@ export async function generateImage(prompt, env, inputImageBase64 = null, inputM
 }
 
 
-// ---- UI Text Generation (Fast & Contextual) ----
-// Uses Flash-Lite via direct connection for speed and cost. No tools, no history.
-// Flash-Lite ($0.25/$1.50 per 1M) is ~half the price of Flash and designed for
-// exactly this workload: short, high-volume, agentic text generation.
+// ---- Short-response generation (greetings, observations, listen-mode) ----
+// Path B step 1: route through Cloudflare Gemma 4 first, fall back to Gemini
+// Flash-Lite, then Flash. Gemma handles ~80% of these cleanly and is free —
+// Gemini preview overload (the cause of silent morning check-ins) no longer
+// breaks the bot.
+//
+// Each tier gets one attempt. No exponential backoff between tiers — that
+// only delays the user when Gemini is overloaded.
+//
+// systemPrompt is appended to the system instruction so the model knows it's
+// generating a short Telegram-shaped message.
+const SHORT_RESPONSE_GUIDE = '\n\nYou are generating a brief message for a Telegram bot. Keep it to 2-4 complete sentences. Be fully in character. No asterisks, no markdown, no HTML tags. You MUST finish every sentence completely. Never stop mid-sentence or mid-thought.';
+
 export async function generateShortResponse(prompt, systemInstruction, env) {
-  const response = await withRetry(
-    () => getAI(env).models.generateContent({
+  const fullSystem = `${systemInstruction}${SHORT_RESPONSE_GUIDE}`;
+
+  // Tier 1: Gemma 4 via Cloudflare (free, fast, independent of Gemini)
+  if (env.AI) {
+    try {
+      const { runCfAi } = await import('../ai-gateway');
+      const result = await runCfAi(env.AI, '@cf/google/gemma-4-26b-a4b-it', {
+        messages: [
+          { role: 'system', content: fullSystem },
+          { role: 'user', content: prompt },
+        ],
+        temperature: 1.0,
+        max_tokens: 1000,
+      });
+      const text = _extractCfText(result);
+      if (text) return _trimTrailing(text);
+      console.warn('Gemma returned empty text, falling through to Gemini');
+    } catch (err) {
+      console.warn('Gemma short-response failed, falling through to Gemini:', err.message);
+    }
+  }
+
+  // Tier 2: Gemini Flash-Lite (preview, cheap)
+  try {
+    const response = await getAI(env).models.generateContent({
       model: FLASH_LITE_TEXT_MODEL,
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: {
-        systemInstruction: `${systemInstruction}\n\nYou are generating a brief message for a Telegram bot. Keep it to 2-4 complete sentences. Be fully in character. No asterisks, no markdown, no HTML tags. You MUST finish every sentence completely. Never stop mid-sentence or mid-thought.`,
-        temperature: 1.0,
-        maxOutputTokens: 1000,
-      }
-    }),
-    2, null
-  );
-  let text = response.candidates?.[0]?.content?.parts?.filter(p => p.text && !p.thought)?.map(p => p.text)?.join('') || '';
-  text = text.trim();
-  // Safety: if text was truncated mid-sentence, trim to last complete sentence
+      config: { systemInstruction: fullSystem, temperature: 1.0, maxOutputTokens: 1000 }
+    });
+    const text = _extractGeminiText(response);
+    if (text) return _trimTrailing(text);
+  } catch (err) {
+    console.warn('Flash-Lite short-response failed, falling through to Flash:', err.status || '', err.message);
+  }
+
+  // Tier 3: Gemini Flash (more reliable, more expensive)
+  const response = await getAI(env).models.generateContent({
+    model: FALLBACK_TEXT_MODEL,
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    config: { systemInstruction: fullSystem, temperature: 1.0, maxOutputTokens: 1000 }
+  });
+  return _trimTrailing(_extractGeminiText(response));
+}
+
+function _extractCfText(result) {
+  if (!result) return '';
+  if (typeof result === 'string') return result;
+  if (result.choices?.[0]?.message?.content) return result.choices[0].message.content;
+  return result.response || '';
+}
+
+function _extractGeminiText(response) {
+  return response.candidates?.[0]?.content?.parts
+    ?.filter(p => p.text && !p.thought)
+    ?.map(p => p.text)
+    ?.join('') || '';
+}
+
+function _trimTrailing(text) {
+  text = (text || '').trim();
+  // If text doesn't end with sentence punctuation, trim to the last complete sentence.
   if (text && !/[.!?…"']$/.test(text)) {
-    const lastComplete = text.lastIndexOf('. ');
-    const lastExclaim = text.lastIndexOf('! ');
-    const lastQuestion = text.lastIndexOf('? ');
-    const lastEnd = Math.max(
-      lastComplete,
-      lastExclaim,
-      lastQuestion,
-      text.lastIndexOf('.'),
-      text.lastIndexOf('!'),
-      text.lastIndexOf('?')
-    );
-    if (lastEnd > 0) text = text.slice(0, lastEnd + 1).trim();
+    const ends = ['. ', '! ', '? ', '.', '!', '?'].map(s => text.lastIndexOf(s)).filter(i => i > 0);
+    if (ends.length) text = text.slice(0, Math.max(...ends) + 1).trim();
   }
   return text;
 }

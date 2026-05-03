@@ -1093,6 +1093,23 @@ export async function handleMessage(msg, env) {
 		const earlyHealthCheckin = await env.CHAT_KV.get(`health_checkin_active_${chatId}`);
 		const ctxMode = (earlyEmotional || earlyHealthCheckin) ? 'warm' : earlyTechnical ? 'technical' : 'default';
 
+		// Phase B optimisation: tag conversation mode in parallel with the rest
+		// of context fetching. Latency hides under the slowest sibling op (memory
+		// fetch is typically the long pole). Skipped on media turns because the
+		// router will pick Pro via the hasMedia rule regardless of tagger output
+		// — running it would just be dead weight on the hottest path.
+		const taggerPromise = hasMedia
+			? Promise.resolve({ mode: null, source: 'skipped_media' })
+			: (async () => {
+				const { tagConversationMode } = await import('../services/cfAi');
+				// Use raw history slice; tagConversationMode only reads role+text.
+				const rawForTag = await env.CHAT_KV.get(`chat_${chatId}_${threadId}`, { type: 'json' }) || [];
+				return tagConversationMode(env, userText, rawForTag.slice(-4)).catch((e) => {
+					log.warn('tagger_failed_in_hot_path', { msg: e.message });
+					return { mode: null, source: 'error' };
+				});
+			})();
+
 		const [memCtxResult, semanticCtx, personaKey, rawHistory] = await Promise.all([
 			isSubstantive ? memoryStore.getFormattedContext(env, userId, ctxMode, userText) : Promise.resolve({ ctx: '', memories: [], debug: { mode: ctxMode, total: 0, skipped: 'not_substantive' } }),
 			isSubstantive ? vectorStore.getSemanticContext(env, userId, userText) : Promise.resolve(''),
@@ -1181,22 +1198,20 @@ export async function handleMessage(msg, env) {
 		// =========================================================
 		// Phase B: Unified routing.
 		// =========================================================
-		// Run the conversation-mode tagger in parallel-safe fashion (~500ms
-		// typical via Llama 8B; full chain has 8s budget with heuristic floor).
-		// The tagger output feeds the router as one of several signals — it is
-		// NOT a hard switch. The router still applies regex, complexity, and
-		// override rules in priority order.
-		const _tTagger = Date.now();
-		const { tagConversationMode } = await import('../services/cfAi');
-		const tagResult = await tagConversationMode(env, userText, hist.slice(-4)).catch((e) => {
-			log.warn('tagger_failed_in_hot_path', { msg: e.message });
-			return { mode: null };
-		});
+		// Tagger was kicked off earlier in parallel with memory fetch (see
+		// taggerPromise above). On media turns it resolves immediately to
+		// {mode: null, source: 'skipped_media'} — the router rule hasMedia->Pro
+		// wins regardless. On text turns the tagger usually finishes well before
+		// the memory ops (Llama 8B ~500ms, getFormattedContext ~1-3s), so this
+		// await is effectively free.
+		const _tTaggerAwait = Date.now();
+		const tagResult = await taggerPromise;
 		log.info('tagger_resolved', {
 			chatId,
 			mode: tagResult?.mode,
 			source: tagResult?.source,
-			latency_ms: Date.now() - _tTagger,
+			await_ms: Date.now() - _tTaggerAwait,
+			hasMedia,
 		});
 
 		// Single source of truth: every signal flows into routeMessage.

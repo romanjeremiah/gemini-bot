@@ -20,8 +20,24 @@
 // Latency budget: ~200-400ms via Flash-Lite. Adds a single extra Gemini call
 // per substantive turn. Cheap given Flash-Lite pricing.
 
-import { generateShortResponse } from '../lib/ai/gemini';
+import { FLASH_LITE_TEXT_MODEL } from '../lib/ai/gemini';
+import { GoogleGenAI } from '@google/genai';
 import { log } from '../lib/logger';
+
+// Direct Flash-Lite call for curator. We DO NOT use generateShortResponse
+// because it appends SHORT_RESPONSE_GUIDE ("2-4 complete sentences, no
+// markdown") which conflicts with our JSON-only instruction. Gemma in
+// particular tends to honour the natural-language guide and produce
+// truncated/contaminated JSON. A direct Flash-Lite call with explicit
+// JSON instruction and no contamination is more reliable.
+//
+// Latency budget: ~400-1000ms typical. Caller should still treat curator
+// as best-effort — a null return must never break the main path.
+let _curatorAi = null;
+function getCuratorAi(env) {
+	if (!_curatorAi) _curatorAi = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
+	return _curatorAi;
+}
 
 const CURATOR_PROMPT = `You are a pre-response curator for an AI companion called Xaridotis.
 
@@ -99,7 +115,21 @@ export async function curateContext(env, { userText, memories = [], recentHistor
 
 	let rawText;
 	try {
-		rawText = await generateShortResponse(input, CURATOR_PROMPT, env);
+		const ai = getCuratorAi(env);
+		const response = await ai.models.generateContent({
+			model: FLASH_LITE_TEXT_MODEL,
+			contents: [{ role: 'user', parts: [{ text: input }] }],
+			config: {
+				systemInstruction: CURATOR_PROMPT,
+				temperature: 0.3, // Lower temp for structured output
+				maxOutputTokens: 600, // Curator output is small; tight budget = less truncation risk
+				responseMimeType: 'application/json', // Force JSON mode — model returns parseable JSON directly
+			},
+		});
+		rawText = response.candidates?.[0]?.content?.parts
+			?.filter(p => p.text && !p.thought)
+			?.map(p => p.text)
+			?.join('') || '';
 	} catch (err) {
 		log.warn('curator_call_failed', { msg: err.message });
 		return null;
@@ -110,19 +140,61 @@ export async function curateContext(env, { userText, memories = [], recentHistor
 		return null;
 	}
 
-	// Strip markdown fences if Flash-Lite added them despite instructions.
+	// Strip markdown fences if present (defensive — responseMimeType: 'application/json'
+	// should prevent these but Flash-Lite occasionally ignores it).
 	const cleaned = rawText.replace(/```json|```/g, '').trim();
-	const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-	if (!jsonMatch) {
-		log.warn('curator_no_json_found', { rawPreview: rawText.slice(0, 100) });
-		return null;
+
+	// Try direct parse first (responseMimeType:json should give us clean JSON).
+	let parsed = null;
+	try {
+		parsed = JSON.parse(cleaned);
+	} catch {
+		// Fallback 1: greedy regex extraction (handles preamble/postamble text).
+		const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+		if (jsonMatch) {
+			try {
+				parsed = JSON.parse(jsonMatch[0]);
+			} catch { /* fall through to truncation recovery */ }
+		}
+
+		// Fallback 2: truncation recovery. If response was cut off mid-JSON,
+		// brace-balance forward from the first `{` and append closing braces
+		// to whatever was generated. This recovers register + leading flags
+		// even when reasoning got cut off.
+		if (!parsed) {
+			const firstBrace = cleaned.indexOf('{');
+			if (firstBrace !== -1) {
+				const slice = cleaned.slice(firstBrace);
+				let depth = 0;
+				let inString = false;
+				let escape = false;
+				let recovered = '';
+				for (const ch of slice) {
+					recovered += ch;
+					if (escape) { escape = false; continue; }
+					if (ch === '\\' && inString) { escape = true; continue; }
+					if (ch === '"') inString = !inString;
+					if (inString) continue;
+					if (ch === '{') depth++;
+					else if (ch === '}') depth--;
+				}
+				// Close any unclosed strings, arrays, and objects.
+				if (inString) recovered += '"';
+				// Trailing comma before closing? Strip it.
+				recovered = recovered.replace(/,\s*$/, '');
+				while (depth > 0) { recovered += '}'; depth--; }
+				try {
+					parsed = JSON.parse(recovered);
+					log.info('curator_truncation_recovered', { rawLen: rawText.length, recoveredLen: recovered.length });
+				} catch (err) {
+					log.warn('curator_recovery_failed', { msg: err.message, rawPreview: rawText.slice(0, 150) });
+				}
+			}
+		}
 	}
 
-	let parsed;
-	try {
-		parsed = JSON.parse(jsonMatch[0]);
-	} catch (err) {
-		log.warn('curator_json_parse_failed', { msg: err.message, rawPreview: jsonMatch[0].slice(0, 200) });
+	if (!parsed) {
+		log.warn('curator_unparseable', { rawPreview: rawText.slice(0, 150) });
 		return null;
 	}
 

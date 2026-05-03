@@ -1138,7 +1138,13 @@ export async function handleMessage(msg, env) {
 		// other prep, but we DO await before prompt assembly — the prepend has to
 		// be in place when the prompt is built.
 		let curatorPromise = Promise.resolve(null);
-		const shouldCurate = isSubstantive && userText.length >= 30 && !earlyHealthCheckin && (memCtxRows.length > 0 || semanticCtx.length > 0);
+		// Skip curator on media turns: voice/photo/video already routes to Pro via
+		// hasMedia rule, and Pro receives the full memCtx anyway. The curator's
+		// spotlight is a luxury for ambiguous text turns, not a necessity for
+		// multimodal. Running it costs ~9-14s on the hot path that's already
+		// budget-pressured by Pro multimodal latency — see the 5/3/2026 voice-note
+		// timeout incident.
+		const shouldCurate = isSubstantive && !hasMedia && userText.length >= 30 && !earlyHealthCheckin && (memCtxRows.length > 0 || semanticCtx.length > 0);
 		if (shouldCurate) {
 			const { curateContext } = await import('../services/responseCurator');
 			curatorPromise = curateContext(env, {

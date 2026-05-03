@@ -2,8 +2,10 @@ import { personas, FORMATTING_RULES, MENTAL_HEALTH_DIRECTIVE, SECOND_BRAIN_DIREC
 import { MOOD_POLL_OPTIONS } from '../config/moodScale';
 import { createChat, sendChatMessage, sendChatMessageStream, generateImage, setupCache, PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, FLASH_LITE_TEXT_MODEL, generateShortResponse, generateWithFallback, generateDeepResponse, StreamIdleError } from '../lib/ai/gemini';
 import { routeMessage, createProvider } from '../ai/router';
+import { detectComplexTask, isSimpleMessage } from '../ai/complexity';
 import { CF_MODELS, MAX_TOOL_ROUNDS } from '../config/models';
 import { buildSystemInstruction, ensurePersonaConfig } from '../services/persona';
+import { getTimezone } from '../lib/timezone';
 import { toolRegistry } from '../tools';
 import * as telegram from '../lib/telegram';
 import * as memoryStore from '../services/memoryStore';
@@ -135,57 +137,11 @@ async function sendLongMessage(chatId, threadId, text, env, replyId = null, fina
 
 const THERAPEUTIC_CATEGORIES = ['pattern', 'trigger', 'avoidance', 'schema', 'growth', 'coping', 'insight', 'homework'];
 
-/**
- * Detect task complexity — returns true if Pro model is needed.
- * Health check-ins use Flash (handled separately by callbacks).
- */
-export function detectComplexTask(text) {
-	if (!text) return false;
-
-	// Code/architecture
-	if (/\b(code|function|bug|error|deploy|refactor|implement|architecture|PR|pull request|commit|git|webpack|npm|wrangler|api|endpoint|database|query|sql|schema|migration)\b/i.test(text)) return true;
-	if (/\.(js|ts|py|json|css|html|jsx|mjs)\b/.test(text)) return true;
-	if (/```/.test(text)) return true;
-
-	// Mental health / emotional depth
-	if (/\b(anxious|depressed|panic|overwhelm|trigger|dissociat|suicid|self.?harm|therapy|therapist|schema|attachment|ifs|dbt|aedp|emotion|mood|bipolar|mania|hypo)\b/i.test(text)) return true;
-
-	// Complex analytical requests
-	if (/\b(analyse|analyze|compare|explain.*detail|deep dive|break down|pros and cons|trade.?off|strategy|plan)\b/i.test(text)) return true;
-
-	// Research triggers (doing, not viewing)
-	if (/\b(research|investigate|look into)\b/i.test(text) && !/\b(show|list|recent|history|results|previous|past|full report)\b/i.test(text)) return true;
-
-	// Long messages
-	if (text.length > 300) return true;
-
-	return false;
-}
-
-/**
- * Detect simple messages suitable for Flash-Lite.
- * Short casual chat, acknowledgments, data points, one-liners.
- * Runs AFTER detectComplexTask — complex wins.
- */
-export function isSimpleMessage(text) {
-	if (!text) return true; // empty/media-only → Flash-Lite by default
-	const trimmed = text.trim();
-
-	// Very short: always simple
-	if (trimmed.length < 30) return true;
-
-	// Acknowledgments, confirmations, reactions
-	if (/^(ok|okay|yes|yep|yeah|no|nope|nah|thanks|ty|cool|nice|sure|done|sound|sounds good|got it|right|alright|cheers|k|kk)\b/i.test(trimmed)) return true;
-
-	// Data point reports (sleep hours, meds, quick mood notes)
-	// Examples: "slept 7h", "meds done", "8 hours last night", "took them"
-	if (/^(slept|sleep|meds|medication|took|had|feeling|mood)\b/i.test(trimmed) && trimmed.length < 80) return true;
-
-	// Short statements without questions (conversational flow, not substantive query)
-	if (!/[?]/.test(trimmed) && trimmed.length < 60) return true;
-
-	return false;
-}
+// Re-export complexity helpers from ai/complexity.js for backwards compatibility.
+// src/index.js imports detectComplexTask from './bot/handlers' for queue routing,
+// and external test files may reference these names. The real definitions live in
+// ../ai/complexity — routing-layer code should import from there directly.
+export { detectComplexTask, isSimpleMessage } from '../ai/complexity';
 
 // Silent Observation: Xaridotis quietly reflects on conversations to learn about the user
 // implicitly. Runs in the background after substantive exchanges. Throttled to max 5/day.
@@ -505,7 +461,7 @@ async function handleCommand(command, msg, env) {
 			if (!tz) {
 				// Read from canonical per-chat key. Fallback to UTC matches the
 				// default in src/lib/timezone.js when nothing is stored.
-				const current = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Etc/UTC';
+				const current = await getTimezone(chatId, env);
 				await telegram.sendMessage(chatId, threadId,
 					`Current timezone: <b>${current}</b>\n\nTo change: <code>/timezone America/New_York</code>\n\nOr send your location (paperclip → Location, or use /setlocation) and I'll detect it automatically.`, env);
 				return true;
@@ -591,6 +547,83 @@ async function handleCommand(command, msg, env) {
 			}
 			return true;
 		}
+		case "/personastate": {
+			// Owner-only debug command. Show what evolved_traits and communication_notes
+			// have been learned for the active persona. NULL means the evolution loop
+			// has either not run yet or had no high-confidence signals.
+			if (!env.OWNER_ID || String(msg.from.id) !== String(env.OWNER_ID)) {
+				await telegram.sendMessage(chatId, threadId, "This command is owner-only.", env);
+				return true;
+			}
+			const row = await env.DB.prepare(
+				"SELECT persona_key, display_name, evolved_traits, communication_notes, updated_at FROM persona_config WHERE user_id = ? ORDER BY updated_at DESC"
+			).bind(msg.from.id).all();
+			const rows = row?.results || [];
+			if (!rows.length) {
+				await telegram.sendMessage(chatId, threadId, "No persona_config rows found.", env);
+				return true;
+			}
+			let text = "<b>Persona State</b>\n\n";
+			for (const r of rows) {
+				text += `<b>${r.display_name || r.persona_key}</b> <i>(${r.persona_key})</i>\n`;
+				text += `Updated: ${r.updated_at || 'never'}\n\n`;
+				text += `<u>Communication notes:</u>\n<code>${r.communication_notes || '(none)'}</code>\n\n`;
+				text += `<u>Evolved traits:</u>\n<code>${r.evolved_traits || '(none)'}</code>\n\n`;
+			}
+			await sendLongMessage(chatId, threadId, text, env);
+			return true;
+		}
+		case "/evolvepersona": {
+			// Owner-only debug command. Manually trigger the persona evolution loop
+			// for one-shot validation. Bypasses the daily 04:00 cron schedule.
+			if (!env.OWNER_ID || String(msg.from.id) !== String(env.OWNER_ID)) {
+				await telegram.sendMessage(chatId, threadId, "This command is owner-only.", env);
+				return true;
+			}
+			await telegram.sendMessage(chatId, threadId, "🌱 Running persona evolution... check <code>/personastate</code> after.", env);
+			try {
+				const { evolvePersona } = await import('../services/personaEvolution');
+				await evolvePersona(env, msg.from.id);
+				await telegram.sendMessage(chatId, threadId, "✅ Evolution pass complete. Run <code>/personastate</code> to view.", env);
+			} catch (e) {
+				await telegram.sendMessage(chatId, threadId, `❌ Failed: <code>${(e.message || '').slice(0, 200)}</code>`, env);
+			}
+			return true;
+		}
+		case "/consolidate": {
+			// Owner-only debug command. Manually trigger memory consolidation now
+			// for one-shot cleanup of the current memory pile (e.g. dropping 63
+			// memories down to ~20 cleaner ones). Same logic the auto-trigger uses;
+			// this just bypasses the count/throttle thresholds.
+			if (!env.OWNER_ID || String(msg.from.id) !== String(env.OWNER_ID)) {
+				await telegram.sendMessage(chatId, threadId, "This command is owner-only.", env);
+				return true;
+			}
+			const userId = msg.from.id;
+			const beforeRow = await env.DB.prepare(
+				'SELECT COUNT(*) AS n FROM memories WHERE user_id = ?'
+			).bind(userId).first();
+			const before = beforeRow?.n || 0;
+
+			await telegram.sendMessage(chatId, threadId,
+				`🧠 Consolidating <b>${before}</b> memories... this may take 10-30 seconds.`, env);
+
+			try {
+				await memoryStore.consolidateMemories(env, userId);
+				const afterRow = await env.DB.prepare(
+					'SELECT COUNT(*) AS n FROM memories WHERE user_id = ?'
+				).bind(userId).first();
+				const after = afterRow?.n || 0;
+				await env.CHAT_KV.put(`memory_consolidation_last_${userId}`, String(Date.now()), { expirationTtl: 86400 * 7 });
+				await telegram.sendMessage(chatId, threadId,
+					`✅ Consolidation done.\n\n<b>Before:</b> ${before} memories\n<b>After:</b> ${after} memories\n<b>Reduction:</b> ${before - after} (${before > 0 ? Math.round((before - after) / before * 100) : 0}%)\n\n<i>Note: Vectorize index entries for deleted memories will be cleaned up by indexed retrieval misses over time.</i>`,
+					env);
+			} catch (e) {
+				await telegram.sendMessage(chatId, threadId,
+					`❌ Consolidation failed: <code>${(e.message || '').slice(0, 200)}</code>`, env);
+			}
+			return true;
+		}
 		case "/testpoll": {
 			// Test whether poll_answer webhooks are received
 			const pollRes = await telegram.sendPoll(chatId, threadId,
@@ -609,6 +642,76 @@ async function handleCommand(command, msg, env) {
 				await env.CHAT_KV.put(`poll_test_${pollId}`, JSON.stringify({ chatId, threadId, type: 'mood_test' }), { expirationTtl: 3600 });
 				log.info('test_poll_sent', { chatId, pollId });
 			}
+			return true;
+		}
+		case "/tagmode": {
+			// Owner-only debug command. Tests the conversation-mode tagger in
+			// isolation so we can validate Gemma's classifications BEFORE we
+			// splice the tagger into every prompt. Outputs the chosen mode,
+			// confidence layer (heuristic agreement check), source provider,
+			// and round-trip latency.
+			//
+			// Usage: /tagmode <message to classify>
+			// Example: /tagmode he's still ignoring me
+			if (!env.OWNER_ID || String(msg.from.id) !== String(env.OWNER_ID)) {
+				await telegram.sendMessage(chatId, threadId, "This command is owner-only.", env);
+				return true;
+			}
+			const sample = (msg.text || '').replace('/tagmode', '').trim();
+			if (!sample) {
+				await telegram.sendMessage(chatId, threadId,
+					'Usage: <code>/tagmode &lt;message&gt;</code>\n\n' +
+					'Examples:\n' +
+					'• <code>/tagmode he is still ignoring me</code>\n' +
+					'• <code>/tagmode why does this keep happening</code>\n' +
+					'• <code>/tagmode remind me at 9am tomorrow</code>\n' +
+					'• <code>/tagmode I cannot go on like this</code>',
+					env);
+				return true;
+			}
+
+			// Use real recent history from this chat so the tagger sees real context.
+			// Falls back to empty array if nothing stored yet.
+			const rawHistory = await env.CHAT_KV.get(`chat_${chatId}_${threadId}`, { type: 'json' }) || [];
+			const recentHistory = sanitizeHistory(rawHistory).slice(-4);
+
+			const t0 = Date.now();
+			const { tagConversationMode } = await import('../services/cfAi');
+			const result = await tagConversationMode(env, sample, recentHistory);
+			const elapsed = Date.now() - t0;
+
+			// Pretty-print provider chain status. The user wants to know which tier
+			// fired, so we surface the source explicitly. 'heuristic-only' means all
+			// four AI providers failed — that is itself useful diagnostic data.
+			const sourceLabel = {
+				'gemma-4': '🟢 Gemma 4 (CF AI)',
+				'gemini-flash': '🟡 Gemini Flash (fallback)',
+				'gemini-flash-lite': '🟡 Gemini Flash-Lite (fallback)',
+				'llama-8b': '🔵 Llama 3.1 8B (Tier 1)',
+				'heuristic-only': '🔴 HEURISTIC FLOOR (all providers failed)',
+				'default-empty': '⚪ Default (empty input)',
+			}[result.source] || result.source;
+
+			const confEmoji = { high: '✅', medium: '🟡', low: '⚠️' }[result.confidence] || '?';
+
+			const report =
+				`<b>Tag Mode Test</b>\n\n` +
+				`<b>Input:</b> <i>${sample.slice(0, 200).replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]))}</i>\n\n` +
+				`<b>Mode:</b> <code>${result.mode}</code>\n` +
+				`<b>Confidence:</b> ${confEmoji} <code>${result.confidence}</code>\n` +
+				`<b>Source:</b> ${sourceLabel}\n` +
+				`<b>Latency:</b> ${elapsed}ms\n` +
+				`<b>History context:</b> ${recentHistory.length} turn(s)\n\n` +
+				`<i>Confidence comes from heuristic agreement — high = surface features support the model pick, low = features point a different direction.</i>`;
+
+			await telegram.sendMessage(chatId, threadId, report, env);
+			log.info('tagmode_test', {
+				sample: sample.slice(0, 80),
+				mode: result.mode,
+				confidence: result.confidence,
+				source: result.source,
+				latency_ms: elapsed,
+			});
 			return true;
 		}
 		case "/researchfull": {
@@ -685,7 +788,7 @@ async function handleCommand(command, msg, env) {
 				}
 
 				let text = `<b>Deep Research History</b> (${results.length} results)\n\n`;
-				const userTz = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Etc/UTC';
+				const userTz = await getTimezone(chatId, env);
 				for (const r of results) {
 					const date = new Date(r.created_at + 'Z').toLocaleDateString('en-GB', { timeZone: userTz, day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 					const topicMatch = r.fact.match(/^Deep Research \(([^)]+)\):/);
@@ -875,7 +978,9 @@ export async function handleMessage(msg, env) {
 	const _elapsed = () => Date.now() - _t0;
 
 	try {
-		const firstName = msg.from.first_name || "User", userText = msg.text || msg.caption || "";
+		const firstName = msg.from.first_name || "User";
+		// userText is mutable: Phase C may append a voice transcript before routing.
+		let userText = msg.text || msg.caption || "";
 		log.info('message_received', { chatId, from: firstName, len: userText.length, hasMedia: !!getMediaFromMessage(msg) });
 
 		// Track last seen for contextual outreach timing
@@ -893,7 +998,7 @@ export async function handleMessage(msg, env) {
 		if (isListening) {
 			const bufferStr = await env.CHAT_KV.get(`listen_buffer_${chatId}`) || '[]';
 			const buffer = JSON.parse(bufferStr);
-			const listenTz = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Etc/UTC';
+			const listenTz = await getTimezone(chatId, env);
 			const timestamp = new Date().toLocaleTimeString('en-GB', { timeZone: listenTz });
 			buffer.push(`[${timestamp}] ${userText || '(Media uploaded)'}`);
 			await env.CHAT_KV.put(`listen_buffer_${chatId}`, JSON.stringify(buffer), { expirationTtl: 86400 });
@@ -917,75 +1022,211 @@ export async function handleMessage(msg, env) {
 
 		// Dynamic context throttling: skip heavy D1/Vectorize queries for short, low-value replies
 		const hasMedia = !!getMediaFromMessage(msg);
+
+		// =========================================================
+		// Phase C: Pre-flight transcription for voice / audio media.
+		// =========================================================
+		// Voice notes arrive with empty userText — routing and memory filters
+		// see only the audio bytes. We transcribe via Flash-Lite up-front so
+		// every downstream signal (tagger, regex, complexity heuristics, route
+		// selector) has actual content to work with.
+		//
+		// The audio is still passed to the main response model in userParts.
+		// Transcript is for routing / context, not a replacement for audio.
+		//
+		// We download the audio HERE and cache the bytes so the later media
+		// block doesn't re-download. cachedMedia survives in scope for the
+		// entire handler.
+		let cachedMedia = null; // { base64, buffer, filePath, fileSize, mime, fileId } when pre-downloaded
+		if (hasMedia) {
+			const _media = getMediaFromMessage(msg);
+			const isAudio = (_media.mimeHint || '').startsWith('audio/');
+			if (isAudio) {
+				const _t = Date.now();
+				try {
+					const download = await telegram.downloadFile(_media.fileId, env);
+					cachedMedia = { ...download, mime: _media.mimeHint, fileId: _media.fileId };
+
+					const { transcribeAudio } = await import('../services/transcription');
+					const result = await transcribeAudio(env, download.base64, _media.mimeHint);
+
+					if (result.success && result.text) {
+						// Append transcript to userText so all downstream signals see it.
+						userText = userText
+							? `${userText}\n\n[Voice transcript]: ${result.text}`
+							: `[Voice transcript]: ${result.text}`;
+						log.info('transcription_complete', {
+							chatId,
+							chars: result.text.length,
+							latency_ms: result.latency_ms,
+							total_elapsed_ms: _elapsed(),
+						});
+					} else {
+						log.warn('transcription_skipped', {
+							chatId,
+							error: result.error,
+							latency_ms: result.latency_ms,
+						});
+					}
+				} catch (e) {
+					log.warn('transcription_failed', {
+						chatId,
+						msg: (e.message || '').slice(0, 200),
+						elapsed_ms: Date.now() - _t,
+					});
+					// Fall through — audio still routes to Pro via hasMedia rule,
+					// just without a transcript to inform memory filtering etc.
+				}
+			}
+		}
+
 		const isSubstantive = userText.length > 15 || userText.includes('?') || hasMedia;
 
-		const [memCtx, semanticCtx, personaKey, rawHistory] = await Promise.all([
-			isSubstantive ? memoryStore.getFormattedContext(env, userId) : Promise.resolve(''),
+		// Pre-compute register signals so memCtx can be filtered by mode.
+		// Three modes:
+		//   warm     — emotional language, mental-health keywords, active health check-in
+		//   technical — code/arch/research keywords (subset of detectComplexTask)
+		//   default  — everything else (casual chat, data points, small talk)
+		// Casual messages no longer drag in 15KB of clinical history.
+		const earlyEmotional = /\b(anxious|depressed|panic|overwhelm|scared|lonely|empty|hopeless|angry|frustrated|sad|grief|trigger|manic|racing|numb|crying|breakdown|struggling|worried|stressed|spiralling)\b/i.test(userText);
+		const earlyTechnical = /\b(code|function|bug|error|deploy|refactor|implement|architecture|PR|pull request|commit|git|webpack|npm|wrangler|api|endpoint|database|query|sql|schema|migration|docker|kubernetes|aws|cloudflare|workers)\b/i.test(userText) || /\.(js|ts|py|json|css|html|jsx|mjs)\b/.test(userText) || /```/.test(userText);
+		const earlyHealthCheckin = await env.CHAT_KV.get(`health_checkin_active_${chatId}`);
+		const ctxMode = (earlyEmotional || earlyHealthCheckin) ? 'warm' : earlyTechnical ? 'technical' : 'default';
+
+		const [memCtxResult, semanticCtx, personaKey, rawHistory] = await Promise.all([
+			isSubstantive ? memoryStore.getFormattedContext(env, userId, ctxMode, userText) : Promise.resolve({ ctx: '', memories: [], debug: { mode: ctxMode, total: 0, skipped: 'not_substantive' } }),
 			isSubstantive ? vectorStore.getSemanticContext(env, userId, userText) : Promise.resolve(''),
 			env.CHAT_KV.get(`persona_${chatId}_${threadId}`),
 			env.CHAT_KV.get(`chat_${chatId}_${threadId}`, { type: "json" })
 		]);
 
+		const memCtx = memCtxResult?.ctx || '';
+		const memCtxDebug = memCtxResult?.debug || { mode: ctxMode, total: 0 };
+		const memCtxRows = memCtxResult?.memories || [];
+
 		const activePersona = getPersona(personaKey);
 		const hist = sanitizeHistory(rawHistory || []);
 
-		// Model routing: check for manual override in KV, otherwise default to Owner=Pro / Guest=Flash
+		// Pre-response curator (Phase 4). For substantive turns, kick off a
+		// Flash-Lite analysis pass that returns:
+		//   - register override (in case our regex was wrong)
+		//   - structured flags (crisis, med_question, project_continuity, etc)
+		//   - relevant_memory_ids (which memories actually matter for this turn)
+		//   - reasoning summary the main model can read
+		// Result is prepended to the dynamic context block so the main model gets
+		// a curated handoff. Skipped for short messages, active health check-ins
+		// (register already locked), and when there's nothing to curate.
+		//
+		// Latency budget: ~200-400ms via Flash-Lite. We don't await before doing
+		// other prep, but we DO await before prompt assembly — the prepend has to
+		// be in place when the prompt is built.
+		let curatorPromise = Promise.resolve(null);
+		const shouldCurate = isSubstantive && userText.length >= 30 && !earlyHealthCheckin && (memCtxRows.length > 0 || semanticCtx.length > 0);
+		if (shouldCurate) {
+			const { curateContext } = await import('../services/responseCurator');
+			curatorPromise = curateContext(env, {
+				userText,
+				memories: memCtxRows,
+				recentHistory: hist,
+				semanticCtxPreview: semanticCtx,
+			}).catch(e => {
+				log.warn('curator_promise_rejected', { msg: e.message });
+				return null;
+			});
+		}
+
+
+		// Model routing happens AFTER currentCheckin is determined (post-clear logic).
+		// We need currentCheckin (not healthCheckin) so the router sees the correct
+		// state when the user has just dropped out of a check-in flow.
+		//
+		// modelOverride is read here so we can both delete the one-shot key and
+		// pass the resolved model string to routeMessage. The resolution from
+		// 'pro'/'flash'/'lite' to actual model strings happens at the call site
+		// because router.js uses raw model strings.
 		const isOwner = env.OWNER_ID && String(userId) === String(env.OWNER_ID);
 
-		// Check health check-in state early (needed for model selection + context gating)
+		// Check health check-in state early (used for clear-flag logic and as input
+		// to the route call below).
 		const healthCheckin = isOwner ? await env.CHAT_KV.get(`health_checkin_active_${chatId}`) : null;
 
-		// Smart model selection — same chain for everyone, no owner/guest asymmetry.
-		// Ternary tiers:
-		//   Pro  → complex tasks, warm register, mental health (detectComplexTask matches these)
-		//   Flash → medium: substantive chat that isn't a deep request
-		//   Flash-Lite → simple: short, casual, data-point confirmations, check-in replies
-		//
-		// modelOverride from /model command is a one-shot override.
 		const modelOverride = await env.CHAT_KV.get(`model_override_${chatId}_${threadId}`);
 		if (modelOverride) await env.CHAT_KV.delete(`model_override_${chatId}_${threadId}`);
 
-		let textModel;
-		if (modelOverride) {
-			// User explicitly picked a tier
-			textModel = modelOverride === 'pro' ? PRIMARY_TEXT_MODEL
-				: modelOverride === 'flash' ? FALLBACK_TEXT_MODEL
-				: modelOverride === 'lite' ? FLASH_LITE_TEXT_MODEL
-				: FALLBACK_TEXT_MODEL;
-			log.info('model_override_applied', { model: textModel });
-		} else if (healthCheckin) {
-			// Check-in replies are short data-point confirmations. Flash-Lite is ideal:
-			// fast, cheap, and built for this exact workload. Previously forced to Flash.
-			textModel = FLASH_LITE_TEXT_MODEL;
-			log.info('model_lite_forced', { reason: 'health_checkin_active', checkin: healthCheckin });
-		} else if (detectComplexTask(userText)) {
-			// Complex tasks include: code, architecture, mental health keywords,
-			// analytical requests, research triggers, messages >300 chars.
-			// These cover the warm-register triggers at the JS routing layer.
-			textModel = PRIMARY_TEXT_MODEL;
-			log.info('model_upgrade', { reason: 'complex_task', model: textModel });
-		} else if (isSimpleMessage(userText)) {
-			// Simple: short casual chat, acknowledgments, data points
-			textModel = FLASH_LITE_TEXT_MODEL;
-		} else {
-			// Medium default: substantive-but-not-complex
-			textModel = FALLBACK_TEXT_MODEL;
-		}
+		const resolvedOverride = modelOverride === 'pro' ? PRIMARY_TEXT_MODEL
+			: modelOverride === 'flash' ? FALLBACK_TEXT_MODEL
+			: modelOverride === 'lite' ? FLASH_LITE_TEXT_MODEL
+			: modelOverride || null; // pass through raw model string if it's already one
 
 		const effectivePersona = activePersona;
 
 		// Fetch per-user persona config from D1 (voice, tone, evolved traits)
 		const personaConfig = await personaStore.getPersona(env, userId, effectivePersona).catch(() => null);
 
-		// If the user is clearly NOT engaging with a health check-in, clear the flag
+		// If the user is clearly NOT engaging with a health check-in, clear the flag.
 		const isHealthRelated = /sleep|mood|medication|medic|anxious|anxiety|depressed|how.*feel|emotion|check.?in/i.test(userText);
 		if (healthCheckin && !isHealthRelated && userText.length > 10) {
 			await env.CHAT_KV.delete(`health_checkin_active_${chatId}`);
 			log.info('checkin_cleared', { chatId, reason: 'non_health_message', was: healthCheckin });
 		}
 
-		// Only inject check-in context if the flag survived
+		// Only inject check-in context if the flag survived.
 		const currentCheckin = await env.CHAT_KV.get(`health_checkin_active_${chatId}`);
+
+		// textModel will be derived from the route once we have all signals
+		// (mode from tagger, currentCheckin post-clear). Declared here so it's
+		// in scope for cache setup and the generation loop.
+		let textModel;
+
+		// =========================================================
+		// Phase B: Unified routing.
+		// =========================================================
+		// Run the conversation-mode tagger in parallel-safe fashion (~500ms
+		// typical via Llama 8B; full chain has 8s budget with heuristic floor).
+		// The tagger output feeds the router as one of several signals — it is
+		// NOT a hard switch. The router still applies regex, complexity, and
+		// override rules in priority order.
+		const _tTagger = Date.now();
+		const { tagConversationMode } = await import('../services/cfAi');
+		const tagResult = await tagConversationMode(env, userText, hist.slice(-4)).catch((e) => {
+			log.warn('tagger_failed_in_hot_path', { msg: e.message });
+			return { mode: null };
+		});
+		log.info('tagger_resolved', {
+			chatId,
+			mode: tagResult?.mode,
+			source: tagResult?.source,
+			latency_ms: Date.now() - _tTagger,
+		});
+
+		// Single source of truth: every signal flows into routeMessage.
+		// router.js owns the priority order — handlers.js no longer duplicates
+		// the tier-selection logic.
+		const route = routeMessage({
+			userText,
+			healthCheckinActive: !!currentCheckin,
+			hasMedia,
+			mode: tagResult?.mode,
+			modelOverride: resolvedOverride,
+		});
+
+		// Derive the Gemini fallback model. For the CF path, route.model is the
+		// CF model id (handled by createProvider); textModel is what we'd fall
+		// BACK to if the CF path errors out, hence FALLBACK_TEXT_MODEL (Flash).
+		// For the Gemini path, textModel = route.model directly.
+		if (route.provider === 'gemini') {
+			textModel = route.model;
+		} else {
+			textModel = FALLBACK_TEXT_MODEL;
+		}
+		log.info('model_route_resolved', {
+			chatId,
+			provider: route.provider,
+			model: route.model,
+			textModel,
+			reason: route.reason,
+			override: !!resolvedOverride,
+		});
 
 		// Build dynamic journal roadmap for evening check-ins
 		let checkinProgress = '';
@@ -1071,18 +1312,57 @@ export async function handleMessage(msg, env) {
 		// Use the user's stored timezone (from location pin or /timezone) for the
 		// "Local Time" context line passed to Gemini. Falls back to UTC when nothing
 		// stored, matching the policy in src/lib/timezone.js.
-		const promptTz = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Etc/UTC';
+		const promptTz = await getTimezone(chatId, env);
 		const localTimeLabel = new Date().toLocaleString("en-GB", { timeZone: promptTz, day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
 
-		const dynamicContext = `[Context] Current speaker: ${userIdentity} | Local Time (${promptTz}): ${localTimeLabel} | Unix: ${Math.floor(Date.now() / 1000)}${weatherCtx ? ` | ${weatherCtx}` : ''} | Relationship: ${daysKnown} days | Persona: ${personaConfig?.display_name || effectivePersona}${checkinProgress}${personaTraits ? `\n\nPERSONA TRAITS FOR THIS USER:\n${personaTraits}` : ''}${customInstruction ? `\n\nCUSTOM INSTRUCTION:\n${customInstruction}` : ''}\n\nMEMORY:\n${memCtx}${semanticCtx}${episodeCtx ? `\n\n${episodeCtx}` : ''}${proceduralCtx ? `\n\n${proceduralCtx}` : ''}${graphCtx ? `\n\n${graphCtx}` : ''}${planCtx}`;
+		// Phase 4 finalisation: await the curator and build the prepend block.
+		// Curator output goes BEFORE the MEMORY section so the main model reads:
+		//   1. Persona traits / custom instruction
+		//   2. Curator analysis (register, flags, reasoning, selected memory IDs)
+		//   3. Raw MEMORY block (still included — curator may have missed something)
+		//   4. Semantic / episode / procedural / graph / plan context
+		// The dual presence of curator-selected memories + raw MEMORY is intentional.
+		// The curator's selection acts as a SPOTLIGHT, not a filter; the main model
+		// still sees the full retrieved context but knows which items the curator
+		// flagged as load-bearing for THIS turn.
+		let curatedPrepend = '';
+		let curatorRegister = null;
+		try {
+			const curatorResult = await curatorPromise;
+			if (curatorResult) {
+				const { buildCuratedPrepend } = await import('../services/responseCurator');
+				curatedPrepend = buildCuratedPrepend(curatorResult, memCtxRows);
+				curatorRegister = curatorResult.register;
+				log.info('curator_applied', {
+					chatId,
+					register: curatorResult.register,
+					flagCount: curatorResult.flags.length,
+					relevantIds: curatorResult.relevant_memory_ids.length,
+					prependChars: curatedPrepend.length,
+				});
+			}
+		} catch (curErr) {
+			log.warn('curator_await_failed', { msg: curErr.message });
+		}
+
+		const dynamicContext = `[Context] Current speaker: ${userIdentity} | Local Time (${promptTz}): ${localTimeLabel} | Unix: ${Math.floor(Date.now() / 1000)}${weatherCtx ? ` | ${weatherCtx}` : ''} | Relationship: ${daysKnown} days | Persona: ${personaConfig?.display_name || effectivePersona}${checkinProgress}${personaTraits ? `\n\nPERSONA TRAITS FOR THIS USER:\n${personaTraits}` : ''}${customInstruction ? `\n\nCUSTOM INSTRUCTION:\n${customInstruction}` : ''}${curatedPrepend ? `\n\n${curatedPrepend}` : ''}\n\nMEMORY:\n${memCtx}${semanticCtx}${episodeCtx ? `\n\n${episodeCtx}` : ''}${proceduralCtx ? `\n\n${proceduralCtx}` : ''}${graphCtx ? `\n\n${graphCtx}` : ''}${planCtx}`;
 
 		// DIAGNOSTICS: size breakdown — tells us which dynamic section is bloating the prompt
 		log.info('prompt_sizes', {
 			chatId,
 			model: textModel,
+			ctxMode,
+			curatorRegister,
+			memCtx_total: memCtxDebug.total || 0,
+			memCtx_kept: (memCtxDebug.factual_kept || 0) + (memCtxDebug.therapeutic_kept || 0) + (memCtxDebug.feedback_kept || 0) + (memCtxDebug.triples_kept || 0),
+			memCtx_factual: memCtxDebug.factual_kept || 0,
+			memCtx_therapeutic: memCtxDebug.therapeutic_kept || 0,
+			memCtx_feedback: memCtxDebug.feedback_kept || 0,
+			memCtx_triples: memCtxDebug.triples_kept || 0,
 			persona_chars: personaInstruction.length,
 			styleCard_chars: styleCardSection.length,
 			memCtx_chars: memCtx.length,
+			curated_chars: curatedPrepend.length,
 			semanticCtx_chars: semanticCtx.length,
 			episodeCtx_chars: episodeCtx.length,
 			proceduralCtx_chars: proceduralCtx.length,
@@ -1094,22 +1374,8 @@ export async function handleMessage(msg, env) {
 			elapsed_ms: _elapsed(),
 		});
 
-		// TEMP DIAGNOSTIC: dump full dynamicContext for owner on substantive messages.
-		// Used to identify what memory / style card content is driving persona drift
-		// (repeated sleep-data mentions, clinical terminology in casual chat, etc.).
-		// Remove this log once persona tuning is complete.
-		if (isOwner && (userText.length > 30 || hasMedia)) {
-			log.info('dynamic_context_dump', {
-				chatId,
-				userText: userText.slice(0, 300),
-				memCtx_preview: memCtx.slice(0, 4000),
-				semanticCtx_preview: semanticCtx.slice(0, 1500),
-				episodeCtx_preview: episodeCtx.slice(0, 1500),
-				proceduralCtx_preview: proceduralCtx.slice(0, 1500),
-				graphCtx_preview: graphCtx.slice(0, 1500),
-				styleCard_preview: styleCardSection.slice(0, 2000),
-			});
-		}
+		// (dynamic_context_dump removed — was a 15KB-per-message debug that's no
+		// longer needed now that prompt_sizes captures memCtx structure via memCtxDebug.)
 
 		// Skip code execution when media is present (incompatible with audio/video inline data)
 		// Also skip cache when media is present, because the cache has codeExecution baked in
@@ -1132,21 +1398,18 @@ export async function handleMessage(msg, env) {
 		// =========================================================
 		// Path B fast-path — Cloudflare provider for casual chat
 		// =========================================================
-		// Routes ~80% of messages (casual, code, analytical, long) to free
-		// Cloudflare Workers AI (Gemma 4 / Qwen3 30B) instead of Gemini.
+		// `route` was resolved earlier (see Phase B block above) — handlers.js
+		// no longer recomputes routing here. We just consult the resolved route
+		// and dispatch to the CF provider when it picked one.
+		//
 		// Bypasses Gemini cache + tool loop because:
 		//   - Gemma/Qwen handle tool calls via OpenAI-compat (different shape)
 		//   - Cache is Gemini-specific (cachedContent on Google's models)
 		//   - For casual chat we don't need the heavyweight Gemini setup
-		// Multimodal, emotional, and active-checkin messages still go to Gemini.
-		const route = routeMessage({
-			userText,
-			healthCheckinActive: !!currentCheckin,
-			hasMedia,
-		});
-		if (!route.isDefault) log.info('model_route', { provider: route.provider, model: route.model, reason: route.reason });
+		// Multimodal, emotional, override, and active-checkin messages went to
+		// Gemini in the router, so they never reach this branch.
 
-		if (route.provider === 'cloudflare' && !modelOverride && env.AI) {
+		if (route.provider === 'cloudflare' && !resolvedOverride && env.AI) {
 			try {
 				const provider = createProvider(route, env);
 				const cfMessages = [];
@@ -1235,6 +1498,22 @@ export async function handleMessage(msg, env) {
 					chars: finalText.length,
 					elapsed_ms: Date.now() - tStream,
 					animated: cfDraftActive,
+				});
+				log.info('message_handled', {
+					chatId,
+					userId,
+					provider: 'cloudflare',
+					model: route.model,
+					route_reason: route.reason,
+					ctxMode,
+					inputLen: userText.length,
+					outputLen: finalText.length,
+					memCtx_chars: memCtx.length,
+					memCtx_kept: (memCtxDebug.factual_kept || 0) + (memCtxDebug.therapeutic_kept || 0) + (memCtxDebug.feedback_kept || 0) + (memCtxDebug.triples_kept || 0),
+					hasMedia,
+					isEmotionalMsg: earlyEmotional || !!earlyHealthCheckin,
+					outcome: 'success_cf',
+					total_elapsed_ms: _elapsed(),
 				});
 				log.info('handler_end', { chatId, total_elapsed_ms: _elapsed(), outcome: 'success_cf' });
 				return;
@@ -1630,6 +1909,22 @@ export async function handleMessage(msg, env) {
 		// DIAGNOSTICS: handler completed successfully — total time from message_received to here.
 		// If we never see this log but we see message_received, we know the handler never reached
 		// its exit point before waitUntil killed it.
+		log.info('message_handled', {
+			chatId,
+			userId,
+			provider: 'gemini',
+			model: textModel,
+			route_reason: route?.reason || 'gemini_default',
+			ctxMode,
+			inputLen: userText.length,
+			outputLen: fullText.length,
+			memCtx_chars: memCtx.length,
+			memCtx_kept: (memCtxDebug.factual_kept || 0) + (memCtxDebug.therapeutic_kept || 0) + (memCtxDebug.feedback_kept || 0) + (memCtxDebug.triples_kept || 0),
+			hasMedia,
+			isEmotionalMsg,
+			outcome: 'success',
+			total_elapsed_ms: _elapsed(),
+		});
 		log.info('handler_end', { chatId, total_elapsed_ms: _elapsed(), outcome: 'success' });
 
 	} catch (err) {

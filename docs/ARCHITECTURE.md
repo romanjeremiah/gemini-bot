@@ -115,8 +115,7 @@ The router (`src/ai/router.js`) is the single decision point for which provider+
 
 | Tier | Model | Used when |
 |---|---|---|
-| Default casual (CF) | `@cf/google/gemma-4-26b-a4b-it` | Casual chat, default for ~80% of messages |
-| Code/analytical (CF) | `@cf/qwen/qwen3-30b-a3b-fp8` | Code keywords, analytical requests, long messages (>300 chars) |
+| Default casual (CF) | `@cf/google/gemma-4-26b-a4b-it` | All Cloudflare-routed chat: casual, code, analytical, long messages |
 | Pro (Gemini) | `gemini-3.1-pro-preview` | Multimodal (voice/image/video), emotional/therapeutic, active health check-in |
 | Flash (Gemini) | `gemini-3-flash-preview` | Fallback when CF path fails for any reason |
 | Flash-Lite (Gemini) | `gemini-3.1-flash-lite-preview` | Manual `/model lite` override |
@@ -124,16 +123,16 @@ The router (`src/ai/router.js`) is the single decision point for which provider+
 Routing rules (in order):
 
 1. `hasMedia` → Gemini Pro
-2. `healthCheckinActive` → Gemini Pro (high thinking)
+2. `healthCheckinActive` → Gemini Pro
 3. Emotional pattern matched → Gemini Pro
-4. Code keywords or triple-backtick → CF Qwen3 30B
-5. Analytical pattern matched → CF Qwen3 30B
-6. Text length > 300 → CF Qwen3 30B
-7. Default → CF Gemma 4
+4. Code keywords or triple-backtick → Gemma 4 (logged as `code_content`)
+5. Analytical pattern matched → Gemma 4 (logged as `analytical_content`)
+6. Text length > 300 → Gemma 4 (logged as `long_message`)
+7. Default → Gemma 4 (silent, no log)
 
-The router only logs non-default routes; casual → Gemma is silent.
+Rules 4-6 route to the same model as the default, but emit a `model_route` log so we can see message-shape distribution in `wrangler tail`. The default casual route is unlogged to keep the tail quiet.
 
-If the CF path fails for any reason (model error, empty response, network issue), `handlers.js` automatically falls back to the existing Gemini Flash path with full cache + tool-loop support. This is the safety net behind Path B.
+If the CF path fails for any reason (model error, empty response, network issue), `handlers.js` automatically falls back to Gemini Flash with full cache + tool-loop support. This is the safety net behind Path B.
 
 For background generation (greetings, observations, listen-mode reactions), `generateShortResponse` in `src/lib/ai/gemini.js` uses its own 3-tier cascade: Gemma → Flash-Lite → Flash. This is what unblocks scheduled morning check-ins when Gemini preview is overloaded.
 

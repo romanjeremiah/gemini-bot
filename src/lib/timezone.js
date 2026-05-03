@@ -12,7 +12,11 @@
 // the cache and the fallback policy. Replaces the previous mix of
 // `user_timezone` (global) and `timezone_${chatId}` (per-chat) keys.
 
-const DEFAULT_TIMEZONE = 'Etc/UTC';
+// Fallback policy: if neither KV nor D1 has a timezone for this chat, use
+// Europe/London. This matches the bot's primary user base and is the safer
+// default than UTC, which has caused real issues (BST/GMT off-by-one).
+// Override per-chat by sharing a location pin or using /setlocation.
+const DEFAULT_TIMEZONE = 'Europe/London';
 
 /**
  * Resolve a (lat, lng) pair to an IANA timezone via Google Maps API.
@@ -62,13 +66,43 @@ export async function setTimezoneFromCoords(chatId, lat, lng, env) {
 }
 
 /**
- * Get the stored timezone for a chat, or DEFAULT_TIMEZONE (UTC) if none.
- * Replaces the previous dual-key confusion (user_timezone vs timezone_${chatId}).
+ * Get the stored timezone for a chat.
+ *
+ * Resolution order (canonical source of truth):
+ *   1. KV `timezone_${chatId}` — fast, the cache used by cron and handlers
+ *   2. D1 `user_profiles.timezone` — durable source of truth
+ *   3. DEFAULT_TIMEZONE (Europe/London) — last-resort fallback
+ *
+ * If KV is empty but D1 has a value, the function self-heals by writing the
+ * D1 value back to KV. This handles the case where a user pinned their
+ * location once and KV later evicted, leaving the bot showing UTC despite
+ * having the correct value in D1.
  */
 export async function getTimezone(chatId, env) {
 	if (!chatId) return DEFAULT_TIMEZONE;
-	const stored = await env.CHAT_KV.get(`timezone_${chatId}`);
-	return stored || DEFAULT_TIMEZONE;
+
+	// 1. KV cache
+	try {
+		const cached = await env.CHAT_KV.get(`timezone_${chatId}`);
+		if (cached) return cached;
+	} catch { /* fall through to D1 */ }
+
+	// 2. D1 source of truth — only attempt if DB binding is present.
+	if (env.DB) {
+		try {
+			const row = await env.DB.prepare(
+				'SELECT timezone FROM user_profiles WHERE user_id = ?'
+			).bind(chatId).first();
+			if (row?.timezone) {
+				// Self-heal: backfill the KV cache so the next read is fast.
+				await env.CHAT_KV.put(`timezone_${chatId}`, row.timezone).catch(() => {});
+				return row.timezone;
+			}
+		} catch { /* fall through to default */ }
+	}
+
+	// 3. Fallback
+	return DEFAULT_TIMEZONE;
 }
 
 /**

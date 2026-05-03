@@ -139,7 +139,321 @@ If none found, write: DUPLICATES: none / CONTRADICTIONS: none`,
 	return { groups, duplicates, contradictions };
 }
 
-export { MODELS };
+
+
+/**
+ * Classify the conversational mode of the user's most recent message.
+ * Returns { mode, confidence, source } where mode is one of:
+ *   'venting' | 'processing' | 'transactional' | 'crisis'
+ *
+ * - venting: emotional discharge, looking to be heard, not asking for solutions
+ * - processing: actively trying to understand or work through something, open to questions
+ * - transactional: practical request (reminder, code, lookup, info)
+ * - crisis: severe distress, suicidal ideation, dissociation, mood 0-1 territory
+ *
+ * Provider chain (per-tier timeouts vary by model; total chain capped at 8000ms):
+ *   Tier 1: Llama 3.1 8B (cap 1500ms)   — fast, free, resilience anchor
+ *   Tier 2: Gemma 4 26B (cap 3500ms)    — free, accuracy when time permits
+ *   Tier 3: Gemini Flash (cap 2500ms)   — reliable production fallback
+ *   Tier 4: Gemini Flash-Lite (cap 2000ms) — last resort (most overloaded)
+ *   Floor:  Heuristic regex (instant)   — never null
+ *
+ * Order optimises for resilience first, accuracy second. Llama 8B handles
+ * the easy 80% in <1s. Gemma reasons through nuance when needed. Gemini
+ * Flash is the production-grade safety net. Flash-Lite is last because
+ * it's the most failure-prone preview model.
+ *
+ * Total cap of 8000ms means worst case the entire chain completes within
+ * the budget of the parallel Promise.all in handlers.js. The tagger runs
+ * alongside memory fetches so under steady-state (Llama succeeds in tier 1)
+ * its latency hides under the slowest memory op.
+ *
+ * Confidence is computed locally from message features (length, punctuation,
+ * keyword agreement) and reflects how strongly the heuristics support the
+ * model's classification. Returned as 'high' | 'medium' | 'low'.
+ *
+ * @param {object} env - Worker env with AI + GEMINI_API_KEY bindings
+ * @param {string} userText - The current user message
+ * @param {Array<{role:string,parts:Array}>} recentHistory - Last 4-6 turns from chat history
+ * @returns {Promise<{mode: 'venting'|'processing'|'transactional'|'crisis', confidence: 'high'|'medium'|'low', source: string}>}
+ */
+export async function tagConversationMode(env, userText, recentHistory = []) {
+	if (!userText || userText.length < 2) {
+		return { mode: 'transactional', confidence: 'low', source: 'default-empty' };
+	}
+
+	const contextLines = recentHistory.slice(-4).map(turn => {
+		const role = turn.role === 'model' ? 'BOT' : 'USER';
+		const text = (turn.parts || []).map(p => p.text).filter(Boolean).join(' ').slice(0, 200);
+		return text ? `${role}: ${text}` : '';
+	}).filter(Boolean).join('\n');
+
+	const prompt = `Classify the user's most recent message into ONE of these modes:
+
+venting — emotional discharge, repeating a painful thought, not asking for help, just needs to be heard. Examples: "He's ignoring me", "I can't stop thinking about it", "I'm just done"
+processing — actively trying to understand or work through something, open to questions and reflection. Examples: "Why does this keep happening?", "Help me think this through", "What do you make of this?"
+transactional — practical request: reminder, lookup, code, info, scheduling. No emotional content. Examples: "Remind me at 9am", "What time is it in Tokyo?", "Fix this code"
+crisis — severe distress: suicidal thoughts, self-harm, dissociation, total breakdown, mood 0-1 territory. Examples: "I want to die", "I can't feel anything", "I can't go on"
+
+RECENT CONVERSATION:
+${contextLines || '(no prior context)'}
+
+CURRENT USER MESSAGE: ${userText.slice(0, 400)}
+
+Respond with ONLY one word: venting, processing, transactional, or crisis.`;
+
+	const systemPrompt = 'You classify conversational modes. Output only one word.';
+
+	// Per-tier timeouts vary by model latency profile. Total chain budget
+	// 8000ms. If we burn the total budget on a slow tier, skip remaining
+	// tiers and drop to the heuristic floor.
+	const chainStartedAt = Date.now();
+	const TOTAL_CHAIN_BUDGET_MS = 8000;
+	const budgetLeft = () => Math.max(0, TOTAL_CHAIN_BUDGET_MS - (Date.now() - chainStartedAt));
+	const tierTimeout = (preferredMs) => Math.min(preferredMs, budgetLeft());
+
+	// Stop on first valid label.
+	let mode = null;
+	let source = null;
+
+	// Tier 1: Llama 3.1 8B (resilience anchor — fast, free, very reliable)
+	if (!mode && env.AI && budgetLeft() > 100) {
+		mode = await _tryProvider(
+			() => _classifyWithLlama8B(env, prompt, systemPrompt),
+			tierTimeout(1500)
+		);
+		if (mode) source = 'llama-8b';
+	}
+
+	// Tier 2: Gemma 4 26B (accuracy via reasoning, but slower)
+	if (!mode && env.AI && budgetLeft() > 100) {
+		mode = await _tryProvider(
+			() => _classifyWithGemma(env, prompt, systemPrompt),
+			tierTimeout(3500)
+		);
+		if (mode) source = 'gemma-4';
+	}
+
+	// Tier 3: Gemini Flash (production-grade fallback)
+	if (!mode && env.GEMINI_API_KEY && budgetLeft() > 100) {
+		mode = await _tryProvider(
+			() => _classifyWithGemini(env, prompt, systemPrompt, '@gemini-flash'),
+			tierTimeout(2500)
+		);
+		if (mode) source = 'gemini-flash';
+	}
+
+	// Tier 4: Gemini Flash-Lite (last resort — most overloaded preview model)
+	if (!mode && env.GEMINI_API_KEY && budgetLeft() > 100) {
+		mode = await _tryProvider(
+			() => _classifyWithGemini(env, prompt, systemPrompt, '@gemini-flash-lite'),
+			tierTimeout(2000)
+		);
+		if (mode) source = 'gemini-flash-lite';
+	}
+
+	// Last-resort floor: heuristic-only. Better than null because the
+	// conversation-state block ALWAYS gets a mode — Gemini Pro never sees
+	// 'mode: unknown', which would invite hallucination.
+	if (!mode) {
+		mode = _heuristicGuess(userText);
+		source = 'heuristic-only';
+	}
+
+	const confidence = _computeConfidence(userText, mode, source);
+	return { mode, confidence, source };
+}
+
+// ---- Provider helpers ----
+
+async function _tryProvider(fn, timeoutMs) {
+	const t0 = Date.now();
+	try {
+		let didTimeout = false;
+		const result = await Promise.race([
+			fn(),
+			new Promise(resolve => setTimeout(() => {
+				didTimeout = true;
+				resolve(null);
+			}, timeoutMs)),
+		]);
+		const elapsed = Date.now() - t0;
+		if (didTimeout) {
+			console.warn(`tagConversationMode: provider timed out after ${elapsed}ms (cap ${timeoutMs}ms)`);
+			return null;
+		}
+		const mode = _extractMode(result);
+		if (!mode) {
+			// Surface the FULL raw response (up to 500 chars) so we can tell the
+			// difference between: (a) genuinely empty model output, (b) response
+			// shape mismatch where the answer is in an unexpected field, and
+			// (c) thinking-tokens consuming the entire max_tokens budget.
+			const rawType = typeof result;
+			const rawPreview = result === null ? '(null)'
+				: result === undefined ? '(undefined)'
+				: rawType === 'string' ? `"${result.slice(0, 500)}"`
+				: JSON.stringify(result)?.slice(0, 500) || '(unstringifiable)';
+			console.warn(`tagConversationMode: provider returned no parseable mode in ${elapsed}ms. Raw type: ${rawType}, preview: ${rawPreview}`);
+		}
+		return mode;
+	} catch (err) {
+		const elapsed = Date.now() - t0;
+		console.warn(`tagConversationMode: provider failed in ${elapsed}ms: ${err.message?.slice(0, 200)}`);
+		return null;
+	}
+}
+
+async function _classifyWithGemma(env, prompt, systemPrompt) {
+	const { runCfAi } = await import('../lib/ai-gateway.js');
+	// max_tokens: 2000 — Gemma 4 26B reasons before answering, and that reasoning
+	// counts against this ceiling. Both 16 and 128 truncated mid-reasoning before
+	// the model could produce its one-word answer (finish_reason: "length").
+	// 2000 is generous; the model will hit its natural EOS far before this.
+	// The 1500ms tier wall-clock cap is the real safety limit; this is just
+	// the token budget upper bound.
+	const result = await runCfAi(env.AI, '@cf/google/gemma-4-26b-a4b-it', {
+		messages: [
+			{ role: 'system', content: systemPrompt },
+			{ role: 'user', content: prompt },
+		],
+		temperature: 0.2,
+		max_tokens: 2000,
+	});
+	// Try the standard fields first; if both empty, return the raw object so
+	// _tryProvider's no-parse log can show what shape actually came back.
+	const text = result?.choices?.[0]?.message?.content || result?.response;
+	return text || result;
+}
+
+async function _classifyWithGemini(env, prompt, systemPrompt, modelTag) {
+	const { GoogleGenAI } = await import('@google/genai');
+	const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
+	const model = modelTag === '@gemini-flash'
+		? 'gemini-3-flash-preview'
+		: 'gemini-3.1-flash-lite-preview';
+	// maxOutputTokens: 2000 — same reasoning as Gemma. Gemini 3.x preview
+	// models have internal thinking budgets that consume output tokens before
+	// the visible answer. 16 and 128 both hit length limit. The 1500ms tier
+	// wall-clock cap is the real safety limit; this is just the token budget.
+	const response = await ai.models.generateContent({
+		model,
+		contents: [{ role: 'user', parts: [{ text: prompt }] }],
+		config: {
+			systemInstruction: systemPrompt,
+			temperature: 0.2,
+			maxOutputTokens: 2000,
+		},
+	});
+	// Prefer the SDK's stable .text accessor (newer @google/genai versions
+	// expose this as a getter that aggregates all text parts and ignores
+	// thought/tool parts). Fall back to manual parts walking for older SDK
+	// versions. If both fail, return the raw response so _tryProvider's
+	// no-parse log can show what came back — e.g. blockReason, sdkHttpResponse
+	// wrapper, or all-thoughts content.
+	let text = '';
+	if (typeof response?.text === 'string') {
+		text = response.text;
+	} else if (typeof response?.text === 'function') {
+		try { text = response.text() || ''; } catch { /* fall through */ }
+	}
+	if (!text) {
+		text = response?.candidates?.[0]?.content?.parts
+			?.filter(p => p.text && !p.thought)
+			?.map(p => p.text)
+			?.join('') || '';
+	}
+	return text || response;
+}
+
+async function _classifyWithLlama8B(env, prompt, systemPrompt) {
+	// Llama 3.1 8B is the resilience anchor: fast, reliable, accurate enough
+	// for nuanced classification without the reasoning overhead of Gemma 4.
+	// Direct env.AI.run (no gateway) keeps the call cheap and isolates this
+	// from gateway-side failures.
+	const result = await env.AI.run(MODELS.balanced, {
+		messages: [
+			{ role: 'system', content: systemPrompt },
+			{ role: 'user', content: prompt },
+		],
+		max_tokens: 64,
+	}, {
+		headers: { 'x-session-affinity': 'xaridotis-tag' },
+	});
+	return result?.response || result;
+}
+
+function _extractMode(rawText) {
+	if (!rawText || typeof rawText !== 'string') return null;
+	const match = rawText.toLowerCase().match(/\b(venting|processing|transactional|crisis)\b/);
+	return match ? match[1] : null;
+}
+
+// ---- Heuristic confidence layer ----
+
+// Rough features extracted from the message itself. These are the signals
+// any decent classifier would also use — they let us check whether the model
+// agrees with the obvious surface-level reading.
+function _messageFeatures(text) {
+	const t = (text || '').toLowerCase();
+	return {
+		length: t.length,
+		hasQuestion: /\?/.test(t),
+		hasCrisisKeyword: /\b(suicid|kill (myself|me)|want to die|self.?harm|can(?:no|')?t go on|don'?t want to (be here|live)|end (it|things)|disappear forever|no point (in )?(living|going on|being here)|nothing matters anymore)\b/.test(t),
+		hasEmotionalKeyword: /\b(anxious|panic|hate|crying|broken|empty|lonely|hopeless|terrified|hurts?|aching|sick of|done with|exhausted|drained|miserable)\b/.test(t),
+		hasProcessingKeyword: /\b(why|how come|figure out|make sense|understand|wonder|curious|trying to|help me think|what do you (think|make))\b/.test(t),
+		hasTransactionalKeyword: /\b(remind|set a|schedule|book|deploy|fix|debug|run|find|search|look up|what.?s the|when.?s|where.?s|who.?s|how do i)\b/.test(t),
+		hasRepeatedThought: /\b(again|still|always|every|keeps?|keeps happening|same thing|won'?t stop)\b/.test(t),
+		isShort: t.length < 30,
+	};
+}
+
+// Local heuristic-only mode guess. Used when every provider fails.
+function _heuristicGuess(text) {
+	const f = _messageFeatures(text);
+	if (f.hasCrisisKeyword) return 'crisis';
+	if (f.hasTransactionalKeyword && !f.hasEmotionalKeyword) return 'transactional';
+	if (f.hasProcessingKeyword && f.hasQuestion) return 'processing';
+	if (f.hasEmotionalKeyword || f.hasRepeatedThought) return 'venting';
+	return 'transactional';
+}
+
+// Confidence reflects whether the heuristics AGREE with the model's pick.
+// 'high'   = strong corroborating signal (e.g. crisis label + crisis keyword)
+// 'medium' = no strong contradiction
+// 'low'    = surface features point a different direction OR floor was used
+function _computeConfidence(text, mode, source) {
+	if (source === 'heuristic-only') return 'low';
+
+	const f = _messageFeatures(text);
+
+	switch (mode) {
+		case 'crisis':
+			if (f.hasCrisisKeyword) return 'high';
+			if (f.hasEmotionalKeyword) return 'medium';
+			return 'low'; // crisis label without crisis keywords is suspicious
+
+		case 'venting':
+			if (f.hasEmotionalKeyword && !f.hasQuestion) return 'high';
+			if (f.hasRepeatedThought || f.hasEmotionalKeyword) return 'medium';
+			if (f.hasTransactionalKeyword) return 'low'; // probably wrong
+			return 'medium';
+
+		case 'processing':
+			if (f.hasProcessingKeyword && f.hasQuestion) return 'high';
+			if (f.hasQuestion || f.hasProcessingKeyword) return 'medium';
+			if (f.isShort && !f.hasQuestion) return 'low'; // short non-question rarely processing
+			return 'medium';
+
+		case 'transactional':
+			if (f.hasTransactionalKeyword) return 'high';
+			if (f.isShort && !f.hasEmotionalKeyword) return 'medium';
+			if (f.hasEmotionalKeyword || f.hasCrisisKeyword) return 'low'; // probably wrong
+			return 'medium';
+
+		default:
+			return 'low';
+	}
+}
 
 
 /**
@@ -244,3 +558,5 @@ RULES:
 	// Clean any markdown wrapping the AI might add
 	return result.replace(/^```[\s\S]*?\n/, '').replace(/\n```\s*$/, '').trim();
 }
+
+export { MODELS };

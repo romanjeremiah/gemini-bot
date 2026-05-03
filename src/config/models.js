@@ -4,16 +4,18 @@
 // strings the bot uses, so swapping a model is a one-line change here
 // rather than a search-replace across the codebase.
 //
-// Cost notes (paid Gemini, free CF):
+// Cost notes:
 //   - Gemini Pro: $2/$12 per 1M tokens (input/output)
 //   - Gemini Flash: $0.50/$3 per 1M
 //   - Gemini Flash-Lite: $0.25/$1.50 per 1M
-//   - Gemma 4 / Qwen3 / Llama / GLM: free within Workers AI included neurons
+//   - Workers AI: priced in Neurons (~$0.011/1K). Gemma 4 26B costs more per
+//     call than the docs imply once you include the input/output Neuron
+//     conversion — not free, but cheaper than Gemini Pro for casual chat.
+//     Verify your actual bill weekly until volume is well understood.
 
 /** Cloudflare Workers AI models — primary path for casual chat & background work */
 export const CF_MODELS = Object.freeze({
-	chat:        '@cf/google/gemma-4-26b-a4b-it',     // default for casual conversation
-	code:        '@cf/qwen/qwen3-30b-a3b-fp8',        // code, analytical
+	chat:        '@cf/google/gemma-4-26b-a4b-it',     // default for ALL CF-routed chat
 	observation: '@cf/meta/llama-3.1-8b-instruct',    // background fact extraction
 	tagging:     '@cf/meta/llama-3.2-1b-instruct',    // sentiment, light tagging
 	dedup:       '@cf/zai-org/glm-4.7-flash',         // long-text summarisation, consolidation

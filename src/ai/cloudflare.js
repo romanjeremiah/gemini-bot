@@ -3,6 +3,7 @@
 // Routes through AI Gateway for caching and observability.
 
 import { runCfAi } from '../lib/ai-gateway';
+import { log } from '../lib/logger';
 
 export class CloudflareProvider {
 	constructor(ai, model) {
@@ -22,6 +23,21 @@ export class CloudflareProvider {
 			max_tokens: config.maxTokens ?? 2048,
 		});
 
+		// DIAGNOSTIC: log the raw response shape so we can compare against
+		// Eukara's working `cf_ai_raw` log. Gemma 4 returns OpenAI-format
+		// `choices[].message.content`; legacy Workers AI returns `response`.
+		// If neither key is present the parser will silently return empty.
+		log.info('cf_ai_raw', {
+			model: this.model,
+			type: typeof result,
+			keys: result && typeof result === 'object' ? Object.keys(result).slice(0, 20) : [],
+			hasChoices: !!(result && typeof result === 'object' && 'choices' in result),
+			hasResponse: !!(result && typeof result === 'object' && 'response' in result),
+			contentLen: result?.choices?.[0]?.message?.content?.length
+				?? result?.response?.length
+				?? 0,
+		});
+
 		return this._parseResponse(result);
 	}
 
@@ -36,6 +52,16 @@ export class CloudflareProvider {
 		});
 
 		if (!(stream instanceof ReadableStream)) {
+			// DIAGNOSTIC: log shape of non-stream fallback (e.g. when CF returns
+			// a complete object instead of a stream). Same fields as chat() so
+			// we can correlate stream-vs-non-stream behaviour in tail.
+			log.info('cf_ai_raw_stream_fallback', {
+				model: this.model,
+				type: typeof stream,
+				keys: stream && typeof stream === 'object' ? Object.keys(stream).slice(0, 20) : [],
+				hasChoices: !!(stream && typeof stream === 'object' && 'choices' in stream),
+				hasResponse: !!(stream && typeof stream === 'object' && 'response' in stream),
+			});
 			const parsed = this._parseResponse(stream);
 			if (parsed.text) yield { type: 'text', text: parsed.text };
 			return;
@@ -44,6 +70,15 @@ export class CloudflareProvider {
 		const reader = stream.getReader();
 		const decoder = new TextDecoder();
 		let buffer = '';
+
+		// DIAGNOSTIC: capture first chunk + chunk count + total yielded text
+		// so we can see whether the stream yields zero text (parser doesn't
+		// match Gemma's chunk shape — my current hypothesis) vs fails some
+		// other way. firstChunkRaw is the literal `data: ...` line so we can
+		// see what fields Gemma is actually streaming.
+		let chunkCount = 0;
+		let firstChunkRaw = null;
+		let yieldedTextLen = 0;
 
 		while (true) {
 			const { done, value } = await reader.read();
@@ -54,12 +89,24 @@ export class CloudflareProvider {
 
 			for (const line of lines) {
 				if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
+				chunkCount++;
+				if (firstChunkRaw === null) firstChunkRaw = line.slice(0, 500);
 				try {
 					const data = JSON.parse(line.slice(6));
-					if (data.response) yield { type: 'text', text: data.response };
+					if (data.response) {
+						yieldedTextLen += data.response.length;
+						yield { type: 'text', text: data.response };
+					}
 				} catch { /* skip malformed chunks */ }
 			}
 		}
+
+		log.info('cf_ai_stream_done', {
+			model: this.model,
+			chunkCount,
+			yieldedTextLen,
+			firstChunkRaw,
+		});
 	}
 
 	_convertMessages(messages, systemInstruction) {

@@ -2,6 +2,26 @@ import { Buffer } from 'node:buffer';
 
 const REPO = 'romanjeremiah/gemini-bot';
 
+/**
+ * Owner-only gate for write operations on the repo.
+ *
+ * Why: tool descriptions can ask the model nicely ("only after explicit
+ * permission") but the model is free to interpret intent loosely. A user
+ * who isn't Roma should never be able to push a PR to his repo via the bot,
+ * regardless of how the conversation framed the request. This check enforces
+ * that at execute() time, where it actually matters.
+ *
+ * env.OWNER_ID is the canonical Telegram numeric ID for Roma. Comparing as
+ * String() to handle both numeric and string forms — KV/D1 round-trips
+ * sometimes coerce types.
+ */
+function _isOwner(env, ctx) {
+	if (!env.OWNER_ID) return false; // no owner configured -> always deny writes
+	const callerId = ctx?.userId;
+	if (callerId == null) return false;
+	return String(callerId) === String(env.OWNER_ID);
+}
+
 function ghHeaders(env) {
 	return {
 		'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
@@ -67,8 +87,19 @@ export const githubPatchTool = {
 			required: ["file_path", "commit_message", "pr_title", "pr_body"]
 		}
 	},
-	async execute(args, env) {
+	async execute(args, env, ctx) {
 		if (!env.GITHUB_TOKEN) return { status: 'error', message: 'GITHUB_TOKEN not configured' };
+
+		// Hard gate: only the owner can open PRs. The Gemini tool description
+		// asks the model to seek permission first, but that is advisory text the
+		// model can ignore or misinterpret. This check is the actual enforcement.
+		if (!_isOwner(env, ctx)) {
+			return {
+				status: 'error',
+				message: 'patch_repo_file is owner-only and was not invoked by the owner. PR not created.',
+			};
+		}
+
 		const headers = ghHeaders(env);
 
 		try {

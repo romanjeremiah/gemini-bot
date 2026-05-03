@@ -52,7 +52,6 @@
  * @property {string} [systemInstruction]
  * @property {number} [temperature]
  * @property {number} [maxTokens]
- * @property {'low'|'medium'|'high'} [thinkingEffort]
  * @property {Object} [cachedContent]
  */
 

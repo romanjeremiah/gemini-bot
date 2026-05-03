@@ -4,6 +4,7 @@ import * as reminderStore from './services/reminderStore';
 import * as moodStore from './services/moodStore';
 import * as memoryStore from './services/memoryStore';
 import * as vectorStore from './services/vectorStore';
+import { cleanOrphans } from './services/vectorMaintenance';
 import * as episodeStore from './services/episodeStore';
 import * as telegram from './lib/telegram';
 import { generateSpeech } from './lib/tts';
@@ -13,7 +14,7 @@ import { storeDiscoveredEffect } from './tools/effect';
 import { personas, MENTAL_HEALTH_DIRECTIVE } from './config/personas';
 import { MOOD_POLL_OPTIONS } from './config/moodScale';
 import { ARCHITECTURE_SUMMARY } from './config/architecture';
-import { getSchedule, matchesSchedule } from './config/schedules';
+import { getSchedule } from './config/schedules';
 import { toolRegistry } from './tools/index';
 import { isQuietTime } from './tools/quietHours';
 import { log } from './lib/logger';
@@ -54,10 +55,74 @@ function extractEffectEmoji(msg, effectId) {
 
 // ---- Health Check-in Scheduler ----
 // Runs inside the cron handler. Checks London time and sends check-ins as Nightfall.
+
+/**
+ * Build grounding context for a check-in greeting. Pulls last-24h memories and
+ * recent episodes so the model has REAL signals to weave in, not invented ones.
+ *
+ * Replaces the prior anti-pattern where check-in prompts told the model to
+ * "weave in a brief, natural reference to one of his interests" without any
+ * data — which produced confident fabrications like "deep-dive into Japanese
+ * architecture you were pulling an all-nighter on" that never happened.
+ *
+ * Returns an object with `summary` (short one-line ground truth, may be empty)
+ * and `had_grounding` (bool) so the caller can fall through to a plain greeting
+ * when there's nothing real to anchor on.
+ */
+async function getCheckinGrounding(env, userId, type) {
+	const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ');
+
+	try {
+		const [recentMems, recentEpisodes, lastMood] = await Promise.all([
+			env.DB.prepare(
+				"SELECT category, fact, created_at FROM memories WHERE user_id = ? AND created_at > ? AND category NOT IN ('discovery','architecture_spec','triple','feedback') ORDER BY created_at DESC LIMIT 5"
+			).bind(userId, since).all().then(r => r.results || []).catch(() => []),
+			episodeStore.getRecentEpisodes(env, userId, 2).catch(() => []),
+			moodStore.getHistory(env, userId, 3).catch(() => []),
+		]);
+
+		const lines = [];
+		if (recentMems.length) {
+			for (const m of recentMems.slice(0, 3)) {
+				lines.push(`- [${m.category}] ${m.fact.slice(0, 200)}`);
+			}
+		}
+		if (recentEpisodes.length) {
+			const ep = recentEpisodes[0];
+			if (ep?.trigger) lines.push(`- Recent episode: ${ep.trigger.slice(0, 160)}`);
+		}
+		if (lastMood.length) {
+			const latest = lastMood[0];
+			const parsed = typeof latest.data === 'string' ? JSON.parse(latest.data || '{}') : (latest.data || {});
+			if (parsed.mood_score != null) {
+				lines.push(`- Last mood: ${parsed.mood_score}/10 on ${latest.date}`);
+			}
+		}
+
+		const hadGrounding = lines.length > 0;
+		log.info('checkin_grounded', {
+			userId,
+			type,
+			had_grounding: hadGrounding,
+			mems: recentMems.length,
+			episodes: recentEpisodes.length,
+			mood_entries: lastMood.length,
+		});
+
+		return {
+			summary: lines.join('\n'),
+			had_grounding: hadGrounding,
+		};
+	} catch (e) {
+		log.warn('checkin_grounding_failed', { userId, type, msg: e.message });
+		return { summary: '', had_grounding: false };
+	}
+}
+
 async function handleHealthCheckIns(env) {
 	const chatId = Number(env.OWNER_ID);
 	const userId = chatId; // Owner's private chat: chatId == userId
-	const userTz = await env.CHAT_KV.get(`timezone_${chatId}`) || 'Etc/UTC';
+	const userTz = await getTimezone(chatId, env);
 	const now = new Date();
 	const localTime = new Date(now.toLocaleString('en-US', { timeZone: userTz }));
 	const hour = localTime.getHours();
@@ -92,9 +157,17 @@ async function handleHealthCheckIns(env) {
 		const alreadyLogged = await moodStore.hasCheckedInToday(env, userId, 'morning');
 		if (alreadyLogged) return;
 
-		// Conversational medication check (no buttons)
+		// Grounded morning greeting. Use real signals from the last 24h instead
+		// of asking the model to "weave in a reference to interests" with no data
+		// (which fabricates plausible-sounding details). When there's no grounding,
+		// fall back to a plain greeting — better cool than wrong.
+		const grounding = await getCheckinGrounding(env, userId, 'morning');
+		const groundedPrompt = grounding.had_grounding
+			? `Generate a 1-2 sentence morning greeting for Roman. It is morning in London. Reference ONE concrete fact from the grounding below — do NOT invent details, do NOT mention activities or interests that aren't here. If the grounding doesn't fit a morning greeting naturally, just greet him plainly. Ask how he slept and casually ask about his morning medication. Keep it warm and conversational.\n\nGROUNDING (real signals from last 24h, may be empty):\n${grounding.summary}\n\nDo NOT list medication names. Do NOT add specifics that aren't in the grounding above.`
+			: `Generate a 1-2 sentence plain morning greeting for Roman. It is morning in London. Just say good morning, ask how he slept, and casually ask about his morning medication. Do NOT mention any specific activities, interests, or recent events — you have no context to draw on. Keep it short and warm. Do NOT list medication names.`;
+
 		const morningGreeting = await generateShortResponse(
-			`Generate a 1-2 sentence morning greeting for Roman. It is morning in London. Weave in a brief, natural reference to one of his interests (coffee, gym, anime, photography, cooking, or music). Ask how he slept and casually ask if he has taken his morning medication. Keep it warm and conversational, like a friend checking in. Do NOT list medication names.`,
+			groundedPrompt,
 			personas.xaridotis.instruction, env
 		) || 'Morning. How did you sleep? Have you taken your meds yet?';
 
@@ -116,9 +189,15 @@ async function handleHealthCheckIns(env) {
 		const alreadyLogged = await moodStore.hasCheckedInToday(env, userId, 'midday');
 		if (alreadyLogged) return;
 
-		// Conversational medication check (no buttons)
+		// Grounded midday check-in (see morning for rationale). Midday is shorter
+		// so we keep the prompt tight — reference real signals OR keep it generic.
+		const grounding = await getCheckinGrounding(env, userId, 'midday');
+		const groundedPrompt = grounding.had_grounding
+			? `Generate a 1-sentence midday check-in for Roman. It is midday in London. You may reference ONE concrete fact from the grounding below if it fits naturally — do NOT invent details. Casually ask if he has taken his meds. Brief and natural.\n\nGROUNDING (real signals, may be empty):\n${grounding.summary}\n\nDo NOT list medication names. Do NOT use buttons. Do NOT ask for a number. Do NOT add specifics that aren't grounded.`
+			: `Generate a 1-sentence plain midday check-in for Roman. It is midday in London. Just casually ask if he has taken his meds. Brief, natural, no specifics about activities or interests. Do NOT list medication names. Do NOT use buttons. Do NOT ask for a number.`;
+
 		const middayGreeting = await generateShortResponse(
-			`Generate a 1-2 sentence midday check-in for Roman. It is midday in London. Casually ask if he has taken his meds. Keep it brief and natural. Do NOT list specific medication names. Do NOT use buttons or ask for a number.`,
+			groundedPrompt,
 			personas.xaridotis.instruction, env
 		) || 'Quick midday check. Have you taken your meds?';
 
@@ -348,6 +427,53 @@ async function handleMemoryConsolidation(env) {
 	}
 }
 
+// ---- Daily Memory Safety-Net Consolidation ----
+// Runs daily at 03:30 London time. Lower-threshold safety net for the on-save
+// auto-trigger inside saveMemory(). Catches users whose memory pile grows
+// steadily without crossing the 20-save modulo (e.g. via discoveries category
+// which dedup-skips often). Also acts as a redundancy if the on-save trigger
+// silently failed (KV throttle key got into a bad state, etc).
+//
+// Threshold: total memories >= 30 AND >24h since last consolidation.
+async function handleDailyMemoryConsolidation(env) {
+	const now = new Date();
+	const londonTime = await getLocalTime(env.OWNER_ID, env, now);
+
+	// Only run at 03:30 (one minute window per day)
+	if (londonTime.getHours() !== 3 || londonTime.getMinutes() !== 30) return;
+
+	const userId = Number(env.OWNER_ID);
+	const today = londonTime.toISOString().split('T')[0];
+	const runKey = `daily_consolidation_${today}`;
+	if (await env.CHAT_KV.get(runKey)) return;
+	await env.CHAT_KV.put(runKey, '1', { expirationTtl: 86400 });
+
+	try {
+		const countRow = await env.DB.prepare(
+			'SELECT COUNT(*) AS n FROM memories WHERE user_id = ?'
+		).bind(userId).first();
+		const total = countRow?.n || 0;
+		if (total < 30) {
+			log.info('daily_consolidation_skipped', { userId, total, reason: 'below_threshold' });
+			return;
+		}
+
+		const lastRunKey = `memory_consolidation_last_${userId}`;
+		const lastRun = await env.CHAT_KV.get(lastRunKey);
+		const hoursSince = lastRun ? (Date.now() - parseInt(lastRun)) / 3600000 : Infinity;
+		if (hoursSince < 24) {
+			log.info('daily_consolidation_skipped', { userId, total, hoursSince: hoursSince.toFixed(1), reason: 'too_recent' });
+			return;
+		}
+
+		log.info('daily_consolidation_started', { userId, total });
+		await env.CHAT_KV.put(lastRunKey, String(Date.now()), { expirationTtl: 86400 * 7 });
+		await memoryStore.consolidateMemories(env, userId);
+	} catch (e) {
+		log.error('daily_consolidation_failed', { msg: e.message });
+	}
+}
+
 // ---- Style Card Auto-Consolidation ----
 // Runs daily at 04:00 London time. Collects feedback memories
 // and merges them into the user's style card using Workers AI.
@@ -435,7 +561,10 @@ async function handleMoodPollAnswer(userId, chatId, threadId, score, env) {
 
 	// Build context-aware response using recent mood history and memories
 	const moodHistory = await moodStore.getHistory(env, userId, 30);
-	const memoryCtx = await memoryStore.getFormattedContext(env, userId);
+	// Mood poll answers are inherently warm-register — the user is reporting
+	// emotional state. Use 'warm' mode so therapeutic memories surface.
+	const memCtxResult = await memoryStore.getFormattedContext(env, userId, 'warm');
+	const memoryCtx = memCtxResult?.ctx || '';
 	const semanticCtx = await vectorStore.getSemanticContext(env, userId, `mood score ${score} how I feel`);
 	const therapeuticNotes = await env.DB.prepare(
 		`SELECT category, fact FROM memories WHERE user_id = ? AND category IN ('pattern','trigger','schema','insight','homework') ORDER BY created_at DESC LIMIT 10`
@@ -1200,7 +1329,10 @@ export default {
 	  try {
 		// Wrap D1 so any failing query logs its full SQL + bindings for debugging
 		env.DB = wrapD1(env.DB);
-		if (!telegram.verifyWebhook(request, env)) {
+		// Webhook verification only applies to Telegram POSTs. GET endpoints are
+		// either internal admin tools (with their own auth) or public health
+		// probes; gating them on the Telegram secret was always slightly wrong.
+		if (request.method === "POST" && !telegram.verifyWebhook(request, env)) {
 			return new Response("Unauthorized", { status: 401 });
 		}
 
@@ -1259,6 +1391,53 @@ export default {
 			return new Response(JSON.stringify({ status: 'success', total: allMemories.length, indexed }), {
 				headers: { "Content-Type": "application/json" }
 			});
+		}
+
+		// ---- Vectorize orphan cleanup: nuke + recreate index, then reindex from D1.
+		// Auth: x-worker-auth header must equal env.WORKER_AUTH_SECRET, AND ?confirm=yes.
+		// Both gates required because this is a destructive maintenance op (deletes
+		// the entire Vectorize index temporarily). See src/services/vectorMaintenance.js
+		// for the full flow and failure modes.
+		if (request.method === "GET" && new URL(request.url).pathname === "/cleanorphans") {
+			if (!env.WORKER_AUTH_SECRET) {
+				return new Response(JSON.stringify({ error: 'WORKER_AUTH_SECRET not configured on this Worker' }), {
+					status: 500,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+			const providedAuth = request.headers.get('x-worker-auth');
+			if (providedAuth !== env.WORKER_AUTH_SECRET) {
+				return new Response(JSON.stringify({ error: 'Missing or invalid x-worker-auth header' }), {
+					status: 401,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+			const confirm = new URL(request.url).searchParams.get('confirm');
+			if (confirm !== 'yes') {
+				return new Response(JSON.stringify({
+					error: 'Add ?confirm=yes to actually run this. It deletes and recreates the Vectorize index.',
+					note: 'Bot semantic search will be unavailable for ~5-30s while the index is recreated.',
+				}), {
+					status: 400,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+			try {
+				const report = await cleanOrphans(env);
+				return new Response(JSON.stringify(report, null, 2), {
+					headers: { 'Content-Type': 'application/json' },
+				});
+			} catch (e) {
+				log.error('cleanorphans_endpoint_error', { msg: e.message, stack: e.stack?.slice(0, 500) });
+				return new Response(JSON.stringify({
+					status: 'error',
+					message: e.message,
+					note: 'Re-running the endpoint is safe — missing index will be recreated; existing rows will reindex.',
+				}), {
+					status: 500,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
 		}
 
 		if (request.method === "GET" && new URL(request.url).pathname === "/setup-webhook") {
@@ -1533,9 +1712,26 @@ export default {
 
 				if (task.type === 'health_checkin') {
 					await env.CHAT_KV.put(`health_checkin_active_${chatId}`, task.period, { expirationTtl: 1800 });
-					const prompt = task.period === 'morning'
-						? `Generate a 1-2 sentence morning greeting for Roman. It is morning. Weave in a brief, natural reference to one of his interests. Ask how he slept and casually ask if he has taken his morning medication. Keep it warm and conversational.`
-						: `Generate a 1-2 sentence midday check-in for Roman. Casually ask if he has taken his meds. Keep it brief and natural.`;
+
+					// Grounded greeting (Phase 1 fix). Match the inline path: pull last-24h
+					// signals via getCheckinGrounding so the model has REAL anchors instead
+					// of inventing them. Without this the queue consumer still generates
+					// the "deep-dive into Japanese architecture" pattern even after the
+					// inline cron path is fixed — because /firecron and the scheduled
+					// enqueueHealthTasks both route here, not into handleHealthCheckIns.
+					const userId = chatId; // Owner's private chat
+					const grounding = await getCheckinGrounding(env, userId, task.period);
+					let prompt;
+					if (task.period === 'morning') {
+						prompt = grounding.had_grounding
+							? `Generate a 1-2 sentence morning greeting for Roman. It is morning in London. Reference ONE concrete fact from the grounding below — do NOT invent details, do NOT mention activities or interests that aren't here. If the grounding doesn't fit a morning greeting naturally, just greet him plainly. Ask how he slept and casually ask about his morning medication. Keep it warm and conversational.\n\nGROUNDING (real signals from last 24h, may be empty):\n${grounding.summary}\n\nDo NOT list medication names. Do NOT add specifics that aren't in the grounding above.`
+							: `Generate a 1-2 sentence plain morning greeting for Roman. It is morning in London. Just say good morning, ask how he slept, and casually ask about his morning medication. Do NOT mention any specific activities, interests, or recent events — you have no context to draw on. Keep it short and warm. Do NOT list medication names.`;
+					} else {
+						prompt = grounding.had_grounding
+							? `Generate a 1-sentence midday check-in for Roman. It is midday in London. You may reference ONE concrete fact from the grounding below if it fits naturally — do NOT invent details. Casually ask if he has taken his meds. Brief and natural.\n\nGROUNDING (real signals, may be empty):\n${grounding.summary}\n\nDo NOT list medication names. Do NOT use buttons. Do NOT ask for a number. Do NOT add specifics that aren't grounded.`
+							: `Generate a 1-sentence plain midday check-in for Roman. It is midday in London. Just casually ask if he has taken his meds. Brief, natural, no specifics about activities or interests. Do NOT list medication names.`;
+					}
+
 					const greeting = await generateShortResponse(prompt, personas.xaridotis.instruction, env)
 						|| (task.period === 'morning' ? 'Morning. How did you sleep? Have you taken your meds?' : 'Quick midday check. Have you taken your meds?');
 					await telegram.sendMessage(chatId, threadId, greeting, env);
@@ -1641,9 +1837,33 @@ export default {
 			const cronResults = await Promise.allSettled([
 				handleMemoryConsolidation(env),
 				handleStyleCardConsolidation(env),
+				handleDailyMemoryConsolidation(env),
+				// Time-gated handlers below: each self-checks its own schedule via
+				// getSchedule(env, ...) and returns early when the window doesn't
+				// match. Calling them every minute is cheap (1 KV read per handler
+				// per tick, served from the module-scope cache after first hit).
+				handleWeeklyReport(env),            // Sunday 20:00 London
+				handleAccountabilityNudge(env),     // Wed 16:00 London
+				handleCuriosityDigest(env),         // Sat 10:00 London
+				handleAutonomousResearch(env),      // Tue/Fri 04:00 London
+				handleSelfImprovement(env),         // 15th of month, 05:00 London
+				handleArchitectureEvolution(env),   // Top of every hour
+				handleDailyStudy(env),              // ~10% chance per hour, 07-22
 			]);
 			cronResults.forEach((r, i) => {
-				if (r.status === 'rejected') log.error('cron_task_failed', { task: i, msg: r.reason?.message });
+				const names = [
+					'consolidation',
+					'style_card',
+					'daily_consolidation',
+					'weekly_report',
+					'accountability_nudge',
+					'curiosity_digest',
+					'autonomous_research',
+					'self_improvement',
+					'architecture_evolution',
+					'daily_study',
+				];
+				if (r.status === 'rejected') log.error(`cron_${names[i]}_failed`, { msg: r.reason?.message });
 			});
 
 			// Spontaneous outreach: cheap checks inline, only enqueue if the random roll passes
@@ -1668,9 +1888,22 @@ export default {
 				handleMemoryConsolidation(env),
 				handleStyleCardConsolidation(env),
 				handleSpontaneousOutreach(env),
+				handleDailyMemoryConsolidation(env),
+				// Time-gated handlers — see queued path above for rationale.
+				handleWeeklyReport(env),
+				handleAccountabilityNudge(env),
+				handleCuriosityDigest(env),
+				handleAutonomousResearch(env),
+				handleSelfImprovement(env),
+				handleArchitectureEvolution(env),
+				handleDailyStudy(env),
 			]);
 			cronResults.forEach((r, i) => {
-				const names = ['checkin', 'nudge', 'consolidation', 'style_card', 'outreach'];
+				const names = [
+					'checkin', 'nudge', 'consolidation', 'style_card', 'outreach', 'daily_consolidation',
+					'weekly_report', 'accountability_nudge', 'curiosity_digest', 'autonomous_research',
+					'self_improvement', 'architecture_evolution', 'daily_study',
+				];
 				if (r.status === 'rejected') log.error(`cron_${names[i]}_failed`, { msg: r.reason?.message });
 			});
 		}

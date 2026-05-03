@@ -12,7 +12,7 @@ This document is a living inventory of what Xaridotis can do. It is grounded in 
 
 Two AI providers behind a unified `AIProvider` interface (`src/types/ai.js`):
 
-- **CloudflareProvider** (`src/ai/cloudflare.js`) — Gemma 4 + Qwen3 30B, OpenAI-compatible function calling, streaming via event-source, routed through AI Gateway for caching/observability
+- **CloudflareProvider** (`src/ai/cloudflare.js`) — Gemma 4, OpenAI-compatible function calling, streaming via event-source, routed through AI Gateway for caching/observability
 - **GeminiProvider** (`src/ai/gemini-provider.js`) — adapter wrapping the existing Gemini SDK code, preserves cache + tool loop + multimodal
 
 The router (`src/ai/router.js`) decides which provider handles each turn based on a fixed set of rules. Default is Cloudflare Gemma; Gemini is reserved for emotional, multimodal, and active-checkin paths.

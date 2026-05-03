@@ -9,23 +9,33 @@
 // gateway never silently breaks the bot.
 //
 // Setup:
-//   1. Cloudflare dashboard → AI → AI Gateway → create gateway named "xaridotis"
+//   1. Gateway already exists — name: "gemini-bot" (auth disabled), proxies
+//      both Workers AI and Google AI Studio traffic.
 //   2. wrangler.jsonc: ai = { binding = "AI" } (already set)
 //   3. Optional: set GEMINI_GATEWAY_URL secret to enable Gemini-via-gateway routing.
-//      Format: https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/google-ai-studio
+//      Format: https://gateway.ai.cloudflare.com/v1/<account>/gemini-bot/google-ai-studio
 //      If unset, Gemini calls go direct.
 
-const GATEWAY_ID = 'xaridotis';
+const GATEWAY_ID = 'gemini-bot';
 const CACHE_TTL_SECONDS = 300; // 5 min
 
 /**
  * Run a Cloudflare Workers AI model through the gateway when possible.
- * Wraps env.AI.run() with gateway routing. Falls back to direct call on
- * any gateway-side error so the bot never fails because the gateway is down.
+ * Wraps the AI binding's .run() method with gateway routing. Falls back to a
+ * direct call on any gateway-side error so the bot never fails because the
+ * gateway is down.
+ *
+ * @param {Ai} ai - The Workers AI binding (env.AI), NOT the env object itself.
+ *                  This is the binding directly because it's the only thing
+ *                  this function needs and it makes call sites read more
+ *                  cleanly: `runCfAi(env.AI, model, input)`.
+ * @param {string} model - Model identifier, e.g. '@cf/google/gemma-4-26b-a4b-it'
+ * @param {object} input - Model input (messages, prompt, etc.)
+ * @param {object} opts - Optional gateway options: { skipCache, cacheTtl }
  */
-export async function runCfAi(env, model, input, opts = {}) {
-	if (!env.AI) {
-		throw new Error('runCfAi: env.AI binding missing');
+export async function runCfAi(ai, model, input, opts = {}) {
+	if (!ai || typeof ai.run !== 'function') {
+		throw new Error('runCfAi: Workers AI binding missing or invalid (expected env.AI)');
 	}
 	const gatewayConfig = {
 		gateway: {
@@ -35,7 +45,7 @@ export async function runCfAi(env, model, input, opts = {}) {
 		},
 	};
 	try {
-		return await env.AI.run(model, input, gatewayConfig);
+		return await ai.run(model, input, gatewayConfig);
 	} catch (err) {
 		// If the gateway itself is the problem (e.g. "gateway not found"),
 		// retry without it so the call still goes through. We log so we
@@ -43,7 +53,7 @@ export async function runCfAi(env, model, input, opts = {}) {
 		const msg = (err && err.message) || '';
 		if (msg.includes('gateway') || msg.includes('Gateway')) {
 			console.warn('AI gateway error, falling back to direct AI.run:', msg);
-			return await env.AI.run(model, input);
+			return await ai.run(model, input);
 		}
 		throw err;
 	}

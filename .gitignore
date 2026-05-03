@@ -172,3 +172,13 @@ dist
 
 # Build outputs
 dist/
+
+# Local debug / scratch files (prompt comparison, ad-hoc analysis)
+_compare_*.mjs
+_compare_*.js
+_eukara_*.txt
+_xaridotis_*.txt
+_*_prompt.txt
+_*_memctx.txt
+scratch/
+

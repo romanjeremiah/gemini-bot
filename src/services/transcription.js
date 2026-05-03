@@ -34,10 +34,6 @@ const SYSTEM_PROMPT = 'You are a speech-to-text transcriber. Return only the tra
 // if Gemini stalls. On timeout the caller proceeds without a transcript.
 const TRANSCRIBE_TIMEOUT_MS = 8000;
 
-// Cap output tokens. A 60s voice note transcribes to ~150 words — well under
-// 800 tokens. Prevents the model from hallucinating long extra commentary.
-const MAX_OUTPUT_TOKENS = 800;
-
 /**
  * Transcribe base64-encoded audio using Gemini Flash-Lite.
  *
@@ -69,8 +65,9 @@ export async function transcribeAudio(env, base64Audio, mimeType) {
 			}],
 			config: {
 				systemInstruction: SYSTEM_PROMPT,
-				temperature: 0.1, // deterministic transcription
-				maxOutputTokens: MAX_OUTPUT_TOKENS,
+				// Temperature defaults to 1.0 (Roma's rule: never set explicit temp).
+				// No maxOutputTokens cap (Roma's rule: never cap output). Voice notes
+				// are short by nature — the SDK will return whatever the model produces.
 			},
 		});
 

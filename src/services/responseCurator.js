@@ -121,8 +121,9 @@ export async function curateContext(env, { userText, memories = [], recentHistor
 			contents: [{ role: 'user', parts: [{ text: input }] }],
 			config: {
 				systemInstruction: CURATOR_PROMPT,
-				temperature: 0.3, // Lower temp for structured output
-				maxOutputTokens: 600, // Curator output is small; tight budget = less truncation risk
+				// Temperature defaults to 1.0 (Roma's rule: never set explicit temp).
+				// No maxOutputTokens cap (Roma's rule: never cap output). The truncation
+				// recovery in the parser below handles any cut-off responses.
 				responseMimeType: 'application/json', // Force JSON mode — model returns parseable JSON directly
 			},
 		});

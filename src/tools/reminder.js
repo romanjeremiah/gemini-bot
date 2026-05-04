@@ -67,7 +67,7 @@ export const reminderTool = {
 export const listRemindersTool = {
 	definition: {
 		name: "list_reminders",
-		description: "List the user's pending reminders. Use this BEFORE calling update_reminder when you need to find which reminder the user is referring to. Returns id, text preview, due time (in user's local timezone), recurrence type, and context. Always call this first when the user asks to change, move, cancel, or otherwise modify an existing reminder — you need the reminder_id from the returned list to call update_reminder.",
+		description: "THE ONLY tool for reading reminders/scheduled tasks. ALWAYS call this when the user asks anything about their reminders, scheduled items, pending tasks, what they have planned, what's coming up, or wants to find/show/list/check their reminders. Examples that MUST use this tool: 'show me my reminders', 'what do I have scheduled', 'what's coming up', 'list my pending tasks', 'do I have any reminders for X'. NEVER use manage_cloudflare or any SQL tool for reminders — reminders live in a dedicated table with user-specific filtering and timezone formatting that this tool handles correctly. Returns id, text preview, due time (in user's local timezone), recurrence type, and context. Always call this first when the user asks to change, move, cancel, or otherwise modify an existing reminder — you need the reminder_id from the returned list to call update_reminder.",
 		parameters: {
 			type: "OBJECT",
 			properties: {},

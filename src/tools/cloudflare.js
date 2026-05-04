@@ -80,7 +80,7 @@ function _validateReadOnlySql(raw) {
 export const cloudflareAdminTool = {
 	definition: {
 		name: "manage_cloudflare",
-		description: "Inspect Cloudflare resource state for diagnostics. READ-ONLY: SELECT/PRAGMA queries on D1, list/get on KV. No mutations, no deletes. For changes, use purpose-built tools (memoryTool, etc).",
+		description: "Inspect Cloudflare resource state for diagnostics. READ-ONLY: SELECT/PRAGMA queries on D1, list/get on KV. No mutations, no deletes. For changes, use purpose-built tools (memoryTool, etc). DO NOT USE for reminders — use list_reminders/update_reminder instead. DO NOT USE for memory/episode/mood lookups — use the dedicated tools. This tool is for low-level state inspection (table schemas, row counts, KV key existence), not for normal product queries.",
 		parameters: {
 			type: "OBJECT",
 			properties: {

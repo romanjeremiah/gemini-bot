@@ -979,7 +979,7 @@ export async function handleMessage(msg, env) {
 
 	try {
 		const firstName = msg.from.first_name || "User";
-		// userText is mutable: Phase C may append a voice transcript before routing.
+		// userText is mutable for downstream consumers but currently unchanged after init.
 		let userText = msg.text || msg.caption || "";
 		log.info('message_received', { chatId, from: firstName, len: userText.length, hasMedia: !!getMediaFromMessage(msg) });
 
@@ -1022,63 +1022,6 @@ export async function handleMessage(msg, env) {
 
 		// Dynamic context throttling: skip heavy D1/Vectorize queries for short, low-value replies
 		const hasMedia = !!getMediaFromMessage(msg);
-
-		// =========================================================
-		// Phase C: Pre-flight transcription for voice / audio media.
-		// =========================================================
-		// Voice notes arrive with empty userText — routing and memory filters
-		// see only the audio bytes. We transcribe via Flash-Lite up-front so
-		// every downstream signal (tagger, regex, complexity heuristics, route
-		// selector) has actual content to work with.
-		//
-		// The audio is still passed to the main response model in userParts.
-		// Transcript is for routing / context, not a replacement for audio.
-		//
-		// We download the audio HERE and cache the bytes so the later media
-		// block doesn't re-download. cachedMedia survives in scope for the
-		// entire handler.
-		let cachedMedia = null; // { base64, buffer, filePath, fileSize, mime, fileId } when pre-downloaded
-		if (hasMedia) {
-			const _media = getMediaFromMessage(msg);
-			const isAudio = (_media.mimeHint || '').startsWith('audio/');
-			if (isAudio) {
-				const _t = Date.now();
-				try {
-					const download = await telegram.downloadFile(_media.fileId, env);
-					cachedMedia = { ...download, mime: _media.mimeHint, fileId: _media.fileId };
-
-					const { transcribeAudio } = await import('../services/transcription');
-					const result = await transcribeAudio(env, download.base64, _media.mimeHint);
-
-					if (result.success && result.text) {
-						// Append transcript to userText so all downstream signals see it.
-						userText = userText
-							? `${userText}\n\n[Voice transcript]: ${result.text}`
-							: `[Voice transcript]: ${result.text}`;
-						log.info('transcription_complete', {
-							chatId,
-							chars: result.text.length,
-							latency_ms: result.latency_ms,
-							total_elapsed_ms: _elapsed(),
-						});
-					} else {
-						log.warn('transcription_skipped', {
-							chatId,
-							error: result.error,
-							latency_ms: result.latency_ms,
-						});
-					}
-				} catch (e) {
-					log.warn('transcription_failed', {
-						chatId,
-						msg: (e.message || '').slice(0, 200),
-						elapsed_ms: Date.now() - _t,
-					});
-					// Fall through — audio still routes to Pro via hasMedia rule,
-					// just without a transcript to inform memory filtering etc.
-				}
-			}
-		}
 
 		const isSubstantive = userText.length > 15 || userText.includes('?') || hasMedia;
 

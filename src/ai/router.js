@@ -8,28 +8,29 @@
 //   1. modelOverride (user-explicit /model command)        → chosen Gemini tier
 //   2. mode === 'crisis' (tagger)                          → Gemini Pro
 //   3. hasMedia (image/video/audio)                        → Gemini Pro (CF is text-only)
-//   4. mode === 'venting' (tagger)                         → Gemini Pro (warm register)
-//   5. healthCheckinActive + emotional regex match         → Gemini Pro
-//   6. emotional regex match (no check-in)                 → Gemini Pro
-//   7. mode === 'processing' (tagger)                      → Gemini Flash
-//   8. complex task (detectComplexTask: code, analytical)  → Gemini Pro
-//   9. CF code/analytical/long routes                      → Gemma 4 (CF)
-//  10. simple message OR mode === 'transactional'          → Gemini Flash-Lite
-//  11. default casual                                      → Gemma 4 (CF, default)
+//   4. healthCheckinActive + emotional regex match         → Gemini Pro
+//   5. emotional regex match (no check-in)                 → Gemini Pro
+//   6. complex task (detectComplexTask: code, analytical)  → Gemini Pro
+//   7. CF code/analytical/long routes                      → Gemma 4 (CF)
+//   8. simple OR mode==='transactional' OR healthCheckin   → Gemini Flash-Lite
+//   9. default casual                                      → Gemma 4 (CF, default)
+//
+// Tagger usage policy (changed 2026-05-04):
+//   The tagger (Llama 3.1 8B → Gemma → Flash chain) is too noisy on short
+//   messages to drive Pro routing safely. We saw it tag a casual 30-char
+//   comment as 'venting' and route it to Pro at 35s total handler time.
+//   New policy: tagger only drives routing when mode === 'crisis' (high
+//   stakes, conservative direction). All other modes (venting, processing,
+//   transactional) are NOT used to escalate or de-escalate model tier.
+//   Curator's register output is the trusted register signal; tagger's
+//   crisis output is the trusted safety signal. Each tool owns one job.
 //
 // Notes on Pro distribution:
-//   - Rule 8 catches code/architecture/analytical text — these stay on Pro for
+//   - Rule 6 catches code/architecture/analytical text — these stay on Pro for
 //     reasoning depth even though no emotional content. The earlier CF routes
 //     for code/analytical were observability-only (same model as default casual);
 //     keeping Pro here matches the previous parallel ternary in handlers.js
 //     so behavioural parity is preserved.
-//
-// Mode integration:
-//   The conversation tagger (cfAi.tagConversationMode) returns one of
-//   'crisis' | 'venting' | 'processing' | 'transactional'. When it's
-//   available the caller passes it in via ctx.mode; the router uses it as
-//   a strong signal alongside the regex heuristics. When the tagger fails
-//   or returns null, regex rules still cover the cases.
 
 import { CloudflareProvider } from './cloudflare';
 import { GeminiProvider } from './gemini-provider';
@@ -40,10 +41,11 @@ import { detectComplexTask, isSimpleMessage } from './complexity';
  * Decide which provider+model to use for this message.
  *
  * @param {object} ctx
- * @param {string} ctx.userText - Current user message (with transcript appended if voice)
+ * @param {string} ctx.userText - Current user message
  * @param {boolean} ctx.hasMedia - Image / video / audio attached to this message
  * @param {boolean} ctx.healthCheckinActive - User is mid-check-in (morning/midday/evening)
  * @param {string|null} ctx.mode - Tagger output: 'crisis'|'venting'|'processing'|'transactional'
+ *                                 Only 'crisis' and 'transactional' are honoured for routing.
  * @param {string|null} ctx.modelOverride - User ‘/model’ selection: gemini model string or null
  * @returns {{provider:'gemini'|'cloudflare', model:string, reason:string, isDefault:boolean}}
  */
@@ -55,7 +57,9 @@ export function routeMessage(ctx) {
 		return { provider: 'gemini', model: modelOverride, reason: 'user_override', isDefault: false };
 	}
 
-	// 2. Crisis from tagger — highest non-override priority.
+	// 2. Crisis from tagger — the only escalation signal we trust from the tagger.
+	// Errs on the side of safety: false positive routes to Pro (mild waste);
+	// false negative is caught by emotional regex below if applicable.
 	if (mode === 'crisis') {
 		return { provider: 'gemini', model: GEMINI_MODELS.pro, reason: 'mode_crisis', isDefault: false };
 	}
@@ -65,29 +69,18 @@ export function routeMessage(ctx) {
 		return { provider: 'gemini', model: GEMINI_MODELS.pro, reason: 'multimodal_input', isDefault: false };
 	}
 
-	// 4. Venting from tagger — needs warm register, not transactional reply.
-	if (mode === 'venting') {
-		return { provider: 'gemini', model: GEMINI_MODELS.pro, reason: 'mode_venting', isDefault: false };
-	}
-
-	// 5. Active check-in + emotional content — user is processing during the
-	// check-in flow, deserves Pro depth.
+	// 4. Active check-in + emotional content — user is processing during the
+	// check-in flow, deserves Pro depth. Regex-based, not tagger-based.
 	if (healthCheckinActive && COMPLEXITY_PATTERNS.emotional.test(userText || '')) {
 		return { provider: 'gemini', model: GEMINI_MODELS.pro, reason: 'checkin_with_emotion', isDefault: false };
 	}
 
-	// 6. Emotional content (no check-in active).
+	// 5. Emotional content (no check-in active). Regex-based, deterministic.
 	if (COMPLEXITY_PATTERNS.emotional.test(userText || '')) {
 		return { provider: 'gemini', model: GEMINI_MODELS.pro, reason: 'emotional_content', isDefault: false };
 	}
 
-	// 7. Tagger says ‘processing’ — substantive but not emotional.
-	// Flash is the right level: more reasoning than Flash-Lite, less weight than Pro.
-	if (mode === 'processing') {
-		return { provider: 'gemini', model: GEMINI_MODELS.flash, reason: 'mode_processing', isDefault: false };
-	}
-
-	// 8. Complex tasks (code, architecture, analytical, long) — Pro.
+	// 6. Complex tasks (code, architecture, analytical, long) — Pro.
 	// Note: this catches code/analytical text that the regex below would also
 	// match. detectComplexTask wins because Pro reasoning matters more than
 	// the CF cost saving for these. Order is deliberate.
@@ -95,7 +88,7 @@ export function routeMessage(ctx) {
 		return { provider: 'gemini', model: GEMINI_MODELS.pro, reason: 'complex_task', isDefault: false };
 	}
 
-	// 9. CF observability routes (kept for tail visibility; same model as default).
+	// 7. CF observability routes (kept for tail visibility; same model as default).
 	if (COMPLEXITY_PATTERNS.code.test(userText || '') || /```/.test(userText || '')) {
 		return { provider: 'cloudflare', model: CF_MODELS.chat, reason: 'code_content', isDefault: false };
 	}
@@ -106,7 +99,8 @@ export function routeMessage(ctx) {
 		return { provider: 'cloudflare', model: CF_MODELS.chat, reason: 'long_message', isDefault: false };
 	}
 
-	// 10. Simple message OR transactional mode — Flash-Lite is plenty.
+	// 8. Simple message OR transactional mode (tagger) OR active check-in non-emotional.
+	// Flash-Lite is plenty for short utility replies.
 	// Health check-in non-emotional replies (“took my meds”) land here too.
 	if (mode === 'transactional' || healthCheckinActive || isSimpleMessage(userText || '')) {
 		const reason = mode === 'transactional' ? 'mode_transactional'
@@ -115,7 +109,7 @@ export function routeMessage(ctx) {
 		return { provider: 'gemini', model: GEMINI_MODELS.flashLite, reason, isDefault: false };
 	}
 
-	// 11. Default: casual chat — Gemma on CF (free, fast, unlogged).
+	// 9. Default: casual chat — Gemma on CF (free, fast, unlogged).
 	return { provider: 'cloudflare', model: CF_MODELS.chat, reason: 'default_casual', isDefault: true };
 }
 

@@ -1624,6 +1624,16 @@ export default {
 			const isCommand = /^\/\w+/.test(userText);
 			const isOwner = env.OWNER_ID && String(update.message.from?.id) === String(env.OWNER_ID);
 
+			// Detect media here (image/voice/audio/video/document/sticker) so the
+			// dispatch decision can route media → queue. Voice notes were timing
+			// out at the 30s waitUntil ceiling because Pro multimodal generation
+			// genuinely takes 15-25s and any setup latency on top pushed past the
+			// budget. The queue's 15-min wall clock removes that constraint.
+			const _msgForMedia = update.message;
+			const hasMessageMedia = !!(_msgForMedia.photo || _msgForMedia.voice || _msgForMedia.audio
+				|| _msgForMedia.video || _msgForMedia.video_note || _msgForMedia.document
+				|| _msgForMedia.sticker);
+
 			// Replies during an active health check-in MUST stay on the fast path (Flash + waitUntil).
 			// detectComplexTask matches on "anxious", "mood", "sleep", etc — exactly the words
 			// morning/evening check-ins invite. Without this override, simple med-confirmation
@@ -1632,10 +1642,26 @@ export default {
 				? await env.CHAT_KV.get(`health_checkin_active_${update.message.chat.id}`).catch(() => null)
 				: null;
 
-			if (!isCommand && isOwner && !activeCheckin && env.TASK_QUEUE && detectComplexTask(userText)) {
+			// Queue routing decision:
+			//   - Media (voice/photo/etc): always queue — always routes to Pro multimodal,
+			//     always exceeds waitUntil budget on overloaded days. No active-checkin
+			//     override here because media during a checkin is even MORE likely to need Pro.
+			//   - Complex text (detectComplexTask hits): queue, unless mid-checkin
+			//     (existing fast-path override).
+			//   - Everything else: waitUntil fast path.
+			const shouldQueue = !isCommand && isOwner && env.TASK_QUEUE && (
+				hasMessageMedia
+				|| (!activeCheckin && detectComplexTask(userText))
+			);
+
+			if (shouldQueue) {
 				try {
 					await env.TASK_QUEUE.send({ type: 'user_message', message: update.message });
-					log.info('message_queued', { chatId: update.message.chat.id, len: userText.length });
+					log.info('message_queued', {
+						chatId: update.message.chat.id,
+						len: userText.length,
+						reason: hasMessageMedia ? 'media' : 'complex_text',
+					});
 					// Send typing indicator so user knows we received it
 					telegram.sendChatAction(update.message.chat.id, update.message.message_thread_id || 'default', 'typing', env).catch(() => {});
 				} catch (queueErr) {

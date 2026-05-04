@@ -103,8 +103,123 @@ field versus six log lines for the response generation tier.
 
 - `39f7b0c` — fix(persona): hard tool-selection rules to stop code execution misuse
 - `c58d0f4` — fix(handlers): treat stream truncation as retryable + add Flash-Lite -> Flash fallback
+- `6a94778` — fix(cron): disable handleArchitectureEvolution (was burning ~72 Gemini calls/day)
+- `7c724d2` — fix(formatter): switch sanitizeTelegramHTML to allow-list
 
 Deployed versions: `0c63e302-d4a2-4d44-bb9e-d59a5f6a690c`,
-`b5e8fe74-9556-4486-8e06-271e25511aeb`.
+`b5e8fe74-9556-4486-8e06-271e25511aeb`,
+`26915963-ae9e-4ee8-b2b4-af6371770827`,
+`d237180f-a1c9-4a5d-b6a1-35e662cbd43a`.
+
+### Problem 3: handleArchitectureEvolution running hourly, burning tokens
+
+User flagged that token consumption from architecture deep search was running
+high and they had stopped engaging with the resulting interactive PR drafts.
+
+Root cause: `handleArchitectureEvolution` in `src/index.js` had two
+contradicting docstrings (`Weekly Deep Search` and `Hourly Deep Search`) and
+only checked `londonTime.getMinutes() === 0`. So it fired at the top of every
+hour, every day. ~24 runs/day, each making three Gemini calls
+(search + read_webpage + PR draft) = ~72 Gemini calls/day plus interactive
+PR Telegram messages with approve/dismiss buttons. The schedules.js config
+still said Monday 04:00 London but the function never read its own schedule.
+
+Fix (Option B — disable, not restore-to-weekly): user explicitly preferred
+disable over restoring weekly cadence. Three changes in commit `6a94778`:
+  1. Early return at top of handleArchitectureEvolution with explanatory
+     comment and re-enable instructions
+  2. Removed `handleArchitectureEvolution(env)` from the queued cron path’s
+     `Promise.allSettled` and from the matching names array
+  3. Same removal in the fallback cron path and its names array
+
+Reviewed `handleDailyStudy` in same patch (per user request) but did NOT
+patch it. Analysis: capped at 1 study/day via `daily_study_<date>` KV lock,
+10%-per-hour random gate during 07-23 window. Real cost is 3-4 Gemini
+calls/day max. Two orders of magnitude less than architecture_evolution.
+Working as intended. Touching it would be scope creep.
+
+To re-enable architecture evolution later: search for
+`ARCHITECTURE_EVOLUTION_DISABLED` in `src/index.js`. Recommend gating on
+`getSchedule(env, 'architecture_evolution')` with day+hour+minute match before
+restoring, so it cannot regress to hourly.
+
+### Problem 4: Telegram HTML parse failures from model-emitted unknown tags
+
+User flagged the `<b>Evening Affirmations</b>` rendering and asked whether
+formatting was Telegram-compatible end-to-end. Investigation also surfaced
+the pre-existing `Bad Request: can't parse entities: Unsupported start tag
+"string"` error from earlier in the day.
+
+Root cause: `sanitizeTelegramHTML` in `src/lib/formatter.js` used a deny-list
+of known-bad tags (`p`, `div`, `br`, `h1-6`, `span` without tg-spoiler, etc.).
+Anything the model invented outside that list (`<string>`, `<example>`,
+`<note>`, etc.) slipped through to a Telegram parse failure. The strip-all-tags
+fallback in `telegram.sendMessage` caught it but users saw degraded output.
+
+Reminder cron path in `src/index.js` already escapes user content correctly
+via `escapeHtml` (added in commit `f465422`), so reminders themselves are
+not the failure source. The failures come from bot-generated wrappers around
+model output (e.g. `<b>Weekly Report</b>\n\n${report}`) where ${report}
+contained unexpected tags.
+
+Fix (Option A — allow-list rewrite). Commit `7c724d2`. Rewrote
+`sanitizeTelegramHTML` in `src/lib/formatter.js`:
+  1. Markdown pre-processing kept (`**bold**`, `__italic__` -> `<b>`/`<i>`)
+  2. Allow-list strip: every tag matched against Telegram spec. Plain
+     allow-list: b, strong, i, em, u, ins, s, strike, del, tg-spoiler,
+     code, pre, blockquote. Attribute-bearing tags handled separately:
+     `<a href>` (required href), `<span class=tg-spoiler>` (only that class),
+     `<tg-emoji emoji-id=NNN>` (numeric only), `<blockquote expandable>`
+     (expandable flag preserved)
+  3. Existing balancer (orphan closers / unclosed openers) and whitespace
+     collapse retained unchanged
+  4. HTML entities (&lt; etc) left untouched so reminder cron's escapeHtml
+     output stays escaped
+
+Test coverage: 23 cases ran locally before deploy, all passed. Including the
+real failing case (`<string>foo</string>` strips cleanly), pre-escaped
+entity preservation, all spec-allowed attribute-bearing tags, balancer
+correctness on orphans/unclosed.
+
+Acknowledged trade-off: `<code class="language-python">` attributes are now
+stripped. Syntax highlighting in Telegram code blocks no longer works.
+Cosmetic only — parse still succeeds. If anyone needs language-hinted code
+blocks back, add a special case for `<code>` matching the pre/code spec.
+
+Deferred to a follow-up Option C session: centralised
+`formatTelegramMessage(template, fields)` helper to make bot-template +
+user-data interpolation auto-escape correctly. Currently five sites in
+`src/index.js` (Weekly Report, Mid-Week Check-in, Monthly self-assessment,
+Things I found interesting, Architecture Deep Search title) interpolate
+model output directly into `<b>Title</b>\n\n${msg}` templates. The new
+sanitiser catches recurrences but a centralised helper would make this
+discipline impossible to forget.
+
+### Side investigations done this session (no code change)
+
+- **Mood check-in / photo upload audit (paused):** Queried mood_journal
+  D1 table for last 14 days. Confirmed: zero photos logged across all
+  entries (`photo_r2_key` is NULL on every row). Patchy check-in coverage
+  with full days missing (28 Apr, 27 Apr, 19 Apr, 02 May had no entries
+  at all). Investigation paused after architecture-evolution fix took
+  priority; needs a fresh dedicated session.
+- **Affirmation reminders deletion verification:** User asked the bot to
+  cancel + delete morning and evening affirmation reminders (rows 42 and
+  43 in D1). Verified via D1 query: both rows are gone, no affirmation-
+  shaped rows remain under any status. The model successfully used the
+  new `update_reminder({cancel: true})` tool. Likely the persona tool-
+  routing fix from commit 39f7b0c was what enabled it to reach the right
+  tool instead of the Python sandbox.
+- **Affirmation text first-person vs second-person mix:** Both rows 42
+  and 43 had identical text mixing first-person opening ("I am beautiful")
+  with second-person body ("You're going to have a beautiful home"). The
+  model copied the user's `originalRequest` verbatim, which itself contained
+  the mix. Not a bug — the bot stored what was given. Worth noting if user
+  recreates the affirmations: provide clean consistent person.
+- **Tagger architecture clarification (continued):** User noted "I cannot
+  see Llama in the logs either, only Flash-Lite". Clarified again:
+  `source: "llama-8b"` field in `tagger_resolved` IS Llama showing up. One
+  log line vs six lines for response generation makes it easy to miss.
+
 
 ================================================================================

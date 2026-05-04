@@ -919,10 +919,19 @@ ${suggestions}`;
 	}
 }
 
-// ---- Autonomous Architecture Evolution (Weekly Deep Search) ----
-// Runs once a week. Searches one technology deeply, reads actual docs via read_webpage, suggests PRs.
-// ---- Autonomous Architecture Evolution (Hourly Deep Search) ----
+// ---- Autonomous Architecture Evolution (DISABLED) ----
+// Disabled 2026-05-04: was running hourly (24x/day) burning ~72 Gemini calls per day.
+// Original intent per schedules.js was once-weekly Monday 04:00 London. The function
+// was never wired to read its own schedule (only checked minute === 0) and the
+// docstring contradicted itself ("Weekly" vs "Hourly").
+//
+// To re-enable: (1) remove the early return below, (2) restore call sites in the
+// scheduled() handler's two Promise.allSettled blocks (search for ARCHITECTURE_EVOLUTION_DISABLED).
+// Recommend gating on getSchedule(env, 'architecture_evolution') with day+hour+minute
+// match before re-enabling, so it cannot regress to hourly.
 async function handleArchitectureEvolution(env) {
+	return; // DISABLED — see comment above
+	// eslint-disable-next-line no-unreachable
 	const now = new Date();
 	const londonTime = await getLocalTime(env.OWNER_ID, env, now);
 
@@ -1873,7 +1882,9 @@ export default {
 				handleCuriosityDigest(env),         // Sat 10:00 London
 				handleAutonomousResearch(env),      // Tue/Fri 04:00 London
 				handleSelfImprovement(env),         // 15th of month, 05:00 London
-				handleArchitectureEvolution(env),   // Top of every hour
+				// ARCHITECTURE_EVOLUTION_DISABLED — was hourly, burning ~72 Gemini calls/day.
+				// To re-enable: restore handleArchitectureEvolution(env) here AND in the
+				// fallback block below, AND remove the early return inside the function.
 				handleDailyStudy(env),              // ~10% chance per hour, 07-22
 			]);
 			cronResults.forEach((r, i) => {
@@ -1886,7 +1897,6 @@ export default {
 					'curiosity_digest',
 					'autonomous_research',
 					'self_improvement',
-					'architecture_evolution',
 					'daily_study',
 				];
 				if (r.status === 'rejected') log.error(`cron_${names[i]}_failed`, { msg: r.reason?.message });
@@ -1921,14 +1931,14 @@ export default {
 				handleCuriosityDigest(env),
 				handleAutonomousResearch(env),
 				handleSelfImprovement(env),
-				handleArchitectureEvolution(env),
+				// ARCHITECTURE_EVOLUTION_DISABLED — see queued path above.
 				handleDailyStudy(env),
 			]);
 			cronResults.forEach((r, i) => {
 				const names = [
 					'checkin', 'nudge', 'consolidation', 'style_card', 'outreach', 'daily_consolidation',
 					'weekly_report', 'accountability_nudge', 'curiosity_digest', 'autonomous_research',
-					'self_improvement', 'architecture_evolution', 'daily_study',
+					'self_improvement', 'daily_study',
 				];
 				if (r.status === 'rejected') log.error(`cron_${names[i]}_failed`, { msg: r.reason?.message });
 			});

@@ -1,0 +1,110 @@
+# Xaridotis Engineering Journal
+
+A log of significant engineering sessions on Xaridotis (gemini-bot). Most recent first.
+
+================================================================================
+
+## 2026-05-04 — Persona tool-routing fix + Flash-Lite fallback
+
+### Problem 1: codeExecution leaking Python tracebacks
+
+Asking "show me my reminders" caused the model to reach for Gemini's built-in
+`codeExecution` Python sandbox instead of calling our `list_reminders` tool.
+The sandbox tried `default_api.list_reminders()` and `update_schedule()` —
+neither exists in the Workers AI Python runtime — leaked NameError tracebacks
+as `Result:` lines into the Telegram chat, then confabulated "no reminders
+found" despite 5 reminders sitting in D1.
+
+Root cause: `src/lib/ai/gemini.js` enables three tool surfaces simultaneously:
+  - `functionDeclarations` (our 32 custom tools)
+  - `googleSearch: {}`
+  - `codeExecution: {}`
+
+Earlier description sharpening on `list_reminders` and `manage_cloudflare`
+(commit 7e6e004) had only redirected the misuse — model switched from
+`manage_cloudflare` to the Python sandbox. Tool description quality wins
+skirmishes, not the war.
+
+Fix (Option C — soft persona instruction). Commit `39f7b0c`. Added a
+`TOOL SELECTION RULES (HARD CONSTRAINTS)` block to
+`personas.xaridotis.instruction` covering reminders, mood, memories, episodes,
+and therapeutic notes. Persona size grew 15824 → 17274 chars.
+
+Acknowledged: this is a soft constraint and may drift. Escalation path to
+Option A (remove `codeExecution: {}` outright in `src/lib/ai/gemini.js` lines
+143 + 171) is documented and ready.
+
+Verified working: test "Show me all my reminders" produced
+`tool_calls: ["list_reminders"]` and returned all 5 reminders cleanly.
+
+### Problem 2: Flash-Lite mid-stream truncation crashed handler
+
+Second test ("what do I have scheduled") crashed with
+`Error: Incomplete JSON segment at the end` from `processStreamResponse_1`
+in the `@google/genai` SDK at total_elapsed_ms 11401. SDK threw because
+Google ended the stream before a JSON chunk closed.
+
+Two gaps in `handleMessage`'s catch block:
+  1. `isOverload` keyword check did not include `"Incomplete JSON segment"`,
+     so `isRetryable` came back false and the handler crashed.
+  2. The fallback branch only fired when `textModel === PRIMARY_TEXT_MODEL`.
+     Flash-Lite had no escape hatch at all.
+
+Fix. Commit `c58d0f4`, deployed `b5e8fe74-9556-4486-8e06-271e25511aeb`.
+Two surgical edits to `src/bot/handlers.js`:
+
+  1. Added `isStreamTruncated` flag matching `'Incomplete JSON segment'`,
+     folded into `isRetryable`. Kept as a separate boolean so logs can tell
+     mid-stream truncation apart from upstream overloads.
+
+  2. Extended fallback condition from `textModel === PRIMARY_TEXT_MODEL` to
+     `(PRIMARY_TEXT_MODEL || FLASH_LITE_TEXT_MODEL)`. Both tiers fall to
+     Flash. Renamed log event `pro_fallback_to_flash` → `fallback_to_flash`
+     with `from`/`to`/`reason` labels for tail diagnostics.
+
+### Considered and rejected
+
+- Adding Gemma 4 26B to the response chain (Gemma → Flash-Lite → Flash → Llama).
+  Rejected: Gemma uses OpenAI-compat tool calling, not Gemini
+  `functionDeclarations`. Would require translating 32 tool defs and building
+  a parallel tool loop — 1-2 day project. Llama 8B can't do reliable 32-tool
+  calling at all, so the bottom of the chain was fictional safety. Cost saving
+  on transactional turns is sub-pence. Concentrates risk on a model already
+  serving as tagger fallback + observation extractor + casual fast-path.
+
+- Flash-Lite-non-streaming as cheaper first retry before Flash. Skipped:
+  today's failure was genuine connection truncation (11.4s of generation
+  before cut), not throttling. Retrying same model is a coin flip. Flash is
+  well-cached and reliable. If recurrence shows non-streaming would help,
+  add it then.
+
+### Tagger architecture clarification
+
+User noted "I cannot see Llama in the logs either, only Flash-Lite".
+Clarified: `source: "llama-8b"` field in `tagger_resolved` IS Llama showing up.
+Tagger is a 4-tier waterfall (Llama 8B → Gemma 4 26B → Gemini Flash →
+Flash-Lite → heuristic), stops on first success. Llama 8B handles ~80% of
+cases in <1s; Gemma is fallback. Logs were correct, just compressed into one
+field versus six log lines for the response generation tier.
+
+### Outstanding
+
+- Telegram HTML parse error at byte offset 363 in 1148-char response
+  ("Unsupported start tag string"). Pre-existing, separate from today's work.
+  Model emitting raw `<string>` or similar in HTML output.
+- Flash-Lite stability monitoring — two failures in one day (TTFB spike 11.5s
+  + mid-stream truncation). If recurrence > 5%/week, escalate transactional
+  default to Flash (latency cost ~1-2s per turn).
+- Llama tier visibility — could add summary log line
+  `tier_summary tagger:llama-8b responder:flash-lite` for at-a-glance chain
+  view. Not done.
+
+### Commits
+
+- `39f7b0c` — fix(persona): hard tool-selection rules to stop code execution misuse
+- `c58d0f4` — fix(handlers): treat stream truncation as retryable + add Flash-Lite -> Flash fallback
+
+Deployed versions: `0c63e302-d4a2-4d44-bb9e-d59a5f6a690c`,
+`b5e8fe74-9556-4486-8e06-271e25511aeb`.
+
+================================================================================

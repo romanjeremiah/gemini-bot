@@ -1,4 +1,4 @@
-import { reminderTool } from './reminder';
+import { reminderTool, listRemindersTool, updateReminderTool } from './reminder';
 import { memoryTool } from './memory';
 import { reactionTool } from './reaction';
 import { voiceTool } from './voice';
@@ -23,6 +23,8 @@ import { quietHoursTool, clearQuietHoursTool } from './quietHours';
 
 export const toolRegistry = {
 	[reminderTool.definition.name]: reminderTool,
+	[listRemindersTool.definition.name]: listRemindersTool,
+	[updateReminderTool.definition.name]: updateReminderTool,
 	[memoryTool.definition.name]: memoryTool,
 	[reactionTool.definition.name]: reactionTool,
 	[voiceTool.definition.name]: voiceTool,

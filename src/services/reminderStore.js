@@ -118,3 +118,91 @@ export async function getUserReminders(env, userId) {
 	).bind(userId).all();
 	return results || [];
 }
+
+/**
+ * Fetch a single reminder by id, scoped by user_id so callers can't accidentally
+ * (or maliciously) read another user's row. Returns the row or null.
+ */
+export async function getReminderForUser(env, userId, id) {
+	const row = await env.DB.prepare(
+		`SELECT * FROM reminders WHERE id = ? AND user_id = ? LIMIT 1`
+	).bind(id, userId).first();
+	return row || null;
+}
+
+/**
+ * Update an existing reminder. All fields except {userId, id} are optional;
+ * pass only the fields you want to change. Special `cancel: true` flag deletes
+ * the row entirely (semantically: "the user cancelled this reminder").
+ *
+ * Identity rules:
+ *   - id is required and must belong to userId. Returns {ok:false, reason:'not_found'}
+ *     if no matching row exists, {ok:false, reason:'permission_denied'} if the row
+ *     exists but belongs to another user. Both shapes are handled by getReminderForUser
+ *     which scopes by userId — missing row could be either case but we don't leak that.
+ *   - Skips dedup check entirely. Updates are explicit user actions; the user said
+ *     "change THIS reminder" so we don't second-guess them. Inserts go through dedup,
+ *     updates do not.
+ *
+ * Returns {ok: true, action: 'updated'|'cancelled', reminder: <row>} on success.
+ * The returned reminder is the post-update state for cancel returns the pre-delete row.
+ */
+export async function updateReminder(env, { userId, id, newText, newDueAt, newRecurrence, newContext, cancel }) {
+	const existing = await getReminderForUser(env, userId, id);
+	if (!existing) {
+		return { ok: false, reason: 'not_found' };
+	}
+
+	// Cancel path: delete the row outright. Returns the pre-delete row so the
+	// caller can confirm what was removed.
+	if (cancel) {
+		await env.DB.prepare(`DELETE FROM reminders WHERE id = ? AND user_id = ?`)
+			.bind(id, userId).run();
+		return { ok: true, action: 'cancelled', reminder: existing };
+	}
+
+	// Build the SET clause from only the fields actually provided. We intentionally
+	// don't allow blanking out fields with empty strings — if a caller passes
+	// undefined/null, the field is left alone.
+	const updates = [];
+	const params = [];
+
+	if (typeof newText === 'string' && newText.trim().length > 0) {
+		updates.push('text = ?');
+		params.push(newText);
+	}
+	if (typeof newDueAt === 'number' && Number.isFinite(newDueAt) && newDueAt > 0) {
+		updates.push('due_at = ?');
+		params.push(newDueAt);
+	}
+	if (typeof newRecurrence === 'string' && ['none', 'daily', 'weekly', 'monthly'].includes(newRecurrence)) {
+		updates.push('recurrence_type = ?');
+		params.push(newRecurrence);
+	}
+	if (typeof newContext === 'string' && newContext.trim().length > 0) {
+		// Merge context into existing metadata rather than overwriting other fields
+		// (firstName, persona, originalRequest, createdAt). Only `reason` changes.
+		let meta = {};
+		try { meta = JSON.parse(existing.metadata || '{}'); } catch { /* meta stays empty */ }
+		meta.reason = newContext;
+		updates.push('metadata = ?');
+		params.push(JSON.stringify(meta));
+	}
+
+	if (updates.length === 0) {
+		// Nothing to update — caller likely passed all-null fields. Treat as no-op
+		// rather than error so the model can recover gracefully.
+		return { ok: true, action: 'noop', reminder: existing };
+	}
+
+	updates.push('updated_at = CURRENT_TIMESTAMP');
+	params.push(id, userId); // for the WHERE clause
+
+	await env.DB.prepare(
+		`UPDATE reminders SET ${updates.join(', ')} WHERE id = ? AND user_id = ?`
+	).bind(...params).run();
+
+	// Re-read so the caller gets the post-update state (including updated_at).
+	const updated = await getReminderForUser(env, userId, id);
+	return { ok: true, action: 'updated', reminder: updated };
+}

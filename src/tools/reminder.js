@@ -17,7 +17,7 @@ export const reminderTool = {
 		}
 	},
 	async execute(args, env, context) {
-		await reminderStore.saveReminder(env, {
+		const result = await reminderStore.saveReminder(env, {
 			userId: context.userId,
 			chatId: context.chatId,
 			threadId: context.threadId,
@@ -33,6 +33,20 @@ export const reminderTool = {
 				createdAt: Math.floor(Date.now() / 1000)
 			}
 		});
+
+		// Dedup guard hit: tell the model so it can respond honestly to the user
+		// ("that reminder is already scheduled") rather than confirming a save
+		// that didn't happen. Without this the model would say "done!" while no
+		// new row was created.
+		if (result?.duplicate) {
+			return {
+				status: "duplicate_skipped",
+				existing_reminder_id: result.existing_id,
+				existing_due_at_utc: result.existing_due_at,
+				note: "A near-identical reminder is already scheduled for the same time slot. No new reminder was created. Tell the user the reminder is already in place rather than claiming you scheduled a new one."
+			};
+		}
+
 		return {
 			status: "success",
 			scheduled_at_utc: args.due_at_timestamp,

@@ -1765,7 +1765,11 @@ export async function handleMessage(msg, env) {
 				|| errMsg.includes('overloaded') || errMsg.includes('unavailable') || errMsg.includes('UNAVAILABLE')
 				|| errMsg.includes('DEADLINE_EXCEEDED') || errMsg.includes('INTERNAL')
 				|| proErr?.status === 503 || proErr?.status === 429 || proErr?.status === 500 || proErr?.status === 504;
-			const isRetryable = isIdle || isOverload;
+			// Mid-stream truncation: the SDK throws this when Google's stream ends
+			// before a JSON chunk closes. Observed on Flash-Lite preview during load.
+			// Treat as transient — same recovery path as overload.
+			const isStreamTruncated = errMsg.includes('Incomplete JSON segment');
+			const isRetryable = isIdle || isOverload || isStreamTruncated;
 
 			// Full error signal capture for observability — so we can see in logs
 			// exactly what Gemini returned (or failed to return).
@@ -1781,8 +1785,10 @@ export async function handleMessage(msg, env) {
 				err_msg: errMsg.slice(0, 200),
 			});
 
-			if (isRetryable && textModel === PRIMARY_TEXT_MODEL) {
-				log.warn('pro_fallback_to_flash', { error: errMsg.slice(0, 100), model: textModel, reason: isIdle ? 'stream_idle' : 'overload' });
+			if (isRetryable && (textModel === PRIMARY_TEXT_MODEL || textModel === FLASH_LITE_TEXT_MODEL)) {
+				const fromTier = textModel === PRIMARY_TEXT_MODEL ? 'pro' : 'flash_lite';
+				const reasonLabel = isIdle ? 'stream_idle' : isStreamTruncated ? 'stream_truncated' : 'overload';
+				log.warn('fallback_to_flash', { error: errMsg.slice(0, 100), from: fromTier, to: 'flash', reason: reasonLabel });
 
 				// Delete the orphaned draft bubble from the failed attempt so Telegram
 				// doesn't show a ghost "..." message alongside the Flash reply.

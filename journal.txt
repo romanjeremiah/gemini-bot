@@ -4,6 +4,204 @@ A log of significant engineering sessions on Xaridotis (gemini-bot). Most recent
 
 ================================================================================
 
+## 2026-05-06 (latest) — Mood flow Round 3: stripped mid-flow AI, end-only synthesis on Cloudflare-first cascade
+
+### What
+
+Live test on 2026-05-06 13:05 showed the mood synthesis hanging 127s+128s+128s on Gemini Pro 524s, retrying 3x then falling through to fixed text. Round 1 (queue migration) and Round 2 (stage tracking) had landed but couldn't help — the upstream Pro hangs were the bottleneck.
+
+Round 3 redesign rebuilt the mood flow around two principles: **AI only at the end**, and **Cloudflare-first** with Gemini as fallback.
+
+### Decision: end-only synthesis with day-level completeness
+
+The entire mid-flow AI surface is gone:
+- Score-tap acknowledgement: was Pro+thinking (10-25s, 127s on bad days). Replaced with a 2-tier Cloudflare-only micro-ack (Llama 3.3 70B fp8-fast → Gemma 3 12B → static text). 1-3s realistic latency.
+- Emotions-Done acknowledgement: was Pro+high-thinking via the queue. Replaced with the same 2-tier micro-ack.
+- Activities-Done kick: was a synthetic `handleMessage` call to nudge the AI to call the next tool. Replaced with `driveNextDeterministicStep()` which reads what's missing from D1 and sends the right keyboard or prose ask. Zero AI involved in flow routing.
+- Photo-skip kick: same as activities-done.
+
+End-of-flow synthesis is now the ONLY heavy AI call per check-in. Fired exactly once when ALL pieces are in: score, emotions, activities, sleep, photo-or-skipped — all checked across ALL of today's mood rows (morning + midday + evening combined). The cascade is 6 tiers:
+
+1. `@cf/meta/llama-3.3-70b-instruct-fp8-fast` (15s)
+2. `@cf/google/gemma-3-12b-it` (15s)
+3. `gemini-3.1-flash-lite-preview` (20s)
+4. `gemini-3-flash-preview` (25s)
+5. `gemini-3.1-pro-preview` (30s)
+6. Fixed warm fallback text
+
+Mixed error-feedback + timeout per tier. Each tier wrapped in `Promise.race` so silent hangs (the 524 pattern) bail at the timeout cap. Realistic case: Tier 1 succeeds in 5-8s. Worst case before fixed text: 105s.
+
+### Why "day-level" matters
+
+The day-level completeness check means if sleep was logged in the morning entry (via `log_mood_entry` from a chat reply), the evening flow doesn't ask again. Same for emotions and photo. The synthesis sees the combined picture of the day, not just the evening row. Implemented via `moodStore.getDayEntries(env, userId, date)` which returns all rows for the date; `computeDayCompleteness()` walks them and OR's each piece.
+
+### Prompt style: situation + role, no instructions
+
+All three new prompts (score-ack, emotions-ack, synthesis) use the "describe the situation, set the role, get out of the way" style. No "max N words", no "do NOT mention X", no examples. Just data + "Briefly respond as a supportive and understanding friend who notices." The persona system prompt handles tone and severity.
+
+Corrections applied during prompt design:
+- Full poll option text in the score scale (not abbreviated buckets), so the model sees the same wording the user did.
+- Dynamic `${period}` ("this morning" / "this afternoon" / "this evening" / "tonight") computed from `flow.started_at` via new `getCheckinTiming()` helper in `moodFlow.js`. Works for cron-triggered AND manual `/mood` at any time of day.
+- Removed the word "clinical" from prompts — "His patterns and known triggers from past sessions" reads more like a friend's recall than a chart review.
+- Helpline trio (Samaritans 116 123, SHOUT text 85258, NHS 111) only in the end-of-flow synthesis prompt, conditional on safety concern in the data.
+
+### What changed
+
+**New files:**
+- `src/services/moodMicroAck.js` (~280 lines) — score-ack + emotions-ack runners, 2-tier Cloudflare cascade, mixed error+timeout, prompt builders.
+- `src/services/moodSynthesis.js` (~330 lines) — 6-tier cascade, day-level completeness checker, `maybeFireSynthesis()` helper with idempotency guard (`mood_synthesis_fired_${chatId}_${date}` KV key, 26h TTL).
+
+**Modified:**
+- `src/lib/moodFlow.js` — added `getCheckinTiming(startedAtMs)` helper. Pure function, no side effects.
+- `src/index.js` — stripped 100+ line AI block from `handleMoodPollAnswer`, replaced with `runScoreAck()` call. Deleted `mood_synthesis_after_emotions` and `mood_kick_after_emotions` queue cases. Added `mood_synthesis_final` queue case with looped typing indicator (every 4s during synthesis).
+- `src/bot/handlers.js` — stripped queue-based AI synthesis from `mood_emo_done`, replaced with `runEmotionsAck()` + `driveNextDeterministicStep()`. Activities-Done and photo-skip handlers replaced their `handleMessage` kicks with `driveNextDeterministicStep()`. Photo upload handler now calls `maybeFireSynthesis()` and returns early so the AI generation pipeline doesn't run on top.
+- `src/tools/mood.js` — `logMoodEntryTool.execute` now calls `maybeFireSynthesis()` after `advanceStage()`. Returns a new `next_step` value when synthesis fired so the AI knows to send a brief one-line ack instead of a long wrap-up reply (the synthesis IS the wrap-up).
+
+### What is NOT changed
+
+- `getCheckinRoadmap` HARD RULES block in `handlers.js` — still there for the prose-driven sleep ask path. The deterministic flow now handles activities, photo, and the post-emotions transition; sleep remains a prose ask answered by `log_mood_entry`.
+- Safety net (`mood_flow_safety_net`) queue case — still works the same way, still uses stage values, still picks keyboards based on what's missing.
+- The 524 streaming-path retryable error issue in handlers.js ~line 2050 — now moot for mood flows (we don't call Pro mid-flow at all). Non-mood Pro paths still hit it; revisit if logs show a problem.
+
+### Risk acknowledged
+
+If the entire 6-tier synthesis cascade fails, the user gets a fixed warm text and zero personalised AI engagement that day. That's a real UX regression compared to the previous setup's "something" — but the previous "something" was often itself broken (today's 127s×3 retries produced no synthesis either). 6 tiers makes total cascade failure rare.
+
+The micro-acks have only 2 tiers and no Gemini fallback. If Workers AI is down, the score-tap and emotions-Done both fall back to short static text ("Got it. Tap below to share what you are feeling." and "Got it."). Mid-flow micro-acks can fail without the user noticing much; the synthesis is what carries the weight.
+
+### Verification plan
+
+1. `npx wrangler deploy --dry-run` to typecheck the new modules and dynamic imports.
+2. `npx wrangler deploy --minify` to ship.
+3. `/mood` end-to-end:
+   - Tap score → confirm 1-3s ack arrives.
+   - Tap Positive → select emotions → Done → confirm 1-3s ack arrives, activities keyboard sent immediately after.
+   - Tap activities → Done → confirm photo keyboard sent immediately.
+   - Upload photo (or Skip) → confirm sleep ask sent immediately.
+   - Reply with "7 hours" → confirm log_mood_entry runs, brief one-line ack from AI, then the synthesis arrives 5-15s later (typing indicator visible throughout).
+4. Tail logs to confirm:
+   - No `mood_synthesis_after_emotions` or `mood_kick_after_emotions` queue events.
+   - Single `mood_synthesis_enqueued` per check-in.
+   - `mood_synthesis_tier_ok` showing which tier succeeded.
+   - No `mood_synthesis_cascade_exhausted` under normal conditions.
+5. Day-level test: log sleep in the morning (via chat), trigger evening `/mood`, confirm sleep is NOT re-asked at the end of the flow.
+
+### Open thread
+
+None for mood flow. Round 3 closes the loop.
+
+The 524 fix in `handlers.js` ~line 2050 (Bug 4) is now lower-priority — mood flow no longer touches Gemini Pro mid-flow. Revisit only if non-mood Pro paths show similar hangs in tail logs.
+
+================================================================================
+
+## 2026-05-06 — Mood flow stage tracking: Option B "what's next missing"
+
+### What
+
+Live test on 2026-05-06 12:09 fired the mood-flow safety net with `stage:
+"score"` despite the user having completed the score AND emotions AND clicked
+Done ~18 minutes earlier. Safety net rendered the activities keyboard
+correctly (its branches handle missing pieces deterministically) but only
+because it fell through the unrecognised 'score' branch into the
+activities-missing fallback. The stage value was lying about reality.
+
+The earlier patch round had moved the synthesis chain into the queue with two
+decoupled steps (`mood_synthesis_after_emotions`, `mood_kick_after_emotions`)
+and thinned the `mood_emo_done` callback from 110 lines to ~30. That fixed
+the waitUntil exhaustion. It did NOT fix the stage tracking, because no call
+site ever advanced the stage when score/emotions/activities/sleep landed in
+D1. Stage was only set in three places: `startFlow` (→'score'),
+`initActivitiesPending` (→'activities'), `initPhotoPending` (→'photo'), and a
+hardcoded `setStage(…'wrap')` inside the photo upload handler.
+
+### Decision: Option B (stage = "what's next missing")
+
+Original proposal was Option A: add `_done` markers like 'emotions_done',
+'activities_done', so the safety net could read "past emotions" and pick the
+right recovery. Pushed back — doubles the enum, and `emotions_done` is a
+transient state that the safety net would still need to interpret as "now
+render activities". The interpretation belongs at the transition point, not
+in the safety net.
+
+Option B: stage value at any moment IS the next missing piece. Canonical
+order: emotions → activities → photo → sleep → wrap. Whenever a piece
+lands, re-derive the stage from D1 + flow state. Safety net branches
+already match these names exactly — zero changes needed downstream.
+
+Second decision point: where to fire the advance for the AI-driven sleep
+case (the model calls `log_mood_entry` with sleep_hours after asking in
+prose). Option (i): inside `log_mood_entry` tool's execute function.
+Option (ii): a check at the start of every `handleMessage`. Picked (i) —
+the tool owns the state advancement when it writes the data, no wasteful
+checks on every turn.
+
+### What changed
+
+**`src/lib/moodFlow.js`** — added `import * as moodStore` and new function
+`advanceStage(env, chatId, userId)`. Reads today's evening entry from D1,
+checks emotions/activities/photo/sleep presence, and sets `stage` to the
+first missing piece in canonical order. Idempotent. ~50 lines including
+docs that list every call site.
+
+**`src/index.js`** — one call site in `handleMoodPollAnswer` after the score
+upsert. After this, `stage` will be 'emotions' when the emotion buttons are
+shown.
+
+**`src/bot/handlers.js`** — four call sites:
+- `mood_emo_done` callback after the emotions upsert.
+- `mood_act|done` handler after `clearActivitiesPending`.
+- Photo upload handler in `handleMessage`. Replaced hardcoded
+  `setStage(env, chatId, 'wrap')` with `advanceStage(...)`. **Semantic
+  change**: if a user uploads a photo before logging sleep, stage will now be
+  'sleep' not 'wrap'. That's the correct behaviour — the safety net should
+  ask for sleep, not wrap up early.
+- `handlePhotoSkipCallback` — added `userId` lookup and `advanceStage` call
+  after `markPhotoSkipped`. Previously this function did not advance the
+  stage at all, leaving it at 'photo' even after skip.
+
+**`src/tools/mood.js`** — added `import * as moodFlow` and gated
+`advanceStage` call after `upsertEntry` inside `logMoodEntryTool.execute`.
+Guarded on `context?.chatId`. Catch-all error handler so a flow miss never
+breaks a tool call.
+
+Every call site has a `.catch((e) => log.warn('mood_flow_advance_failed',
+{...}))` so partial failure is observable but never throws. Where-tag in
+logs identifies which call site failed: `after_score`, `after_emotions`,
+`after_activities`, `after_photo_upload`, `after_photo_skip`, plus the
+bare-catch in the tool path.
+
+### What is NOT changed
+
+- Safety net branches in `src/index.js` — already match the new stage names.
+- The 'score' initial stage in `startFlow` — technically dead now (overwritten
+  the moment score is logged) but harmless and matches the historical shape.
+- Roadmap builder `getCheckinRoadmap` — reads from D1 directly, doesn't care
+  about flow state.
+- The unrelated 524 cascade and chain-fallback work — still pending, separate
+  patch.
+
+### Verification plan
+
+1. Typecheck via `npx wrangler deploy --dry-run` (catches missing imports).
+2. Deploy via `npx wrangler deploy --minify`.
+3. Run a fresh `/mood` end-to-end: tap score → tap Positive → select an
+   emotion → tap Done. Watch tail for absence of `mood_flow_advance_failed`
+   warnings and absence of `queue_safety_net_done` (flow should make
+   progress, never stall).
+4. Stall recovery: trigger an evening flow, complete some pieces partially,
+   then ignore for 20 minutes. Safety net should fire with the correct
+   stage matching what's actually missing in D1.
+5. Sleep advancement: when AI calls `log_mood_entry` with sleep_hours,
+   confirm flow stage moves past 'sleep' to next missing or 'wrap'.
+
+### Open thread
+
+524-cascade fix and chain-fallback (Pro→Flash→Flash-Lite→Gemma) still
+pending. Stage tracking is independent of those — it makes the safety net
+resilient regardless of which model is doing the upstream work.
+
+================================================================================
+
 ## 2026-05-05 (latest) — Mood flow tool-use bug: prompt fix attempt (Option 1)
 
 ### What

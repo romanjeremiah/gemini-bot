@@ -6,6 +6,7 @@
 
 import * as moodStore from '../services/moodStore';
 import * as mediaStore from '../services/mediaStore';
+import * as moodFlow from '../lib/moodFlow';
 import { ACTIVITY_LABELS_CSV, canonicaliseActivities } from '../config/activities';
 
 export const logMoodEntryTool = {
@@ -117,6 +118,26 @@ IMPORTANT for SOURCE: do NOT pass a 'source' parameter — the runtime sets it a
 		const entry = await moodStore.upsertEntry(env, context.userId, date, args.entry_type || 'evening', data);
 		console.log(`📊 Mood logged: ${date} ${args.entry_type} score=${args.mood_score} src=${source}`);
 
+		// Advance the deterministic flow tracker if a check-in is live. This is
+		// the AI-driven path (e.g. the user replies with sleep hours and the
+		// model calls log_mood_entry). Without this, sleep would land in D1 but
+		// the safety net's stage value would still be 'sleep' — it would re-ask
+		// for sleep on the next stall instead of moving to 'wrap'.
+		let synthesisFired = false;
+		if (context?.chatId) {
+			await moodFlow.advanceStage(env, context.chatId, context.userId).catch(() => {});
+
+			// Day-completeness check: if all pieces are now in (e.g. the user just
+			// replied with sleep hours and that was the last missing piece), fire
+			// the final synthesis. The AI should NOT also write a wrap-up reply in
+			// the same turn — the synthesis is the wrap-up. We signal this back via
+			// the next_step field below.
+			try {
+				const { maybeFireSynthesis } = await import('../services/moodSynthesis');
+				synthesisFired = await maybeFireSynthesis(env, context.chatId, context.userId, context.threadId);
+			} catch { /* best-effort */ }
+		}
+
 		// Dynamic feedback: tell the AI what's still missing.
 		// Updated 2026-05-05: when the deterministic flow is active (mood_flow_*
 		// KV key set), the keyboard tools handle activities/sleep/photo — don't
@@ -129,11 +150,16 @@ IMPORTANT for SOURCE: do NOT pass a 'source' parameter — the runtime sets it a
 		if (!entry.note) missing.push('final reflections');
 
 		const flowActive = await env.CHAT_KV.get(`mood_flow_${context.chatId || context.userId}`);
-		const next_step = flowActive
-			? 'Data logged. The deterministic check-in flow is active — it will collect activities, sleep, and photo via keyboards. Respond warmly to what was just logged but DO NOT ask about other missing pieces in prose.'
-			: (missing.length > 0
-				? `Data logged. Still missing: ${missing.join(', ')}. Ask ONE natural question to gather the next piece, OR call send_activities_keyboard / send_photo_request if you're inside an evening check-in.`
-				: 'Journal complete for today. Warmly summarise the day and wrap up the check-in.');
+		let next_step;
+		if (synthesisFired) {
+			next_step = 'Data logged. The end-of-day synthesis has been queued and will arrive shortly. Send a brief one-line acknowledgement only — do NOT write a long reply or summarise the day yourself, the synthesis covers it.';
+		} else if (flowActive) {
+			next_step = 'Data logged. The deterministic check-in flow is active — it will collect activities, sleep, and photo via keyboards. Respond warmly to what was just logged but DO NOT ask about other missing pieces in prose.';
+		} else if (missing.length > 0) {
+			next_step = `Data logged. Still missing: ${missing.join(', ')}. Ask ONE natural question to gather the next piece, OR call send_activities_keyboard / send_photo_request if you're inside an evening check-in.`;
+		} else {
+			next_step = 'Journal complete for today. Warmly summarise the day and wrap up the check-in.';
+		}
 
 		return { status: "success", date, entry_type: args.entry_type, mood_score: args.mood_score, mood_label: entry.mood_label, next_step };
 	}

@@ -27,6 +27,8 @@
 //     } | null,
 //   }
 
+import * as moodStore from '../services/moodStore';
+
 const FLOW_TTL_SECONDS = 1800;
 const STALL_THRESHOLD_MS = 20 * 60 * 1000; // 20 min — safety net trigger
 
@@ -64,6 +66,53 @@ export async function setStage(env, chatId, stage) {
 	const flow = await getFlow(env, chatId);
 	if (!flow) return null;
 	flow.stage = stage;
+	return await setFlow(env, chatId, flow);
+}
+
+/**
+ * Advance the flow stage to whatever piece of data is missing next.
+ *
+ * Stage tracking philosophy (decided 2026-05-06): the stage value always
+ * represents "what's the next missing piece", never a "_done" marker for
+ * what just finished. The moment a piece lands, we re-derive the stage
+ * from D1 + flow state. This keeps the safety net's stage→keyboard mapping
+ * trivial: each stage corresponds to exactly one keyboard or prose ask.
+ *
+ * Canonical order (mirrors getCheckinRoadmap pieces order, plus emotions
+ * which is collected upstream by the emotion buttons):
+ *   emotions → activities → photo → sleep → wrap
+ *
+ * Idempotent. Safe to call after every meaningful event in the flow.
+ * Call sites:
+ *   - handleMoodPollAnswer (after score upsert)            → score lands, advance to emotions
+ *   - mood_emo_done callback (after emotions upsert)       → emotions land, advance to next missing
+ *   - mood_act|done handler (after mergeActivities)        → activities land, advance to next missing
+ *   - photo upload handler (after photo_r2_key written)    → photo lands, advance to next missing
+ *   - handlePhotoSkipCallback (after markPhotoSkipped)     → photo skipped, advance to next missing
+ *   - logMoodEntryTool.execute (after upsertEntry)         → AI-driven log (sleep, etc) advances
+ *
+ * Returns the updated flow, or null if no flow is active.
+ */
+export async function advanceStage(env, chatId, userId) {
+	const flow = await getFlow(env, chatId);
+	if (!flow) return null;
+
+	const today = moodStore.todayLondon();
+	const entry = await moodStore.getEntry(env, userId, today, 'evening').catch(() => null);
+
+	const hasEmotions = !!(entry?.emotions && entry.emotions !== '[]' && entry.emotions !== 'null');
+	const hasActivities = !!(entry?.activities && entry.activities !== '[]' && entry.activities !== 'null');
+	const hasPhoto = !!entry?.photo_r2_key || flow.photo?.skipped === true;
+	const hasSleep = entry?.sleep_hours !== null && entry?.sleep_hours !== undefined;
+
+	let nextStage;
+	if (!hasEmotions) nextStage = 'emotions';
+	else if (!hasActivities) nextStage = 'activities';
+	else if (!hasPhoto) nextStage = 'photo';
+	else if (!hasSleep) nextStage = 'sleep';
+	else nextStage = 'wrap';
+
+	flow.stage = nextStage;
 	return await setFlow(env, chatId, flow);
 }
 
@@ -145,3 +194,35 @@ export async function isAwaitingPhoto(env, chatId) {
 }
 
 export { FLOW_TTL_SECONDS, STALL_THRESHOLD_MS };
+
+/**
+ * Map a flow's start time to a dynamic period label like "this morning",
+ * "this afternoon", "this evening", or "tonight".
+ *
+ * Used by mood prompts (micro-acks and synthesis) so the model has timing
+ * context without hardcoded "evening" / "tonight" assumptions. The check-in
+ * can be triggered by the morning cron, midday cron, evening cron, or the
+ * manual /mood command at any time of day — the period label adapts.
+ *
+ * Computed in Europe/London. Returns one of:
+ *   "this morning"   (00:00 - 11:59 London)
+ *   "this afternoon" (12:00 - 16:59 London)
+ *   "this evening"   (17:00 - 21:59 London)
+ *   "tonight"        (22:00 - 23:59 London)
+ *
+ * @param {number} startedAtMs - Unix ms timestamp of when the flow started
+ * @returns {string} Period label, e.g. "this evening"
+ */
+export function getCheckinTiming(startedAtMs) {
+	const d = new Date(startedAtMs || Date.now());
+	const hourStr = d.toLocaleString('en-GB', {
+		timeZone: 'Europe/London',
+		hour: '2-digit',
+		hour12: false,
+	});
+	const hour = parseInt(hourStr, 10);
+	if (hour < 12) return 'this morning';
+	if (hour < 17) return 'this afternoon';
+	if (hour < 22) return 'this evening';
+	return 'tonight';
+}

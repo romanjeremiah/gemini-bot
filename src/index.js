@@ -571,109 +571,54 @@ async function handleMoodPollAnswer(userId, chatId, threadId, score, env, source
 	// vs casual chat-driven entries apart.
 	await moodStore.upsertEntry(env, userId, today, 'evening', { mood_score: score, source });
 
-	// Build context-aware response using recent mood history and memories
-	const moodHistory = await moodStore.getHistory(env, userId, 30);
-	// Mood poll answers are inherently warm-register — the user is reporting
-	// emotional state. Use 'warm' mode so therapeutic memories surface.
-	const memCtxResult = await memoryStore.getFormattedContext(env, userId, 'warm');
-	const memoryCtx = memCtxResult?.ctx || '';
-	const semanticCtx = await vectorStore.getSemanticContext(env, userId, `mood score ${score} how I feel`);
-	const therapeuticNotes = await env.DB.prepare(
-		`SELECT category, fact FROM memories WHERE user_id = ? AND category IN ('pattern','trigger','schema','insight','homework') ORDER BY created_at DESC LIMIT 10`
-	).bind(userId).all().then(r => r.results || []);
+	// Advance the deterministic flow tracker. Score has landed; next missing
+	// piece is normally 'emotions' (the buttons sent below capture them).
+	await moodFlow.advanceStage(env, chatId, userId).catch((e) => {
+		log.warn('mood_flow_advance_failed', { msg: e.message, where: 'after_score' });
+	});
 
-	const recentScores = moodHistory.slice(0, 7).map(e => {
-		const parsed = typeof e.data === 'string' ? JSON.parse(e.data || '{}') : (e.data || {});
-		const emotions = parsed.emotions?.length ? '(' + parsed.emotions.join(', ') + ')' : '';
-		return `${e.date}: ${parsed.mood_score ?? '?'}/10 ${emotions}`;
-	}).join('\n');
-
-	const clinicalNotes = therapeuticNotes.map(n => `[${n.category}] ${n.fact}`).join('\n');
-
-	// Retrieve relevant past episodes (CoALA episodic memory)
-	const relevantEpisodes = await episodeStore.getRecentEpisodes(env, userId, 5, score <= 3 ? 'crisis' : null).catch(() => []);
-	const episodeCtx = episodeStore.formatEpisodesForContext(relevantEpisodes);
-
-	let contextPrompt;
-	if (score <= 1) {
-		contextPrompt = `CRISIS RESPONSE. The user scored ${score}/10 (severe depression/crisis).
-Recent mood history:\n${recentScores}
-Clinical notes:\n${clinicalNotes}
-${episodeCtx}
-${semanticCtx}
-
-Respond with deep compassion. Mention Samaritans (116 123) and SHOUT (text 85258). If past episodes show what helped before, reference that gently. Ask what has been weighing on them.`;
-	} else if (score >= 9) {
-		contextPrompt = `MANIA ALERT. The user scored ${score}/10 (mania/hypomania).
-Recent mood history:\n${recentScores}
-Clinical notes:\n${clinicalNotes}
-${episodeCtx}
-${semanticCtx}
-
-Acknowledge calmly without amplifying the energy. Ask ONE question about sleep or safety. Note any escalating pattern. If past episodes show precedent, reference it.`;
-	} else {
-		contextPrompt = `The user just logged their mood as ${score}/10 on the bipolar scale. Analyse the data below and respond with a meaningful, grounded acknowledgement.
-
-TODAY:
-Mood score: ${score}/10
-
-RECENT MOOD HISTORY:
-${recentScores}
-
-${clinicalNotes ? 'Clinical notes:\n' + clinicalNotes : '(No therapeutic notes on file yet.)'}
-
-${episodeCtx || '(No past episodes to reference.)'}
-
-${semanticCtx || ''}
-
-YOUR RESPONSE (3-5 sentences, natural prose, not a bulleted list):
-1. Acknowledge the score without repeating it numerically. If it stands out against recent days (up, down, stable), note that briefly.
-2. If therapeutic notes or past episodes reveal a pattern relevant to this score, weave one observation in — without sounding clinical.
-3. End with a question that invites the user to say more, worded naturally. Ask EXACTLY one question.
-
-After your message, the user will be shown Positive/Negative emotion buttons to tap — do NOT ask about emotions in your text; the buttons handle that.
-
-Do not mention the data structure, the score number more than once, or how you generated this analysis. Just speak.`;
-	}
-
+	// Light micro-acknowledgement on Workers AI. 2-tier Cloudflare-only cascade,
+	// ~1-3s realistic latency, falls through to static text if both tiers fail.
+	// The deeper therapeutic synthesis fires at the END of the flow once all
+	// pieces are collected (see moodSynthesis.maybeFireSynthesis).
+	const { runScoreAck } = await import('./services/moodMicroAck');
+	const flow = await moodFlow.getFlow(env, chatId);
+	let ackText;
 	try {
-		// Pro + medium thinking for initial mood analysis (matching Eukara).
-		// Clinical concern scores (0-1, 9-10) and normal range all get Pro-quality analysis.
-		const response = await generateDeepResponse(contextPrompt, personas.xaridotis.instruction, env, {
-			thinkingLevel: 'medium',
-			maxOutputTokens: 1500,
-		});
-		const aiMsg = response || 'Tap below to tell me about your emotions.';
-
-		// Show emotion buttons for normal range (2-8)
-		const btns = (score >= 2 && score <= 8) ? {
-			inline_keyboard: [[
-				{ text: '☀️ Positive', callback_data: 'mood_cat_positive', style: 'success' },
-				{ text: '🌧 Negative', callback_data: 'mood_cat_negative', style: 'danger' }
-			]]
-		} : undefined;
-
-		await telegram.sendMessage(chatId, threadId, aiMsg, env, null, btns);
-
-		// Persist in history so the user's next message has context about the check-in.
-		// Synthetic user turn labels the mood logging event without re-encoding the poll.
-		const threadKey = `chat_${chatId}_${threadId}`;
-		let hist = await env.CHAT_KV.get(threadKey, { type: 'json' }) || [];
-		hist.push({ role: 'user', parts: [{ text: `[I just logged my mood as ${score}/10]` }] });
-		hist.push({ role: 'model', parts: [{ text: aiMsg }] });
-		if (hist.length > 24) hist = hist.slice(-24);
-		await env.CHAT_KV.put(threadKey, JSON.stringify(hist), { expirationTtl: 604800 });
-
-		log.info('mood_analysis_sent', { userId, score, analysisLen: aiMsg.length });
+		ackText = await runScoreAck(env, userId, score, flow, personas.xaridotis.instruction);
 	} catch (e) {
-		log.error('mood_poll_response_error', { msg: e.message });
-		await telegram.sendMessage(chatId, threadId, 'How are your emotions today?', env, null, {
-			inline_keyboard: [[
-				{ text: '☀️ Positive', callback_data: 'mood_cat_positive', style: 'success' },
-				{ text: '🌧 Negative', callback_data: 'mood_cat_negative', style: 'danger' }
-			]]
-		});
+		log.error('mood_score_ack_error', { msg: e.message });
+		ackText = 'Got it. Tap below to share what you are feeling.';
 	}
+
+	// Show emotion buttons for normal range (2-8). Crisis/mania scores skip the
+	// buttons — the persona handles severity tone in the ack itself.
+	const btns = (score >= 2 && score <= 8) ? {
+		inline_keyboard: [[
+			{ text: '☀️ Positive', callback_data: 'mood_cat_positive', style: 'success' },
+			{ text: '🌧 Negative', callback_data: 'mood_cat_negative', style: 'danger' }
+		]]
+	} : undefined;
+
+	await telegram.sendMessage(chatId, threadId, ackText, env, null, btns);
+
+	// Persist in history so the user's next message has context about the check-in.
+	const threadKey = `chat_${chatId}_${threadId}`;
+	let hist = await env.CHAT_KV.get(threadKey, { type: 'json' }) || [];
+	hist.push({ role: 'user', parts: [{ text: `[I just logged my mood as ${score}/10]` }] });
+	hist.push({ role: 'model', parts: [{ text: ackText }] });
+	if (hist.length > 24) hist = hist.slice(-24);
+	await env.CHAT_KV.put(threadKey, JSON.stringify(hist), { expirationTtl: 604800 });
+
+	// If for some reason emotions are already logged elsewhere today, the day
+	// could be complete after the score lands. Check now so we don't strand a
+	// completed check-in waiting for emotion buttons that were already answered.
+	const { maybeFireSynthesis } = await import('./services/moodSynthesis');
+	await maybeFireSynthesis(env, chatId, userId, threadId).catch((e) => {
+		log.warn('mood_synthesis_fire_failed', { msg: e.message, where: 'after_score' });
+	});
+
+	log.info('mood_score_handled', { userId, score, ackLen: ackText.length });
 }
 
 // ---- Spontaneous "Thinking of You" Outreach ----
@@ -1893,160 +1838,72 @@ export default {
 						}
 						throw mpErr; // re-throw for queue retry
 					}
-				} else if (task.type === 'mood_synthesis_after_emotions') {
-					// Pro+thinking therapeutic synthesis after emotion buttons. Moved to the
-					// queue on 2026-05-06 because the inline waitUntil path was being
-					// cancelled at the 30s ceiling — synthesis itself is 10-25s, and the
-					// downstream kick (mood_kick_after_emotions) added another 5-15s on
-					// top, blowing the budget. Each step now has 15-min wall clock and 3
-					// retries.
-					const { chatId: mchatId, userId: muserId, threadId: mthreadId, msgId: mmsgId,
-						chatType: mchatType, messageThreadId: mmessageThreadId, fromUser: mfromUser,
-						selected: mselected } = task;
-					log.info('queue_mood_synthesis_start', { chatId: mchatId, emotionsCount: mselected?.length || 0 });
-					try {
-						await telegram.sendChatAction(mchatId, mthreadId, 'typing', env).catch(() => {});
-						const today = moodStore.todayLondon();
+				} else if (task.type === 'mood_synthesis_final') {
+					// End-of-flow synthesis. Fired once per check-in once ALL pieces are
+					// collected (score, emotions, activities, sleep, photo-or-skipped).
+					// 6-tier cascade (Llama → Gemma → Flash-Lite → Flash → Pro → fixed).
+					// Looped typing indicator keeps the user aware while the model thinks.
+					const { chatId: sChatId, userId: sUserId, threadId: sThreadId, startedAtMs: sStartedAtMs } = task;
+					log.info('queue_mood_synthesis_final_start', { chatId: sChatId, userId: sUserId });
 
-						// Re-derive context fresh from D1/KV/Vectorize (don't trust cached state
-						// from the callback handler — the queue could fire minutes later).
-						const negativeList = ['devastated', 'empty', 'frustrated', 'scared', 'angry', 'depressed', 'sad', 'anxious', 'annoyed', 'insecure', 'lonely', 'confused', 'tired', 'bored', 'nervous', 'disappointed', 'lost'];
-						const negSelected = (mselected || []).filter(e => negativeList.includes(e));
-						const posSelected = (mselected || []).filter(e => !negativeList.includes(e));
-
-						const recentEntries = await moodStore.getHistory(env, muserId, 30, 'evening').catch(() => []);
-						let pastContext = 'No previous check-ins found.';
-						if (recentEntries.length > 1) {
-							const summaries = recentEntries.slice(0, 10).map(e => {
-								const parsed = typeof e.data === 'string' ? JSON.parse(e.data || '{}') : (e.data || {});
-								return `${e.date}: score ${parsed.mood_score ?? '?'}, emotions: ${parsed.emotions || 'none'}`;
-							}).join(' | ');
-							pastContext = `Recent evening check-ins (up to 30 days): ${summaries}`;
+					// Looped typing indicator: send every 4s while synthesis runs.
+					// Telegram's typing indicator fades after ~5s; loop keeps it visible
+					// across the realistic 5-15s synthesis time and even longer cascade fallbacks.
+					let typingActive = true;
+					const typingLoop = (async () => {
+						while (typingActive) {
+							await telegram.sendChatAction(sChatId, sThreadId, 'typing', env).catch(() => {});
+							await new Promise((r) => setTimeout(r, 4000));
 						}
+					})();
 
-						const therapeuticNotes = await env.DB.prepare(
-							`SELECT category, fact FROM memories WHERE user_id = ? AND category IN ('pattern','trigger','schema','insight','homework','growth') ORDER BY created_at DESC LIMIT 10`
-						).bind(muserId).all().then(r => r.results || []).catch(() => []);
-						const clinicalCtx = therapeuticNotes.length
-							? 'Clinical notes:\n' + therapeuticNotes.map(n => `[${n.category}] ${n.fact}`).join('\n')
-							: '';
+					try {
+						const { runSynthesisCascade } = await import('./services/moodSynthesis');
+						const result = await runSynthesisCascade(
+							env,
+							sUserId,
+							sStartedAtMs,
+							personas.xaridotis.instruction,
+						);
+						typingActive = false;
+						await telegram.sendMessage(sChatId, sThreadId, result.text, env);
 
-						const emotionQuery = [...negSelected, ...posSelected].join(' ') || 'mood emotions feelings';
-						const semanticCtx = await vectorStore.getSemanticContext(env, muserId, emotionQuery).catch(() => '');
+						// Persist in chat history so the next message has context.
+						const histKey = `chat_${sChatId}_${sThreadId}`;
+						let sHist = await env.CHAT_KV.get(histKey, { type: 'json' }) || [];
+						sHist.push({ role: 'user', parts: [{ text: '[I finished my mood check-in for the day]' }] });
+						sHist.push({ role: 'model', parts: [{ text: result.text }] });
+						if (sHist.length > 24) sHist = sHist.slice(-24);
+						await env.CHAT_KV.put(histKey, JSON.stringify(sHist), { expirationTtl: 604800 });
 
-						const allEmotions = [...negSelected, ...posSelected];
-						const relevantEpisodes = allEmotions.length
-							? await episodeStore.getEpisodesByEmotion(env, muserId, allEmotions, 5).catch(() => [])
-							: await episodeStore.getRecentEpisodes(env, muserId, 5).catch(() => []);
-						const episodeCtx = episodeStore.formatEpisodesForContext(relevantEpisodes);
+						// End the flow now that the day is wrapped.
+						await moodFlow.endFlow(env, sChatId).catch(() => {});
 
-						const todayEntry = await moodStore.getEntry(env, muserId, today, 'evening').catch(() => null);
-						const todayParsed = todayEntry?.data ? (typeof todayEntry.data === 'string' ? JSON.parse(todayEntry.data) : todayEntry.data) : {};
-						const todayScore = todayParsed.mood_score;
-
-						const contextPrompt = `The user just completed their full mood check-in. Analyse everything and give a meaningful therapeutic summary.
-
-TODAY'S CHECK-IN:
-Mood score: ${todayScore ?? 'not recorded'}/10
-Positive emotions: ${posSelected.length > 0 ? posSelected.join(', ') : 'none selected'}
-Negative emotions: ${negSelected.length > 0 ? negSelected.join(', ') : 'none selected'}
-
-RECENT MOOD HISTORY:
-${pastContext}
-
-${clinicalCtx}
-
-${episodeCtx}
-
-${semanticCtx}
-
-YOUR RESPONSE (follow this structure naturally, not as a list):
-1. Acknowledge what they shared today. Name the emotions they selected. If the mix of positive and negative is notable (e.g. "inspired but lonely"), explore that tension.
-2. Compare to recent days. Is the score trending up, down, or stable? Are certain emotions recurring? Note any patterns without being clinical.
-3. If past episodes are available, reference what happened in similar emotional states before. What helped? What didn't? Use this to inform your suggestion.
-4. Draw one therapeutic observation. Connect today's emotions to known patterns, triggers, or schemas from the clinical notes. Use therapeutic frameworks (AEDP, IFS, schema therapy) as lenses for YOUR thinking — do NOT name them to the user.
-5. End with ONE natural question that invites deeper conversation but doesn't pressure.
-
-Keep it warm, direct, and personal. 3-5 sentences. No bullet points. No clinical jargon unless it adds genuine insight. You know this person well.`;
-
-						const response = await generateDeepResponse(contextPrompt, personas.xaridotis.instruction, env, {
-							thinkingLevel: 'high',
-							maxOutputTokens: 2000,
+						log.info('queue_mood_synthesis_final_done', {
+							chatId: sChatId,
+							source: result.source,
+							ms: result.ms,
+							len: result.text.length,
 						});
-						const synthesis = response || `Thank you for sharing. What has been on your mind today?`;
-						await telegram.sendMessage(mchatId, mthreadId, synthesis, env);
-
-						// Persist synthetic user turn + synthesis in chat history.
-						const selectionLabel = (mselected || []).length
-							? `[I finished my check-in. Selected emotions: ${mselected.join(', ')}]`
-							: `[I finished my check-in without selecting specific emotions]`;
-						const histKey = `chat_${mchatId}_${mthreadId}`;
-						let hist = await env.CHAT_KV.get(histKey, { type: 'json' }) || [];
-						hist.push({ role: 'user', parts: [{ text: selectionLabel }] });
-						hist.push({ role: 'model', parts: [{ text: synthesis }] });
-						if (hist.length > 24) hist = hist.slice(-24);
-						await env.CHAT_KV.put(histKey, JSON.stringify(hist), { expirationTtl: 604800 });
-
-						log.info('mood_synthesis_sent', { userId: muserId, emotionsCount: (mselected || []).length, synthesisLen: synthesis.length });
-
-						// Enqueue the kick as a SEPARATE queue message so synthesis success
-						// doesn't get rolled back if the kick fails. Each step has its own
-						// retry budget.
-						if (env.TASK_QUEUE) {
-							await env.TASK_QUEUE.send({
-								type: 'mood_kick_after_emotions',
-								chatId: mchatId,
-								userId: muserId,
-								threadId: mthreadId,
-								msgId: mmsgId,
-								chatType: mchatType,
-								messageThreadId: mmessageThreadId,
-								fromUser: mfromUser,
-							});
-							log.info('mood_kick_queued', { chatId: mchatId });
-						}
-						log.info('queue_mood_synthesis_done', { chatId: mchatId });
-					} catch (synErr) {
+					} catch (synthErr) {
+						typingActive = false;
 						const attempts = msg.attempts || 1;
-						log.error('queue_mood_synthesis_error', { chatId: mchatId, attempt: attempts, msg: synErr.message });
+						log.error('queue_mood_synthesis_final_error', {
+							chatId: sChatId,
+							attempt: attempts,
+							msg: synthErr.message,
+						});
 						if (attempts >= 3) {
-							// Final retry failed — send a brief acknowledgement so the user
-							// isn't left hanging. The deeper synthesis is lost but the flow
-							// can still continue.
-							const fallback = (mselected || []).length
-								? `You selected: ${mselected.join(', ')}. What has been driving those feelings?`
-								: 'What has been on your mind today?';
-							await telegram.sendMessage(mchatId, mthreadId, fallback, env).catch(() => {});
+							const { FIXED_FALLBACK_TEXT } = await import('./services/moodSynthesis');
+							await telegram.sendMessage(sChatId, sThreadId, FIXED_FALLBACK_TEXT, env).catch(() => {});
+							await moodFlow.endFlow(env, sChatId).catch(() => {});
 						}
-						throw synErr;
-					}
-
-				} else if (task.type === 'mood_kick_after_emotions') {
-					// After the synthesis was sent, kick handleMessage so the AI picks up
-					// the HARD RULES roadmap and continues the check-in (activities →
-					// sleep → photo → commit). Runs in its own queue invocation so it
-					// has a fresh 15-min budget independent of the synthesis call.
-					const { chatId: kchatId, threadId: kthreadId, msgId: kmsgId,
-						chatType: kchatType, messageThreadId: kmessageThreadId, fromUser: kfromUser } = task;
-					log.info('queue_mood_kick_start', { chatId: kchatId });
-					try {
-						await telegram.sendChatAction(kchatId, kthreadId, 'typing', env).catch(() => {});
-						const kickMsg = {
-							chat: { id: kchatId, type: kchatType },
-							from: kfromUser,
-							message_id: kmsgId,
-							message_thread_id: kmessageThreadId,
-							text: '[Emotion selection complete. Continue the check-in by performing the NEXT REQUIRED ACTION from the HARD RULES roadmap.]',
-						};
-						await handleMessage(kickMsg, env);
-						log.info('queue_mood_kick_done', { chatId: kchatId });
-					} catch (kickErr) {
-						const attempts = msg.attempts || 1;
-						log.error('queue_mood_kick_error', { chatId: kchatId, attempt: attempts, msg: kickErr.message });
-						// Don't notify the user on kick failure — the synthesis already
-						// landed and the user can resume the check-in by typing a reply.
-						// Just log and re-throw for queue retry.
-						throw kickErr;
+						throw synthErr;
+					} finally {
+						typingActive = false;
+						// Best-effort drain so the loop's pending setTimeout doesn't keep
+						// the worker alive past task completion.
+						await typingLoop.catch(() => {});
 					}
 
 				} else if (task.type === 'mood_flow_safety_net') {

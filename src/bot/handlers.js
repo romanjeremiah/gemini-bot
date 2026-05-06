@@ -1644,8 +1644,29 @@ export async function handleMessage(msg, env) {
 								if (flow?.photo?.msg_id) {
 									await telegram.editMessage(chatId, flow.photo.msg_id, 'Photo received. ✓', env, { inline_keyboard: [] }).catch(() => {});
 								}
-								await moodFlow.setStage(env, chatId, 'wrap');
+								// Advance to the next missing piece. Was hardcoded to 'wrap',
+								// which was wrong if sleep wasn't logged yet — the safety net
+								// would jump straight to wrap-up and skip the sleep ask.
+								await moodFlow.advanceStage(env, chatId, userId).catch((e) => {
+									log.warn('mood_flow_advance_failed', { msg: e.message, where: 'after_photo_upload' });
+								});
 								log.info('photo_linked_to_journal', { chatId, key: storedKey });
+
+								// Day-completeness check: if all pieces are in, fire the synthesis.
+								// Otherwise drive the next deterministic step (typically sleep ask).
+								const { maybeFireSynthesis } = await import('../services/moodSynthesis');
+								const fired = await maybeFireSynthesis(env, chatId, userId, threadId).catch((e) => {
+									log.warn('mood_synthesis_fire_failed', { msg: e.message, where: 'after_photo_upload' });
+									return false;
+								});
+
+								if (!fired) {
+									await driveNextDeterministicStep(env, chatId, userId, threadId);
+								}
+
+								// Photo handling is now self-contained — we don't fall through to
+								// the regular AI generation pipeline. Stop the handleMessage flow.
+								return;
 							}
 						} catch (linkErr) {
 							log.warn('photo_link_failed', { msg: linkErr.message });
@@ -2058,17 +2079,23 @@ async function handleActivitiesCallback(data, callbackQuery, env) {
 		await moodFlow.clearActivitiesPending(env, chatId);
 		log.info('activities_committed', { chatId, added: added.length, removed: removed.length });
 
-		// Hand back to the AI with a synthetic user turn describing what was logged.
-		// This lets Xaridotis comment naturally and decide the next step (sleep / photo).
-		const syntheticText = `[I just updated my activities for today. ${summary}]`;
-		const syntheticMsg = {
-			chat: { id: chatId, type: callbackQuery.message.chat.type },
-			from: callbackQuery.from,
-			message_id: msgId,
-			message_thread_id: callbackQuery.message.message_thread_id,
-			text: syntheticText,
-		};
-		await handleMessage(syntheticMsg, env);
+		// Advance flow stage now that activities are committed. Next missing
+		// piece is photo, sleep, or wrap depending on what's already in D1.
+		await moodFlow.advanceStage(env, chatId, userId).catch((e) => {
+			log.warn('mood_flow_advance_failed', { msg: e.message, where: 'after_activities' });
+		});
+
+		// Day-completeness check: if all pieces are in, fire the synthesis.
+		// Otherwise drive the next deterministic step (photo or sleep). No AI here.
+		const { maybeFireSynthesis } = await import('../services/moodSynthesis');
+		const fired = await maybeFireSynthesis(env, chatId, userId, threadId).catch((e) => {
+			log.warn('mood_synthesis_fire_failed', { msg: e.message, where: 'after_activities' });
+			return false;
+		});
+
+		if (!fired) {
+			await driveNextDeterministicStep(env, chatId, userId, threadId);
+		}
 		return;
 	}
 
@@ -2106,20 +2133,103 @@ function labelOf(key) {
 
 async function handlePhotoSkipCallback(callbackQuery, env) {
 	const chatId = callbackQuery.message.chat.id;
+	const userId = callbackQuery.from?.id || chatId;
 	const msgId = callbackQuery.message.message_id;
 	await moodFlow.markPhotoSkipped(env, chatId);
+	// Advance flow stage past photo. Next missing piece is normally sleep,
+	// or wrap if sleep is already logged.
+	await moodFlow.advanceStage(env, chatId, userId).catch((e) => {
+		log.warn('mood_flow_advance_failed', { msg: e.message, where: 'after_photo_skip' });
+	});
 	await telegram.editMessage(chatId, msgId, 'Photo skipped for today.', env, { inline_keyboard: [] });
 	log.info('photo_skipped', { chatId });
 
-	// Hand back to AI for wrap-up
-	const syntheticMsg = {
-		chat: { id: chatId, type: callbackQuery.message.chat.type },
-		from: callbackQuery.from,
-		message_id: msgId,
-		message_thread_id: callbackQuery.message.message_thread_id,
-		text: '[I skipped the photo for today.]',
-	};
-	await handleMessage(syntheticMsg, env);
+	const threadId = callbackQuery.message.message_thread_id || 'default';
+
+	// Day-completeness check: if all pieces are now in, fire the final synthesis.
+	// Otherwise drive the next deterministic step (typically a sleep ask).
+	const { maybeFireSynthesis } = await import('../services/moodSynthesis');
+	const fired = await maybeFireSynthesis(env, chatId, userId, threadId).catch((e) => {
+		log.warn('mood_synthesis_fire_failed', { msg: e.message, where: 'after_photo_skip' });
+		return false;
+	});
+
+	if (!fired) {
+		await driveNextDeterministicStep(env, chatId, userId, threadId);
+	}
+}
+
+/**
+ * Drive the next deterministic step in the mood check-in flow.
+ *
+ * Reads day-level completeness from D1 + flow state, then either sends the
+ * right keyboard (activities or photo) or the right prose ask (sleep), or
+ * does nothing if the day is already complete (in which case the synthesis
+ * trigger handles the wrap-up separately).
+ *
+ * No AI calls. Pure flow-routing logic. The point of this helper is to
+ * replace the old "kick handleMessage and hope the AI calls the right tool"
+ * pattern with explicit deterministic transitions.
+ *
+ * Order checked:
+ *   1. activities missing  -> send activities keyboard
+ *   2. photo missing       -> send photo request
+ *   3. sleep missing       -> ask in prose (user reply triggers log_mood_entry)
+ *   4. nothing missing     -> no-op (synthesis trigger fires elsewhere)
+ */
+async function driveNextDeterministicStep(env, chatId, userId, threadId) {
+	try {
+		const today = moodStore.todayLondon();
+		const flow = await moodFlow.getFlow(env, chatId);
+		const dayEntries = await moodStore.getDayEntries(env, userId, today).catch(() => []);
+
+		// Walk all of today's rows for each piece (day-level completeness).
+		let hasActivities = false;
+		let hasPhoto = false;
+		let hasSleep = false;
+		for (const row of dayEntries) {
+			if (!hasActivities && row.activities && row.activities !== '[]' && row.activities !== 'null') {
+				try {
+					const parsed = JSON.parse(row.activities);
+					if (Array.isArray(parsed) && parsed.length > 0) hasActivities = true;
+				} catch { /* skip */ }
+			}
+			if (!hasPhoto && row.photo_r2_key) hasPhoto = true;
+			if (!hasSleep && row.sleep_hours !== null && row.sleep_hours !== undefined) hasSleep = true;
+		}
+		const photoOk = hasPhoto || flow?.photo?.skipped === true;
+
+		if (!hasActivities) {
+			const { sendActivitiesKeyboardTool } = await import('../tools/moodKeyboards');
+			await telegram.sendMessage(chatId, threadId, 'Tap any activities you did today.', env);
+			await sendActivitiesKeyboardTool.execute({ preamble: 'Tap any that fit, then ✓ Done.' }, env, {
+				chatId, userId, source: flow?.source || 'cron_poll',
+			});
+			log.info('drive_step_activities', { chatId });
+			return;
+		}
+
+		if (!photoOk) {
+			const { sendPhotoRequestTool } = await import('../tools/moodKeyboards');
+			await telegram.sendMessage(chatId, threadId, 'A photo from today? Tap Skip if you would rather not.', env);
+			await sendPhotoRequestTool.execute({ preamble: 'Send any photo, or tap Skip.' }, env, {
+				chatId, userId, source: flow?.source || 'cron_poll',
+			});
+			log.info('drive_step_photo', { chatId });
+			return;
+		}
+
+		if (!hasSleep) {
+			await telegram.sendMessage(chatId, threadId, 'How many hours did you sleep last night?', env);
+			log.info('drive_step_sleep', { chatId });
+			return;
+		}
+
+		// All pieces present — the synthesis trigger should fire elsewhere; no-op.
+		log.info('drive_step_noop', { chatId });
+	} catch (e) {
+		log.warn('drive_step_failed', { chatId, msg: e.message });
+	}
 }
 
 export async function handleCallback(callbackQuery, env) {
@@ -2493,6 +2603,14 @@ export async function handleCallback(callbackQuery, env) {
 				await moodStore.upsertEntry(env, userId, today, 'evening', { emotions: JSON.stringify(selected) });
 				log.info('mood_emotions_logged', { userId, emotions: selected });
 
+				// Advance the deterministic flow tracker. Emotions have landed; the
+				// stage now reflects whatever piece is missing next (activities,
+				// photo, sleep, or wrap). Without this, the safety net would still
+				// see stage='score' or 'emotions' and pick the wrong recovery path.
+				await moodFlow.advanceStage(env, chatId, userId).catch((e) => {
+					log.warn('mood_flow_advance_failed', { msg: e.message, where: 'after_emotions' });
+				});
+
 				// Background tagger (CF AI, free) — fire-and-forget, fits inside waitUntil.
 				import('../services/cfAi').then(async ({ tagMoodEntry }) => {
 					const todayEntry = await moodStore.getEntry(env, userId, today, 'evening').catch(() => null);
@@ -2507,46 +2625,41 @@ export async function handleCallback(callbackQuery, env) {
 
 			await env.CHAT_KV.delete(`mood_emo_selected_${chatId}`);
 
-			// Hand off the Pro+thinking synthesis to the queue. Reasons:
-			//   1. The synthesis call is 10-25s on Pro+high thinking. The downstream
-			//      kick that follows is another 5-15s on a full handleMessage pass.
-			//      Together they exceed the 30s waitUntil budget — confirmed by the
-			//      "waitUntil() tasks did not complete" cancellation we hit on
-			//      2026-05-06.
-			//   2. Each step gets its own 15-min queue budget and 3 retries.
-			//   3. If kick fails, retrying the kick alone is safe — the synthesis
-			//      message has already been sent to the user.
-			if (env.TASK_QUEUE) {
-				try {
-					await env.TASK_QUEUE.send({
-						type: 'mood_synthesis_after_emotions',
-						chatId,
-						userId,
-						threadId,
-						msgId,
-						chatType: callbackQuery.message.chat.type,
-						messageThreadId: callbackQuery.message.message_thread_id,
-						fromUser: callbackQuery.from,
-						selected,
-					});
-					log.info('mood_synthesis_queued', { chatId, emotionsCount: selected.length });
-				} catch (queueErr) {
-					log.warn('mood_synthesis_queue_failed', { msg: queueErr.message });
-					// Last-resort fallback: a brief acknowledgement so the user isn't
-					// left staring at a dead chat. The detailed synthesis won't run
-					// because the queue is unavailable.
-					const fallback = selected.length
-						? `You selected: ${selected.join(', ')}. What has been driving those feelings?`
-						: 'What has been on your mind today?';
-					await telegram.sendMessage(chatId, threadId, fallback, env).catch(() => {});
-				}
-			} else {
-				// No queue binding configured. Send a brief acknowledgement so the
-				// flow doesn't feel broken to the user.
-				const noqueue = selected.length
-					? `You selected: ${selected.join(', ')}. What has been driving those feelings?`
-					: 'What has been on your mind today?';
-				await telegram.sendMessage(chatId, threadId, noqueue, env).catch(() => {});
+			// Light micro-acknowledgement on Workers AI. ~1-3s realistic latency.
+			// Falls through to a static text if both Cloudflare tiers fail.
+			const { runEmotionsAck } = await import('../services/moodMicroAck');
+			const flow = await moodFlow.getFlow(env, chatId);
+			let ackText;
+			try {
+				ackText = await runEmotionsAck(env, userId, selected, flow, personas.xaridotis.instruction);
+			} catch (e) {
+				log.error('mood_emotions_ack_error', { msg: e.message });
+				ackText = 'Got it.';
+			}
+			await telegram.sendMessage(chatId, threadId, ackText, env);
+
+			// Persist in chat history.
+			const histKey = `chat_${chatId}_${threadId}`;
+			let hist = await env.CHAT_KV.get(histKey, { type: 'json' }) || [];
+			const label = selected.length ? `[I selected emotions: ${selected.join(', ')}]` : '[I finished emotion selection without picking any]';
+			hist.push({ role: 'user', parts: [{ text: label }] });
+			hist.push({ role: 'model', parts: [{ text: ackText }] });
+			if (hist.length > 24) hist = hist.slice(-24);
+			await env.CHAT_KV.put(histKey, JSON.stringify(hist), { expirationTtl: 604800 });
+
+			// Day-completeness check: if the day is now fully covered, fire the final
+			// synthesis. Otherwise drive the next deterministic step (activities or
+			// photo or sleep) without going through the AI roadmap.
+			const { maybeFireSynthesis } = await import('../services/moodSynthesis');
+			const fired = await maybeFireSynthesis(env, chatId, userId, threadId).catch((e) => {
+				log.warn('mood_synthesis_fire_failed', { msg: e.message, where: 'after_emotions' });
+				return false;
+			});
+
+			if (!fired) {
+				// Synthesis not yet ready — advance the flow deterministically. Look at
+				// what's missing and send the right keyboard or prose ask.
+				await driveNextDeterministicStep(env, chatId, userId, threadId);
 			}
 		}
 

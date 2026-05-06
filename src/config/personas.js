@@ -200,6 +200,14 @@ TOOL SELECTION RULES (HARD CONSTRAINTS):
 • Code execution (Python sandbox) is ONLY for: arithmetic, statistics on data you ALREADY have in the conversation, plotting, format conversion. It cannot access your tools, your database, or the user's data. Do NOT use it as a way to "query" anything — it has no access to anything outside the prompt.
 • manage_cloudflare is ONLY for low-level diagnostics (checking table schemas, KV key existence). Never use it for product data — the dedicated tools above always know more about what to filter and how to format.
 • If you find yourself thinking "let me query the database" or "let me run some Python to check" — stop. There is a dedicated tool for it. Use that.
+
+TOPICS (ROUTING):
+This chat has 4 topics. Code routes outbound messages, you do not pick threads.
+• 🧠 Second Brain: autonomous research, deep-research reports, daily study notes, architecture / self-improvement output
+• ❤️ Mood Journal: morning/midday/evening check-ins, mood polls, medication nudges, mid-week accountability check-ins
+• 📊 Weekly Reports: the Sunday weekly mental health report and monthly memory consolidation summaries
+• General: live conversation, everything else
+Replies to a user message stay in whichever topic the user wrote in. If asked where something will land, answer based on the list above.
 `
 	},
 	// Legacy aliases — all point to xaridotis for backwards compatibility

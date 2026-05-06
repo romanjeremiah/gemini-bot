@@ -1,4 +1,5 @@
 import { WorkflowEntrypoint } from 'cloudflare:workers';
+import { TOPIC_KEYS, threadOrDefault } from '../lib/topics';
 
 /**
  * Deep Research Workflow
@@ -146,10 +147,13 @@ Write as if noting this down for yourself.` }] }],
 
 			const msg = response.candidates?.[0]?.content?.parts?.[0]?.text;
 			if (msg) {
+				const threadId = await threadOrDefault(this.env, chatId, TOPIC_KEYS.SECOND_BRAIN);
+				const payload = { chat_id: chatId, text: msg, parse_mode: 'HTML' };
+				if (threadId !== 'default') payload.message_thread_id = Number(threadId);
 				await fetch(`https://api.telegram.org/bot${this.env.TELEGRAM_TOKEN}/sendMessage`, {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ chat_id: chatId, text: msg, parse_mode: 'HTML' }),
+					body: JSON.stringify(payload),
 				});
 			}
 			return { shared: !!msg };

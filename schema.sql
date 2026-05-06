@@ -146,6 +146,7 @@ CREATE TABLE IF NOT EXISTS mood_journal (
     ai_observation TEXT,
     photo_r2_key TEXT,
     clinical_tags TEXT,
+    source TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );

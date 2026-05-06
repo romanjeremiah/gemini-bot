@@ -4,6 +4,592 @@ A log of significant engineering sessions on Xaridotis (gemini-bot). Most recent
 
 ================================================================================
 
+## 2026-05-05 (latest) — Mood flow tool-use bug: prompt fix attempt (Option 1)
+
+### What
+
+First live test of the AI-driven evening flow (the hybrid Option A+C from the
+entry below) failed at the activities step. After `mood_synthesis_sent`, the
+next user message routed to `gemini-3.1-flash-lite-preview` with
+`route_reason: "simple_message"`. The model **ignored** the
+`getCheckinRoadmap` instruction to call `send_activities_keyboard` and produced
+a 66-char generic text reply with `tool_calls: 0`. No errors — a clean
+success from the SDK's perspective. So the fallback chain in `c58d0f4` (which
+is error-gated) never fired.
+
+### Diagnosis (separated facts vs interpretation)
+
+**Facts:**
+- Flash-Lite supports tool use per Google's docs (Vertex AI + ai.google.dev),
+  and the Gemini CLI uses it as a routing classifier in production.
+- The router rule that picks Pro for `healthCheckinActive` requires the
+  message to ALSO match the emotional regex. "7" or "a few hours" does not.
+- The roadmap text was buried inside dynamicContext, after ~22KB of persona,
+  style card, memory, curator block, and other context.
+- Wording was soft ("ALWAYS prefer calling X over asking in prose") rather than
+  hard ("call X. Do NOT ask in prose.").
+
+**Interpretation (what we don't know for certain):**
+- Whether the failure was caused by (a) prompt position, (b) prompt wording,
+  (c) Flash-Lite's instruction-following weakness on long prompts, or (d) the
+  combination. We have one sample, not a distribution.
+
+### Options considered
+
+1. **Strengthen the prompt only** (chosen). Cheapest test. No router change,
+   no new fallback machinery, no behavioural risk.
+2. Add a quality-signal fallback: when check-in is active and Flash-Lite
+   responds with 0 tool calls + short text, retry on Flash. Real change but
+   narrowly scoped.
+3. Patch router: route active check-ins to Flash regardless of emotional
+   content. Costs slightly more per check-in turn.
+
+Roma's call: option 1 first, then escalate if it still fails.
+
+### What changed (commit pending)
+
+Replaced `getCheckinRoadmap` in `src/bot/handlers.js` (~line 268). New version:
+
+- Builds an **ordered** list of missing pieces: activities → sleep → photo.
+  Mood score and emotions are listed as `preCaptured` (state info, not
+  actionable), since they are poll/button-driven.
+- Surfaces the **single next required action** by name, not a list of
+  everything missing. This avoids the model trying to chain tool calls in one
+  turn (which interacts badly with `MAX_PASSES = 4`).
+- Wraps the directive in clearly delimited ALL-CAPS markers:
+  `=== EVENING CHECK-IN — HARD RULES (override anything else in this prompt) ===`
+- Imperative, tool-name-explicit wording: "NEXT REQUIRED ACTION: call
+  send_activities_keyboard. Do NOT ask about activities in prose. The tool is
+  the answer."
+- Five numbered rules: drop check-in if user changes topic; do exactly ONE
+  thing per turn; tool IS the question for activities/photo; sleep is
+  prose-then-tool; commit_journal_entry then wrap-up at the end.
+
+Dropped the "any final thoughts or notes" item (formerly required `entry.note`)
+because it was unbounded — it would always block `commit_journal_entry`. The
+wrap-up message naturally invites further conversation.
+
+No router change. No callback-handler change. No fallback machinery added.
+
+### How to test
+
+```
+cd ~/Documents/GitHub/gemini-bot
+npx wrangler deploy --minify
+```
+
+Then `/mood` → poll → emotions → Done. Watch `wrangler tail` for:
+
+| Signal                                                            | Pass condition                                |
+|-------------------------------------------------------------------|-----------------------------------------------|
+| `tool_calls > 0` and `tool_names` includes `send_activities_keyboard` on the post-emotions turn | Patch worked                                  |
+| `max_passes_hit` events                                           | Should stay at 0 — model isn't chaining tools |
+
+If `tool_calls: 0` again, position outweighs wording at this depth, and we
+escalate to option 2 (quality-signal fallback) or option 3 (router patch).
+
+### Risks acknowledged
+
+- **Position vs wording:** if it's truly position, no amount of wording fixes
+  it. We will know after one or two real check-ins.
+- **Cache churn:** `dynamicContext` already changes per turn (memory counts,
+  remaining items, etc.), so the new wording adds no new cache pressure. The
+  earlier worry was unfounded.
+- **Pro over-calling:** rules are state-gated by D1 reads, not model judgment.
+  The model can only call a tool the roadmap says is missing. State filtering
+  prevents hallucinated tool calls.
+- **Pass-cap interaction:** by surfacing only the NEXT action (not all missing
+  pieces), we explicitly discourage chaining. `MAX_PASSES = 4` should hold.
+
+### Status
+
+- [x] Patch applied to `src/bot/handlers.js` via `Filesystem:edit_file`
+- [x] Deployed via `npx wrangler deploy --minify`
+- [x] Live test: `/mood` → poll → emotions → Done
+- [x] Result: **flow stalled at synthesis again** — BUT not for the reason
+      we expected. Logs showed `mood_synthesis_sent` at 12:31:47, then
+      nothing for 25 minutes (just cron heartbeats). No `message_received`,
+      no `callback`, no `generation_complete`. The patched roadmap never
+      got a chance to fire because **`handleMessage` was never invoked.**
+      Diagnosis below.
+
+================================================================================
+
+## 2026-05-05 (latest+1) — Mood flow: emotions-done handler doesn't kick the AI
+
+### What
+
+The HARD RULES roadmap patch (entry above) was fundamentally sound but
+targeted the wrong layer. After clicking Done on the emotions buttons:
+
+1. `mood_emo_done` callback fires → logs emotions, runs Pro+high synthesis,
+   sends synthesis text. ✅ working.
+2. Handler then deletes `health_checkin_active_${chatId}` and returns. ⛔
+3. User reads the synthesis. They do not type anything because the bot's
+   message reads as a complete therapeutic reply, not an open question.
+4. Without a user message, `handleMessage` never runs, so the roadmap never
+   gets injected, so the AI never picks up the flow. The check-in dies
+   silently after the synthesis.
+
+The AI-driven design assumed *something* would invoke `handleMessage` after
+the synthesis. That "something" was meant to be the user's reply — but in
+practice the synthesis already feels like the natural end of the exchange.
+
+### What changed
+
+Two edits inside the `mood_emo_done` handler in `src/bot/handlers.js` (~line 2598):
+
+1. **Removed** the `await env.CHAT_KV.delete('health_checkin_active_${chatId}')`
+   line. The flag must survive past synthesis so the next handler invocation
+   sees an active check-in. `commit_journal_entry` now exclusively owns the
+   flag's lifecycle (this matches the original intent in the previous
+   session's design but had been broken by a stale early-clear).
+2. **Added** a synthetic-message kick after `mood_synthesis_sent` logs.
+   Constructs a fake msg object with text
+   `[Emotion selection complete. Continue the check-in by performing the
+   NEXT REQUIRED ACTION from the HARD RULES roadmap.]` and awaits
+   `handleMessage(kickMsg, env)`. The kick lands in the full handler pipeline
+   (tagger → memory → router → generation), which now sees an active
+   check-in flag and applies the patched roadmap with NEXT REQUIRED ACTION =
+   `send_activities_keyboard`.
+
+### Risks acknowledged before deploy
+
+- **Bracketed text and `stripLeakedThoughts`:** the kick text uses square
+  brackets, but the strip regex only matches a closed list of verbs
+  (`Noticing`, `Thinking`, etc.) — "Emotion" is not in the list, so it
+  survives. Verified.
+- **Latency:** the kick runs through the full pipeline (~5-10s) so the
+  activities keyboard appears a few seconds after the synthesis. Acceptable
+  for now; can add a typing indicator if it feels off.
+- **Rule 1 misread:** the HARD RULES say "if user's message is unrelated,
+  drop the check-in." A bracketed system kick is clearly not unrelated, but
+  Flash-Lite could still misread it. If we see `tool_calls: 0` again with
+  this kick, that's the failure mode — escalate to option 2 (quality-signal
+  fallback) or option 3 (router patch).
+
+### How to test
+
+```
+cd ~/Documents/GitHub/gemini-bot
+npx wrangler deploy --minify
+```
+
+Then `/mood` → poll → emotions → Done. Watch `wrangler tail` for these
+signals **in this order**:
+
+| Signal                                                                                          | Pass condition                              |
+|-------------------------------------------------------------------------------------------------|---------------------------------------------|
+| `mood_synthesis_sent`                                                                           | Synthesis still works                       |
+| `message_received` with text starting `[Emotion selection complete...`                          | Kick fired                                  |
+| `model_route_resolved` for that turn                                                            | Tells us which model handled the kick       |
+| `generation_complete` with `tool_names` including `send_activities_keyboard`                    | End-to-end working                          |
+| Activities keyboard message appears in Telegram                                                  | User-visible confirmation                   |
+
+If the kick fires but `tool_calls: 0` again on Flash-Lite, we know the
+position-vs-wording issue from the previous patch is still live and we need
+to address it with router or fallback machinery.
+
+### Status
+
+- [x] Patch applied to `src/bot/handlers.js` via `Filesystem:edit_file`
+- [x] Deployed via `npx wrangler deploy --minify`
+- [x] Live test: `/mood` → poll → emotions → Done
+- [x] Result: **synthesis sent successfully and kick fired**, BUT Cloudflare
+      cancelled the in-flight `waitUntil` tasks at the 30s ceiling. Logs:
+      `mood_synthesis_sent` → `message_received` (kick) →
+      `model_route_resolved` → `generation_start` → then
+      `(warn) waitUntil() tasks did not complete within the allowed time`.
+      Next entry below: queue migration.
+
+================================================================================
+
+## 2026-05-06 (latest+2) — Mood flow Plan A: full queue migration
+
+### What
+
+The kick patch (entry above) was correct in mechanism but doomed by
+architecture. Two heavy generations chained back-to-back inside one
+`waitUntil` window cannot fit the 30s post-response budget:
+
+- Pro+high-thinking synthesis: 10-25s
+- Full `handleMessage` pipeline (tagger, memory, route, cache, generation):
+  another 5-15s
+- Telegram callback responded in <1s, so the budget started counting from
+  the moment the synthesis began
+
+Result: synthesis sent, kick started, generation cancelled mid-stream.
+User saw synthesis, then nothing.
+
+Project notes already explicitly flag this constraint:
+
+> `ctx.waitUntil` ceiling is 30 seconds post-response (not configurable
+> `cpu_ms`). Media/async work must use Queues (15-min wall clock, 3 retries)
+> for reliability.
+
+I missed applying that pattern to the new emotion-flow chain and got
+bitten by it. Roma asked for the queue migration explicitly: "all the
+mood check steps should be on the queue".
+
+### Architecture decision: Plan A (queue) vs Plan B (Cloudflare Workflow)
+
+Weighed two architectures. Plan A: each heavy step becomes a `TASK_QUEUE`
+message, matching the existing `mood_poll_answer` pattern. ~30 min of work,
+low risk, no architectural lock-in. Plan B: full Cloudflare Workflow
+rewrite (already on the project's roadmap as a dedicated session).
+
+Chose A. Rationale:
+- Bug is a `waitUntil` exhaustion; queue solves that. Workflow solves it
+  AND many other things we didn't ask for.
+- Mid-debug refactor is the wrong time to switch architectures.
+- Workflow design needs answers to non-trivial questions (one workflow
+  per check-in vs per user, how Telegram callbacks wake a running
+  instance, state size, idempotency) — those belong in a dedicated
+  design session, not a panic patch.
+- Roma's project notes already define Workflows as "agreed for a
+  dedicated session" — keeping that scope for later.
+
+### What changed
+
+**`src/bot/handlers.js` — `mood_emo_done` callback handler (~line 2486):**
+
+From 110 lines (synthesis + history + kick) down to ~30 lines. Now does:
+1. Edit message markup
+2. Save emotions to D1 (`upsertEntry`)
+3. Fire-and-forget tagger (CF AI, free, ~500ms)
+4. Clear emo selected KV
+5. Enqueue `mood_synthesis_after_emotions` to TASK_QUEUE
+6. Return
+
+Total inline time: <1s. No Pro calls, no `handleMessage`, nothing that
+could stall the `waitUntil` budget.
+
+Fallback path: if `env.TASK_QUEUE` is missing or send fails, post a brief
+acknowledgement so the user isn't left staring at a dead chat. The deep
+synthesis is sacrificed in that edge case but the flow continues.
+
+**`src/index.js` — queue consumer (added 2 cases after `mood_poll_answer`):**
+
+1. `mood_synthesis_after_emotions`:
+   - Re-derives all context fresh from D1/KV/Vectorize (don't trust
+     cached state — the queue could fire minutes later in theory).
+     Pulls: today's entry, recent 30-day mood history, therapeutic notes,
+     semantic vector context, relevant past episodes by emotion.
+   - Builds the same therapeutic synthesis prompt as before.
+   - Calls `generateDeepResponse` with `thinkingLevel: 'high'`,
+     `maxOutputTokens: 2000` (Pro + high thinking, matching Eukara's pattern).
+   - Sends synthesis to Telegram.
+   - Persists synthetic user turn + synthesis in chat history KV.
+   - Enqueues `mood_kick_after_emotions` as a SEPARATE message so the
+     synthesis success can't be rolled back by a kick failure.
+   - On final retry (attempt 3) failure: sends a brief acknowledgement so
+     the user isn't hanging. Throws to retry queue otherwise.
+
+2. `mood_kick_after_emotions`:
+   - Builds the same synthetic kick message as before.
+   - Awaits `handleMessage(kickMsg, env)` — fresh 15-min budget.
+   - On failure: don't notify user (synthesis already landed). Re-throw
+     for queue retry. After 3 retries the user can simply type to resume
+     the flow naturally.
+
+### Why two queue messages instead of one
+
+Idempotency. If synthesis succeeds and kick fails, retrying ONLY the kick
+is safe — synthesis was already sent to Telegram, no duplicate. If we put
+both in one message, retrying after kick failure would re-run synthesis
+and send a duplicate to the user.
+
+Each message also gets its own 15-min budget and 3-retry budget. If Pro
+is slow on synthesis (e.g. 4-min preview overload), the kick still has a
+full 15 min when its turn comes.
+
+### Risks acknowledged
+
+- **Latency between synthesis and kick:** queue dispatch adds ~1-3s.
+  Acceptable; user is reading the synthesis during this window.
+- **Queue failure:** the inline fallback in `mood_emo_done` covers
+  TASK_QUEUE missing or send failing. The synthesis fallback covers
+  Pro generation failing. The kick has no user-facing fallback because
+  the synthesis is already there — user can type to resume.
+- **Context staleness:** queue context is re-derived fresh. The only
+  thing passed via the queue message is `selected` (the emotion array)
+  — everything else comes from D1/KV/Vectorize at queue-handler time.
+- **Existing `mood_flow_safety_net` queue task is now redundant** for the
+  immediate-after-emotions case (we no longer rely on the AI noticing the
+  flow on its own). It still serves as a safety net for genuinely stalled
+  flows (e.g. user starts then walks away). Leaving it in place.
+
+### How to test
+
+```
+cd ~/Documents/GitHub/gemini-bot
+npx wrangler deploy --minify
+```
+
+Then `/mood` → poll → emotions → Done. Watch `wrangler tail`. Expected log
+signal sequence:
+
+| Order | Signal                                                                       | Meaning                                          |
+|-------|------------------------------------------------------------------------------|--------------------------------------------------|
+| 1     | `mood_emotions_logged` (callback path)                                        | Emotions saved to D1                             |
+| 2     | `mood_synthesis_queued`                                                       | Callback handed off cleanly, returned in <1s     |
+| 3     | `queue_task_received` `type: "mood_synthesis_after_emotions"`                 | Queue picked up the task                         |
+| 4     | `queue_mood_synthesis_start`                                                  | Synthesis about to run                           |
+| 5     | `mood_synthesis_sent`                                                         | Synthesis delivered to Telegram                  |
+| 6     | `mood_kick_queued`                                                            | Kick enqueued as separate message                |
+| 7     | `queue_task_done` `type: "mood_synthesis_after_emotions"`                     | Synthesis step closed cleanly                    |
+| 8     | `queue_task_received` `type: "mood_kick_after_emotions"`                      | Kick picked up                                   |
+| 9     | `queue_mood_kick_start`                                                       | Kick about to run                                |
+| 10    | `message_received` (text starts with `[Emotion selection complete...`)        | Synthetic kick reached `handleMessage`           |
+| 11    | `model_route_resolved` (likely Pro via `checkin_with_emotion`)                | Routing kicked in                                |
+| 12    | `generation_complete` with `tool_names` including `send_activities_keyboard`  | HARD RULES roadmap fired correctly               |
+| 13    | Activities keyboard appears in Telegram                                       | User-visible confirmation                        |
+| 14    | `queue_mood_kick_done`, `queue_task_done`                                     | Chain complete                                   |
+
+Failure modes to recognise in logs:
+- Steps 1–7 succeed but step 8 never fires → kick never enqueued. Check
+  `mood_kick_queued` log presence.
+- Step 11 picks Flash-Lite → the existing position-vs-wording question
+  is still live; escalate to router patch or quality-signal fallback.
+- Any `waitUntil() tasks did not complete` warning → something is still
+  on the inline path that shouldn't be.
+
+### Status
+
+- [x] Patch applied to `src/bot/handlers.js` via `Filesystem:edit_file`
+- [x] Patch applied to `src/index.js` via `Filesystem:edit_file`
+- [ ] Deploy via `npx wrangler deploy --minify`
+- [ ] Live test: verify the 14-signal chain above
+- [ ] If pass: commit all three patches together (roadmap + kick + queue
+      migration); watch a few real cron-triggered evenings
+- [ ] If fail at step 12 (Flash-Lite ignores tools again): escalate to
+      router patch or quality-signal fallback (option 2 or 3 from the
+      previous entry)
+
+================================================================================
+
+## 2026-05-05 (later) — Evening mood check-in: source-based suppression + AI-driven flow with safety net
+
+### What
+
+Full redesign of the evening mood check-in. Two problems addressed in one pass:
+
+1. **Cron suppression bug:** Last cron-shaped evening row was 30 Apr 22:50 UTC.
+   After that, every "evening" row was created at non-cron times by mid-day mood
+   mentions tagged via `log_mood_entry`. The cron's `hasCheckedInToday` saw any
+   `entry_type='evening'` row and skipped the scheduled poll. Result: scheduled
+   evening polls silently broken for ~5 days.
+
+2. **Activities/sleep/photo ergonomics:** Asking for activities, sleep, and a
+   photo in prose was unreliable. Activities especially — free-text answers
+   produced inconsistent canonicalisation and the AI sometimes forgot to ask.
+   Photo logging never worked (`photo_r2_key` always NULL across all entries).
+
+### Decisions (chosen with Roma)
+
+- **Suppression rule:** source-based, NOT time-based. New `source` column in
+  `mood_journal` with values `cron_poll`, `manual_command`, `inline_chat`,
+  NULL. Cron only skips if a real check-in exists (cron_poll/manual_command).
+  NULL-source rows (pre-migration) treated as non-suppressing.
+- **Manual `/mood` always re-runs the full sequence.** Re-running activities
+  shows only un-logged items; Completed mode allows removal.
+- **Activities keyboard:** 26 canonical activities. Two-mode toggle (New /
+  Completed) with single Done button committing both adds and removes. Summary
+  rendered into the keyboard message: `Added: X, Y. Removed: Z.`
+- **Hybrid AI + safety net (Option A + C):** AI drives the flow via three new
+  tools. If `mood_flow_${chatId}` KV state hasn't progressed in 20 min, a cron
+  task takes over with a **visible** handoff ("Quick one before we wrap —…")
+  and renders whichever keyboard is missing.
+- **Sleep:** asked only if no row has `sleep_hours` today.
+- **Photo:** asked only if no row has `photo_r2_key` today; auto-linked when
+  user uploads during stage='photo'.
+- **Activity rename:** `love` → `intimacy`.
+
+### Schema migration
+
+```sql
+ALTER TABLE mood_journal ADD COLUMN source TEXT;
+```
+
+Run on remote D1 via Cloudflare Developer Platform MCP; mirrored in `schema.sql`.
+
+### Files
+
+- New: `src/config/activities.js` — 26 canonical activities, stable indices
+  for callback_data, `canonicaliseActivities()` for AI-passed values.
+- New: `src/lib/moodFlow.js` — KV state tracker `mood_flow_${chatId}`, TTL 1800s.
+  Functions: `startFlow`, `endFlow`, `setStage`, `isStalled` (20min threshold),
+  `initActivitiesPending`, `toggleActivityPending`, `setActivitiesMode`,
+  `clearActivitiesPending`, `initPhotoPending`, `markPhotoSkipped`,
+  `isAwaitingPhoto`.
+- New: `src/tools/moodKeyboards.js` — three new tools:
+  - `send_activities_keyboard` — renders multi-mode 26-grid; respects
+    `getTodayActivities` filter
+  - `send_photo_request` — inline keyboard with Skip button; noops if photo
+    already logged today
+  - `commit_journal_entry` — gates on missing pieces; refuses if any of
+    mood/emotions/activities/sleep/photo missing
+  - Also exports `buildActivitiesKeyboard()` for callback re-renders
+- Modified: `src/services/moodStore.js` — added `MOOD_SOURCES`,
+  `sourcePrecedence()` (cron > manual > inline), `hasRealEveningCheckin()`,
+  `hasSleepLoggedToday()`, `hasPhotoLoggedToday()`, `getTodayActivities()`,
+  `mergeActivities()`. `upsertEntry` writes source with precedence rule.
+- Modified: `src/tools/mood.js` — `log_mood_entry` ignores AI-supplied `source`,
+  takes from `context.source` (default `inline_chat`); canonicalises activities;
+  `next_step` is flow-aware (returns deterministic-flow message when KV
+  `mood_flow_${chatId}` is set).
+- Modified: `src/index.js`:
+  - `enqueueHealthTasks` and `handleHealthCheckIns` evening branches use
+    `hasRealEveningCheckin` instead of `hasCheckedInToday`. New log lines
+    `cron_evening_enqueue` and `cron_window_skip`.
+  - `sendMoodPoll(chatId, threadId, env, source='cron_poll')` stores source
+    in poll context AND calls `moodFlow.startFlow`.
+  - `handleMoodPollAnswer(…, source='cron_poll')` writes source on the row.
+  - Queue path threads source through.
+  - Stalled-flow safety-net check inside `enqueueHealthTasks` queues a
+    `mood_flow_safety_net` task per stalled-stage per day.
+  - New queue consumer `mood_flow_safety_net` handler with visible handoff
+    message before rendering the next missing keyboard. Sleep stays prose.
+- Modified: `src/tools/index.js` — three new tools registered.
+- Modified: `src/bot/handlers.js`:
+  - `/mood` writes `source: 'manual_command'` AND calls `moodFlow.startFlow`.
+  - New callback handlers `mood_act|*` and `mood_photo|skip`. Helpers
+    `handleActivitiesCallback`, `handlePhotoSkipCallback`,
+    `rerenderActivitiesKeyboard`, `labelOf`. Both end by handing back to AI
+    via synthetic message turn so Xaridotis comments naturally.
+  - `getCheckinRoadmap(env, userId, chatId)` — new signature, mentions all
+    three new tools to AI; explicitly tells AI to prefer keyboards over prose.
+  - Photo upload during `moodFlow.isAwaitingPhoto()` is AWAITED, R2 key written
+    to today's evening row, prompt message edited to "Photo received. ✓",
+    stage → 'wrap'.
+  - Removed auto-clearing of `health_checkin_active`; `commit_journal_entry`
+    now owns lifecycle.
+
+### Callback data scheme (≤64 bytes)
+
+- `mood_act|<idx>` — toggle activity by canonical index 0-25
+- `mood_act|mode|new` / `mood_act|mode|completed` — switch keyboard mode
+- `mood_act|done` — commit pending adds/removes
+- `mood_act|noop` — decorative button (no-op)
+- `mood_photo|skip` — skip photo step
+
+### State storage shape (`mood_flow_${chatId}` KV, TTL 1800s)
+
+```
+{
+  started_at, last_progress_at, source: 'cron_poll' | 'manual_command',
+  stage: 'score' | 'emotions' | 'activities' | 'sleep' | 'photo' | 'wrap',
+  activities: { msg_id, mode: 'new'|'completed', pending_new[], pending_remove[] } | null,
+  photo: { msg_id, skipped: boolean } | null,
+}
+```
+
+### Verification plan after deploy
+
+- Tonight's 20:30 London cron: watch `wrangler tail` for `cron_run` +
+  `cron_evening_enqueue`. `hasRealEveningCheckin` should return false for
+  today (no cron_poll/manual_command row exists yet).
+- Test `/mood`: confirms `mood_command_invoked`, full sequence runs (poll →
+  emotions → activities keyboard → sleep prompt if NULL → photo prompt if
+  NULL → wrap).
+- Multiple `/mood` invocations: activities accumulate; Done summary shows only
+  newly-selected items.
+- Photo upload during stage='photo': `photo_linked_to_journal` log + prompt
+  message edited.
+- Stall test: send `/mood`, ignore for 20+ min, watch for
+  `mood_flow_stall_detected` + safety-net visible handoff.
+
+### Constraints preserved
+
+- Existing emotions positive/negative button flow unchanged.
+- Pro+medium-thinking `handleMoodPollAnswer` response unchanged.
+- Weekly/monthly handlers untouched.
+- Inline-chat mood logging via `log_mood_entry` still works, tagged
+  `inline_chat`, doesn't suppress cron.
+- AI-driven journal flow preserved — only structured collection steps are
+  deterministic; sleep stays prose.
+
+### Deferred
+
+- Full Cloudflare Workflow rewrite of mood check-in (agreed; separate session).
+- Vectorize migration to 1536-dim with `gemini-embedding-2`.
+- `tagConversationMode` diagnostic block cleanup in `src/services/cfAi.js`.
+
+================================================================================
+
+## 2026-05-05 — Private chat topics (Bot API 9.4)
+
+### What
+
+Added four default topics to the private chat with the bot, with code-side
+routing of cron-driven sends. Topics enabled in @BotFather first, then
+`/setuptopics` ran cleanly first try post-deploy.
+
+Allocated thread IDs (chat 62047005):
+  - 🧠 Second Brain     thread 553951
+  - ❤️ Mood Journal     thread 553952
+  - 📊 Weekly Reports   thread 553953
+  - General                no thread_id
+
+KV: `topics_62047005` = `{"secondBrain":553951,"moodJournal":553952,"weeklyReports":553953}`.
+
+### Files
+
+- New: `src/lib/topics.js` — `TOPIC_KEYS`, `getTopicMap`, `getThreadFor`,
+  `threadOrDefault`, `ensureTopics`, `clearTopic`. KV is source of truth.
+  `ensureTopics` is idempotent and never overwrites existing IDs (safety
+  invariant for re-runs after manual topic deletion).
+- `src/index.js` — import + 10 routing sites:
+    • `MOOD_JOURNAL`: handleHealthCheckIns, handleMedicationNudge,
+      handleAccountabilityNudge, queue `health_checkin` / `mood_poll` /
+      `med_nudge` (via conditional `isMoodTask` shadow at consumer top).
+    • `WEEKLY_REPORTS`: handleWeeklyReport, handleMemoryConsolidation
+      fallback message.
+    • `SECOND_BRAIN`: handleCuriosityDigest, handleSelfImprovement,
+      handleArchitectureEvolution (when re-enabled), handleDailyStudy share.
+- `src/workflows/deepResearch.js` — import + notify-user step now sends to
+  `SECOND_BRAIN` via raw-fetch payload with conditional `message_thread_id`.
+- `src/bot/handlers.js` — import + `/setuptopics` command (owner-only)
+  inserted between `/schedule` and `default`.
+- `src/lib/telegram.js` — `/setuptopics` registered in `setMyCommands`.
+- `src/config/personas.js` — `TOPICS (ROUTING)` block appended after
+  `TOOL SELECTION RULES (HARD CONSTRAINTS)`. Persona is told routing is
+  code-side and not its decision.
+
+### Sites deliberately not changed
+
+- `handleSpontaneousOutreach` — General (casual texts).
+- `handleStyleCardConsolidation` — silent, D1 only.
+- Reminder cron in `src/index.js` — already uses stored `thread_id` from the
+  reminder record. Old reminders keep their original thread.
+- `handleMessage` user replies — already mirrors incoming `message_thread_id`,
+  so user replies stay in whichever topic they wrote in.
+- Queue consumer's `mood_poll_answer` task — receives `mthreadId` from the
+  poll context, which now inherits MOOD_JOURNAL since `sendMoodPoll` is
+  called with the routed threadId. No direct change needed.
+
+### Failed first attempt
+
+First `/setuptopics` after edit hit the AI handler instead of the new case.
+Logs showed `cmd: "setuptopics"` then routed to `gemini-3.1-flash-lite-preview`
+with a confabulated "I don't have a direct set up topics command" reply.
+Cause: code on disk but not yet deployed. `wrangler deploy --minify` then
+`/setuptopics` succeeded immediately. Lesson, again: log message presence is
+not deploy-state evidence — only fresh log lines from new code paths are.
+
+### Verification next
+
+- Tomorrow's morning check-in (08:30 London) should land in Mood Journal,
+  not General. Watch for `message_thread_id: 553952` in the wrangler tail
+  on the next health_checkin queue task.
+- Weekly report (Sun 20:00 London) should land in Weekly Reports.
+- Saturday curiosity digest (10:00 London) should land in Second Brain.
+- If any topic is manually deleted in Telegram client, sends will fail with
+  `MESSAGE_THREAD_NOT_FOUND`. Recovery: `topics.clearTopic(env, chatId, KIND)`
+  then `/setuptopics` to recreate just the missing one.
+
+================================================================================
+
 ## 2026-05-04 — Persona tool-routing fix + Flash-Lite fallback
 
 ### Problem 1: codeExecution leaking Python tracebacks

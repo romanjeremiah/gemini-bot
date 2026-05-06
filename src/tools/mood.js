@@ -6,6 +6,7 @@
 
 import * as moodStore from '../services/moodStore';
 import * as mediaStore from '../services/mediaStore';
+import { ACTIVITY_LABELS_CSV, canonicaliseActivities } from '../config/activities';
 
 export const logMoodEntryTool = {
 	definition: {
@@ -20,7 +21,11 @@ Partial updates are supported. You can log just sleep in the morning and add moo
 The system uses a bipolar mood scale (0-10):
 0-1: Severe Depression, 2-3: Mild/Moderate Depression, 4-6: Balanced, 7-8: Hypomania, 9-10: Mania.
 
-IMPORTANT: If mood_score is 0-1 or 9-10, this is a clinical concern. Always acknowledge it compassionately and suggest professional contact.`,
+IMPORTANT: If mood_score is 0-1 or 9-10, this is a clinical concern. Always acknowledge it compassionately and suggest professional contact.
+
+IMPORTANT for ACTIVITIES: only use these canonical values: ${ACTIVITY_LABELS_CSV}. Do not invent activity names. If you want to collect activities during a check-in, prefer calling send_activities_keyboard instead of asking in prose — the keyboard handles add/remove cleanly. Only call log_mood_entry with an activities array if the user mentions specific activities directly in chat.
+
+IMPORTANT for SOURCE: do NOT pass a 'source' parameter — the runtime sets it automatically based on context (cron poll, /mood command, or inline chat).`,
 		parameters: {
 			type: "OBJECT",
 			properties: {
@@ -86,6 +91,15 @@ IMPORTANT: If mood_score is 0-1 or 9-10, this is a clinical concern. Always ackn
 			if (recent?.length) photoKey = recent[0].key;
 		}
 
+		// Canonicalise any activities the AI passed inline. Filters out non-canonical
+		// values silently — the keyboard is the preferred path for activities.
+		const canonActivities = args.activities ? canonicaliseActivities(args.activities) : null;
+
+		// Source resolution: callers (cron, /mood handler, queue consumer) pass an
+		// explicit source via context.source. AI tool calls don't, so default to
+		// 'inline_chat'. Never let the AI override this — we ignore args.source.
+		const source = context?.source || 'inline_chat';
+
 		const data = {
 			mood_score: args.mood_score ?? null,
 			emotions: args.emotions ? JSON.stringify(args.emotions) : null,
@@ -94,15 +108,19 @@ IMPORTANT: If mood_score is 0-1 or 9-10, this is a clinical concern. Always ackn
 			medication_taken: args.medication_taken ? 1 : 0,
 			medication_time: null,
 			medication_notes: args.medication_notes || null,
-			activities: args.activities ? JSON.stringify(args.activities) : null,
+			activities: canonActivities ? JSON.stringify(canonActivities) : null,
 			note: args.note || null,
 			ai_observation: args.ai_observation || null,
 			photo_r2_key: photoKey,
+			source,
 		};
 		const entry = await moodStore.upsertEntry(env, context.userId, date, args.entry_type || 'evening', data);
-		console.log(`📊 Mood logged: ${date} ${args.entry_type} score=${args.mood_score}`);
+		console.log(`📊 Mood logged: ${date} ${args.entry_type} score=${args.mood_score} src=${source}`);
 
-		// Dynamic feedback: tell the AI what's still missing
+		// Dynamic feedback: tell the AI what's still missing.
+		// Updated 2026-05-05: when the deterministic flow is active (mood_flow_*
+		// KV key set), the keyboard tools handle activities/sleep/photo — don't
+		// nudge the AI to ask for them in prose.
 		const missing = [];
 		if (entry.sleep_hours === null) missing.push('sleep hours/quality');
 		if (!entry.emotions || entry.emotions === '[]' || entry.emotions === 'null') missing.push('specific emotions');
@@ -110,9 +128,12 @@ IMPORTANT: If mood_score is 0-1 or 9-10, this is a clinical concern. Always ackn
 		if (!entry.photo_r2_key) missing.push('a photo of the day');
 		if (!entry.note) missing.push('final reflections');
 
-		const next_step = missing.length > 0
-			? `Data logged. Still missing: ${missing.join(', ')}. Ask ONE natural question to gather the next piece.`
-			: 'Journal complete for today. Warmly summarise the day and wrap up the check-in.';
+		const flowActive = await env.CHAT_KV.get(`mood_flow_${context.chatId || context.userId}`);
+		const next_step = flowActive
+			? 'Data logged. The deterministic check-in flow is active — it will collect activities, sleep, and photo via keyboards. Respond warmly to what was just logged but DO NOT ask about other missing pieces in prose.'
+			: (missing.length > 0
+				? `Data logged. Still missing: ${missing.join(', ')}. Ask ONE natural question to gather the next piece, OR call send_activities_keyboard / send_photo_request if you're inside an evening check-in.`
+				: 'Journal complete for today. Warmly summarise the day and wrap up the check-in.');
 
 		return { status: "success", date, entry_type: args.entry_type, mood_score: args.mood_score, mood_label: entry.mood_label, next_step };
 	}

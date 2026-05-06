@@ -20,6 +20,7 @@ import { timezoneTool } from './timezone';
 import { searchResearchTool, startResearchTool } from './research';
 import { episodeTool, updateEpisodeOutcomeTool } from './episode';
 import { quietHoursTool, clearQuietHoursTool } from './quietHours';
+import { sendActivitiesKeyboardTool, sendPhotoRequestTool, commitJournalEntryTool } from './moodKeyboards';
 
 export const toolRegistry = {
 	[reminderTool.definition.name]: reminderTool,
@@ -54,6 +55,9 @@ export const toolRegistry = {
 	[updateEpisodeOutcomeTool.definition.name]: updateEpisodeOutcomeTool,
 	[quietHoursTool.definition.name]: quietHoursTool,
 	[clearQuietHoursTool.definition.name]: clearQuietHoursTool,
+	[sendActivitiesKeyboardTool.definition.name]: sendActivitiesKeyboardTool,
+	[sendPhotoRequestTool.definition.name]: sendPhotoRequestTool,
+	[commitJournalEntryTool.definition.name]: commitJournalEntryTool,
 };
 
 export const toolDefinitions = Object.values(toolRegistry).map(t => t.definition);

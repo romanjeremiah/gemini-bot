@@ -17,6 +17,8 @@ import { ARCHITECTURE_SUMMARY } from './config/architecture';
 import { getSchedule } from './config/schedules';
 import { toolRegistry } from './tools/index';
 import { isQuietTime } from './tools/quietHours';
+import { TOPIC_KEYS, threadOrDefault } from './lib/topics';
+import * as moodFlow from './lib/moodFlow';
 import { log } from './lib/logger';
 import { wrapD1 } from './lib/db';
 
@@ -127,7 +129,7 @@ async function handleHealthCheckIns(env) {
 	const localTime = new Date(now.toLocaleString('en-US', { timeZone: userTz }));
 	const hour = localTime.getHours();
 	const minute = localTime.getMinutes();
-	const threadId = 'default';
+	const threadId = await threadOrDefault(env, chatId, TOPIC_KEYS.MOOD_JOURNAL);
 	const today = localTime.toISOString().split('T')[0];
 	const currentMins = hour * 60 + minute;
 
@@ -220,8 +222,11 @@ async function handleHealthCheckIns(env) {
 		await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
 		await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 1800 });
 
-		const alreadyLogged = await moodStore.hasCheckedInToday(env, userId, 'evening');
-		if (alreadyLogged) return;
+		// Source-based suppression (2026-05-05): only skip if a REAL evening
+		// check-in (cron_poll or manual_command) has happened today. Casual
+		// mid-day mood mentions tagged 'inline_chat' no longer block the poll.
+		const alreadyDone = await moodStore.hasRealEveningCheckin(env, userId);
+		if (alreadyDone) return;
 
 		// Send mood poll instead of checklist buttons
 		await sendMoodPoll(chatId, threadId, env);
@@ -240,7 +245,7 @@ async function handleMedicationNudge(env) {
 
 	// Only check during relevant hours to avoid unnecessary D1 queries
 	if (hour < 8 || hour > 21) return;
-	const threadId = 'default';
+	const threadId = await threadOrDefault(env, chatId, TOPIC_KEYS.MOOD_JOURNAL);
 
 	for (const type of ['morning', 'midday', 'evening']) {
 		const nudgeKey = `nudge_pending_${type}_${chatId}`;
@@ -295,7 +300,7 @@ async function handleWeeklyReport(env) {
 
 	const chatId = Number(env.OWNER_ID);
 	const userId = chatId; // Owner's private chat
-	const threadId = 'default';
+	const threadId = await threadOrDefault(env, chatId, TOPIC_KEYS.WEEKLY_REPORTS);
 	const today = londonTime.toISOString().split('T')[0];
 	const reportKey = `weekly_report_${today}`;
 
@@ -384,7 +389,8 @@ Keep it to 2-3 sentences. Be warm and curious, not demanding.`;
 
 		const msg = await generateShortResponse(prompt, personas.xaridotis.instruction, env);
 		if (msg) {
-			await telegram.sendMessage(chatId, 'default', `<b>Mid-Week Check-in</b>\n\n${msg}`, env);
+			const threadId = await threadOrDefault(env, chatId, TOPIC_KEYS.MOOD_JOURNAL);
+			await telegram.sendMessage(chatId, threadId, `<b>Mid-Week Check-in</b>\n\n${msg}`, env);
 		}
 	} catch (e) {
 		console.error('Accountability nudge error:', e.message);
@@ -419,7 +425,8 @@ async function handleMemoryConsolidation(env) {
 		} else {
 			// Fallback: run inline if Workflow binding not available
 			await memoryStore.consolidateMemories(env, userId);
-			await telegram.sendMessage(chatId, 'default',
+			const threadId = await threadOrDefault(env, chatId, TOPIC_KEYS.WEEKLY_REPORTS);
+			await telegram.sendMessage(chatId, threadId,
 				'<i>Did some deep memory consolidation overnight. Your saved memories are organised and ready for the new month.</i>', env);
 		}
 	} catch (e) {
@@ -536,7 +543,7 @@ async function handleStyleCardConsolidation(env) {
 // MOOD_POLL_OPTIONS is imported at the top of this file from config/moodScale.js.
 // Canonical 0-10 bipolar mood scale, shared with the manual /mood command.
 
-async function sendMoodPoll(chatId, threadId, env) {
+async function sendMoodPoll(chatId, threadId, env, source = 'cron_poll') {
 	const pollRes = await telegram.sendPoll(chatId, threadId,
 		'How do you feel right now?',
 		MOOD_POLL_OPTIONS,
@@ -545,19 +552,24 @@ async function sendMoodPoll(chatId, threadId, env) {
 	if (pollRes?.ok) {
 		const pollId = pollRes.result.poll.id;
 		await env.CHAT_KV.put(`mood_poll_${pollId}`, JSON.stringify({
-			chatId, threadId, type: 'mood_checkin', sentAt: Date.now()
+			chatId, threadId, type: 'mood_checkin', sentAt: Date.now(), source
 		}), { expirationTtl: 86400 });
-		log.info('mood_poll_sent', { chatId, pollId });
+		// Initialise the deterministic flow tracker so the keyboard tools, photo
+		// upload handler, and safety-net cron all know a check-in is live.
+		await moodFlow.startFlow(env, chatId, source);
+		log.info('mood_poll_sent', { chatId, pollId, source });
 	}
 	return pollRes;
 }
 
-async function handleMoodPollAnswer(userId, chatId, threadId, score, env) {
+async function handleMoodPollAnswer(userId, chatId, threadId, score, env, source = 'cron_poll') {
 	const today = new Date().toISOString().split('T')[0];
-	log.info('mood_poll_score', { userId, chatId, score });
+	log.info('mood_poll_score', { userId, chatId, score, source });
 
-	// Save mood score (keyed by user, not chat)
-	await moodStore.upsertEntry(env, userId, today, 'evening', { mood_score: score });
+	// Save mood score (keyed by user, not chat). Tag with the source that owns
+	// this check-in so the cron suppression logic can tell scheduled vs manual
+	// vs casual chat-driven entries apart.
+	await moodStore.upsertEntry(env, userId, today, 'evening', { mood_score: score, source });
 
 	// Build context-aware response using recent mood history and memories
 	const moodHistory = await moodStore.getHistory(env, userId, 30);
@@ -803,7 +815,8 @@ ${digest}`;
 
 		const msg = await generateShortResponse(formatPrompt, persona.instruction, env);
 		if (msg) {
-			await telegram.sendMessage(chatId, 'default', `<b>Things I found interesting this week</b>\n\n${msg}`, env);
+			const threadId = await threadOrDefault(env, chatId, TOPIC_KEYS.SECOND_BRAIN);
+			await telegram.sendMessage(chatId, threadId, `<b>Things I found interesting this week</b>\n\n${msg}`, env);
 
 			// Save the raw discoveries as a memory so they feed into spontaneous outreach and conversations
 			await memoryStore.saveMemory(env, userId, 'discovery', `Weekly research (${today}): ${digest.slice(0, 500)}`, 1);
@@ -912,7 +925,8 @@ ${suggestions}`;
 
 		const msg = await generateShortResponse(formatPrompt, personas.xaridotis.instruction, env);
 		if (msg) {
-			await telegram.sendMessage(chatId, 'default', `<b>Monthly self-assessment</b>\n\n${msg}`, env);
+			const threadId = await threadOrDefault(env, chatId, TOPIC_KEYS.SECOND_BRAIN);
+			await telegram.sendMessage(chatId, threadId, `<b>Monthly self-assessment</b>\n\n${msg}`, env);
 		}
 	} catch (e) {
 		console.error('Self-improvement error:', e.message);
@@ -999,7 +1013,8 @@ Keep it under 500 words. End with: "Awaiting your manual review."` }] }],
 		);
 
 		if (prText && !prText.includes('NO_PR_NEEDED') && prText.length > 50) {
-			await telegram.sendMessage(chatId, 'default', `<b>Architecture Deep Search</b>\n\n${prText}`, env, null, {
+			const threadId = await threadOrDefault(env, chatId, TOPIC_KEYS.SECOND_BRAIN);
+			await telegram.sendMessage(chatId, threadId, `<b>Architecture Deep Search</b>\n\n${prText}`, env, null, {
 				inline_keyboard: [[
 					{ text: '✅ Approve', callback_data: 'approve_pr', style: 'success' },
 					{ text: '❌ Dismiss', callback_data: 'action_dismiss_pr', style: 'danger' }
@@ -1147,7 +1162,8 @@ Match your tone to the topic: sassy/direct for tech, warm/grounded for psycholog
 
 			const msg = await generateShortResponse(sharePrompt, personas.xaridotis.instruction, env);
 			if (msg) {
-				await telegram.sendMessage(chatId, 'default', msg, env);
+				const threadId = await threadOrDefault(env, chatId, TOPIC_KEYS.SECOND_BRAIN);
+				await telegram.sendMessage(chatId, threadId, msg, env);
 			}
 		}
 	} catch (e) {
@@ -1308,9 +1324,38 @@ async function enqueueHealthTasks(env) {
 		const shouldDefer = isUserActive && currentMins < graceEndMins;
 		if (!(await env.CHAT_KV.get(key)) && !shouldDefer) {
 			await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
-			if (!(await moodStore.hasCheckedInToday(env, userId, 'evening'))) {
+			// Source-based suppression (2026-05-05): only skip if a REAL evening
+			// check-in (cron_poll or manual_command) has happened today.
+			if (!(await moodStore.hasRealEveningCheckin(env, userId))) {
+				log.info('cron_evening_enqueue', { chatId, today });
 				await env.TASK_QUEUE.send({ type: 'mood_poll', chatId });
+			} else {
+				log.info('cron_window_skip', { period: 'evening', reason: 'real_checkin_already_today' });
 			}
+		}
+	}
+
+	// Stalled-flow safety-net (added 2026-05-05). If a deterministic mood flow is
+	// active and hasn't progressed for STALL_THRESHOLD_MS (20 min), the AI got
+	// stuck mid-conversation. Take over with a visible handoff message and
+	// render whichever keyboard is still missing.
+	if (env.OWNER_ID) {
+		try {
+			const stalled = await moodFlow.isStalled(env, chatId);
+			if (stalled) {
+				const flow = await moodFlow.getFlow(env, chatId);
+				if (flow) {
+					const safetyKey = `mood_flow_safety_${today}_${flow.stage}`;
+					const alreadyRun = await env.CHAT_KV.get(safetyKey);
+					if (!alreadyRun) {
+						await env.CHAT_KV.put(safetyKey, '1', { expirationTtl: 3600 });
+						await env.TASK_QUEUE.send({ type: 'mood_flow_safety_net', chatId, stage: flow.stage });
+						log.info('mood_flow_stall_detected', { chatId, stage: flow.stage });
+					}
+				}
+			}
+		} catch (e) {
+			log.warn('mood_flow_stall_check_failed', { msg: e.message });
 		}
 	}
 
@@ -1552,19 +1597,20 @@ export default {
 								userId: pa.user?.id || pollCtx.chatId,
 								chatId: pollCtx.chatId,
 								threadId: pollCtx.threadId,
+								source: pollCtx.source || 'cron_poll',
 								score
 							});
-							log.info('mood_poll_queued', { chatId: pollCtx.chatId, score });
+							log.info('mood_poll_queued', { chatId: pollCtx.chatId, score, source: pollCtx.source });
 							// Light acknowledgement so the user sees SOMETHING while Pro is working
 							await telegram.sendChatAction(pollCtx.chatId, pollCtx.threadId, 'typing', env).catch(() => {});
 						} catch (queueErr) {
 							log.warn('mood_poll_queue_failed', { msg: queueErr.message });
 							// Fallback: run inline (may hit 30s ceiling, but better than nothing)
-							task = handleMoodPollAnswer(pa.user?.id || pollCtx.chatId, pollCtx.chatId, pollCtx.threadId, score, env);
+							task = handleMoodPollAnswer(pa.user?.id || pollCtx.chatId, pollCtx.chatId, pollCtx.threadId, score, env, pollCtx.source || 'cron_poll');
 						}
 					} else {
 						// No queue binding — run inline
-						task = handleMoodPollAnswer(pa.user?.id || pollCtx.chatId, pollCtx.chatId, pollCtx.threadId, score, env);
+						task = handleMoodPollAnswer(pa.user?.id || pollCtx.chatId, pollCtx.chatId, pollCtx.threadId, score, env, pollCtx.source || 'cron_poll');
 					}
 				}
 				await env.CHAT_KV.delete(`mood_poll_${pa.poll_id}`);
@@ -1743,7 +1789,10 @@ export default {
 			log.info('queue_task_received', { type: task.type, hasMessage: !!task.message });
 			try {
 				const chatId = task.chatId || Number(env.OWNER_ID);
-				const threadId = 'default';
+				const isMoodTask = task.type === 'health_checkin' || task.type === 'mood_poll' || task.type === 'med_nudge' || task.type === 'mood_flow_safety_net';
+				const threadId = isMoodTask
+					? await threadOrDefault(env, chatId, TOPIC_KEYS.MOOD_JOURNAL)
+					: 'default';
 
 				if (task.type === 'health_checkin') {
 					await env.CHAT_KV.put(`health_checkin_active_${chatId}`, task.period, { expirationTtl: 1800 });
@@ -1821,11 +1870,11 @@ export default {
 					// Mood poll responses run here for 15-min wall clock budget. The inline
 					// path only had 30s via waitUntil, which wasn't enough when Pro is slow
 					// or preview-overloaded. Queue retries (max 3) give resilience.
-					const { userId: muserId, chatId: mchatId, threadId: mthreadId, score } = task;
-					log.info('queue_mood_poll_start', { chatId: mchatId, score });
+					const { userId: muserId, chatId: mchatId, threadId: mthreadId, score, source: msource } = task;
+					log.info('queue_mood_poll_start', { chatId: mchatId, score, source: msource });
 					try {
 						await telegram.sendChatAction(mchatId, mthreadId, 'typing', env).catch(() => {});
-						await handleMoodPollAnswer(muserId, mchatId, mthreadId, score, env);
+						await handleMoodPollAnswer(muserId, mchatId, mthreadId, score, env, msource || 'cron_poll');
 						log.info('queue_mood_poll_done', { chatId: mchatId });
 					} catch (mpErr) {
 						const attempts = msg.attempts || 1;
@@ -1843,6 +1892,204 @@ export default {
 							).catch(() => {});
 						}
 						throw mpErr; // re-throw for queue retry
+					}
+				} else if (task.type === 'mood_synthesis_after_emotions') {
+					// Pro+thinking therapeutic synthesis after emotion buttons. Moved to the
+					// queue on 2026-05-06 because the inline waitUntil path was being
+					// cancelled at the 30s ceiling — synthesis itself is 10-25s, and the
+					// downstream kick (mood_kick_after_emotions) added another 5-15s on
+					// top, blowing the budget. Each step now has 15-min wall clock and 3
+					// retries.
+					const { chatId: mchatId, userId: muserId, threadId: mthreadId, msgId: mmsgId,
+						chatType: mchatType, messageThreadId: mmessageThreadId, fromUser: mfromUser,
+						selected: mselected } = task;
+					log.info('queue_mood_synthesis_start', { chatId: mchatId, emotionsCount: mselected?.length || 0 });
+					try {
+						await telegram.sendChatAction(mchatId, mthreadId, 'typing', env).catch(() => {});
+						const today = moodStore.todayLondon();
+
+						// Re-derive context fresh from D1/KV/Vectorize (don't trust cached state
+						// from the callback handler — the queue could fire minutes later).
+						const negativeList = ['devastated', 'empty', 'frustrated', 'scared', 'angry', 'depressed', 'sad', 'anxious', 'annoyed', 'insecure', 'lonely', 'confused', 'tired', 'bored', 'nervous', 'disappointed', 'lost'];
+						const negSelected = (mselected || []).filter(e => negativeList.includes(e));
+						const posSelected = (mselected || []).filter(e => !negativeList.includes(e));
+
+						const recentEntries = await moodStore.getHistory(env, muserId, 30, 'evening').catch(() => []);
+						let pastContext = 'No previous check-ins found.';
+						if (recentEntries.length > 1) {
+							const summaries = recentEntries.slice(0, 10).map(e => {
+								const parsed = typeof e.data === 'string' ? JSON.parse(e.data || '{}') : (e.data || {});
+								return `${e.date}: score ${parsed.mood_score ?? '?'}, emotions: ${parsed.emotions || 'none'}`;
+							}).join(' | ');
+							pastContext = `Recent evening check-ins (up to 30 days): ${summaries}`;
+						}
+
+						const therapeuticNotes = await env.DB.prepare(
+							`SELECT category, fact FROM memories WHERE user_id = ? AND category IN ('pattern','trigger','schema','insight','homework','growth') ORDER BY created_at DESC LIMIT 10`
+						).bind(muserId).all().then(r => r.results || []).catch(() => []);
+						const clinicalCtx = therapeuticNotes.length
+							? 'Clinical notes:\n' + therapeuticNotes.map(n => `[${n.category}] ${n.fact}`).join('\n')
+							: '';
+
+						const emotionQuery = [...negSelected, ...posSelected].join(' ') || 'mood emotions feelings';
+						const semanticCtx = await vectorStore.getSemanticContext(env, muserId, emotionQuery).catch(() => '');
+
+						const allEmotions = [...negSelected, ...posSelected];
+						const relevantEpisodes = allEmotions.length
+							? await episodeStore.getEpisodesByEmotion(env, muserId, allEmotions, 5).catch(() => [])
+							: await episodeStore.getRecentEpisodes(env, muserId, 5).catch(() => []);
+						const episodeCtx = episodeStore.formatEpisodesForContext(relevantEpisodes);
+
+						const todayEntry = await moodStore.getEntry(env, muserId, today, 'evening').catch(() => null);
+						const todayParsed = todayEntry?.data ? (typeof todayEntry.data === 'string' ? JSON.parse(todayEntry.data) : todayEntry.data) : {};
+						const todayScore = todayParsed.mood_score;
+
+						const contextPrompt = `The user just completed their full mood check-in. Analyse everything and give a meaningful therapeutic summary.
+
+TODAY'S CHECK-IN:
+Mood score: ${todayScore ?? 'not recorded'}/10
+Positive emotions: ${posSelected.length > 0 ? posSelected.join(', ') : 'none selected'}
+Negative emotions: ${negSelected.length > 0 ? negSelected.join(', ') : 'none selected'}
+
+RECENT MOOD HISTORY:
+${pastContext}
+
+${clinicalCtx}
+
+${episodeCtx}
+
+${semanticCtx}
+
+YOUR RESPONSE (follow this structure naturally, not as a list):
+1. Acknowledge what they shared today. Name the emotions they selected. If the mix of positive and negative is notable (e.g. "inspired but lonely"), explore that tension.
+2. Compare to recent days. Is the score trending up, down, or stable? Are certain emotions recurring? Note any patterns without being clinical.
+3. If past episodes are available, reference what happened in similar emotional states before. What helped? What didn't? Use this to inform your suggestion.
+4. Draw one therapeutic observation. Connect today's emotions to known patterns, triggers, or schemas from the clinical notes. Use therapeutic frameworks (AEDP, IFS, schema therapy) as lenses for YOUR thinking — do NOT name them to the user.
+5. End with ONE natural question that invites deeper conversation but doesn't pressure.
+
+Keep it warm, direct, and personal. 3-5 sentences. No bullet points. No clinical jargon unless it adds genuine insight. You know this person well.`;
+
+						const response = await generateDeepResponse(contextPrompt, personas.xaridotis.instruction, env, {
+							thinkingLevel: 'high',
+							maxOutputTokens: 2000,
+						});
+						const synthesis = response || `Thank you for sharing. What has been on your mind today?`;
+						await telegram.sendMessage(mchatId, mthreadId, synthesis, env);
+
+						// Persist synthetic user turn + synthesis in chat history.
+						const selectionLabel = (mselected || []).length
+							? `[I finished my check-in. Selected emotions: ${mselected.join(', ')}]`
+							: `[I finished my check-in without selecting specific emotions]`;
+						const histKey = `chat_${mchatId}_${mthreadId}`;
+						let hist = await env.CHAT_KV.get(histKey, { type: 'json' }) || [];
+						hist.push({ role: 'user', parts: [{ text: selectionLabel }] });
+						hist.push({ role: 'model', parts: [{ text: synthesis }] });
+						if (hist.length > 24) hist = hist.slice(-24);
+						await env.CHAT_KV.put(histKey, JSON.stringify(hist), { expirationTtl: 604800 });
+
+						log.info('mood_synthesis_sent', { userId: muserId, emotionsCount: (mselected || []).length, synthesisLen: synthesis.length });
+
+						// Enqueue the kick as a SEPARATE queue message so synthesis success
+						// doesn't get rolled back if the kick fails. Each step has its own
+						// retry budget.
+						if (env.TASK_QUEUE) {
+							await env.TASK_QUEUE.send({
+								type: 'mood_kick_after_emotions',
+								chatId: mchatId,
+								userId: muserId,
+								threadId: mthreadId,
+								msgId: mmsgId,
+								chatType: mchatType,
+								messageThreadId: mmessageThreadId,
+								fromUser: mfromUser,
+							});
+							log.info('mood_kick_queued', { chatId: mchatId });
+						}
+						log.info('queue_mood_synthesis_done', { chatId: mchatId });
+					} catch (synErr) {
+						const attempts = msg.attempts || 1;
+						log.error('queue_mood_synthesis_error', { chatId: mchatId, attempt: attempts, msg: synErr.message });
+						if (attempts >= 3) {
+							// Final retry failed — send a brief acknowledgement so the user
+							// isn't left hanging. The deeper synthesis is lost but the flow
+							// can still continue.
+							const fallback = (mselected || []).length
+								? `You selected: ${mselected.join(', ')}. What has been driving those feelings?`
+								: 'What has been on your mind today?';
+							await telegram.sendMessage(mchatId, mthreadId, fallback, env).catch(() => {});
+						}
+						throw synErr;
+					}
+
+				} else if (task.type === 'mood_kick_after_emotions') {
+					// After the synthesis was sent, kick handleMessage so the AI picks up
+					// the HARD RULES roadmap and continues the check-in (activities →
+					// sleep → photo → commit). Runs in its own queue invocation so it
+					// has a fresh 15-min budget independent of the synthesis call.
+					const { chatId: kchatId, threadId: kthreadId, msgId: kmsgId,
+						chatType: kchatType, messageThreadId: kmessageThreadId, fromUser: kfromUser } = task;
+					log.info('queue_mood_kick_start', { chatId: kchatId });
+					try {
+						await telegram.sendChatAction(kchatId, kthreadId, 'typing', env).catch(() => {});
+						const kickMsg = {
+							chat: { id: kchatId, type: kchatType },
+							from: kfromUser,
+							message_id: kmsgId,
+							message_thread_id: kmessageThreadId,
+							text: '[Emotion selection complete. Continue the check-in by performing the NEXT REQUIRED ACTION from the HARD RULES roadmap.]',
+						};
+						await handleMessage(kickMsg, env);
+						log.info('queue_mood_kick_done', { chatId: kchatId });
+					} catch (kickErr) {
+						const attempts = msg.attempts || 1;
+						log.error('queue_mood_kick_error', { chatId: kchatId, attempt: attempts, msg: kickErr.message });
+						// Don't notify the user on kick failure — the synthesis already
+						// landed and the user can resume the check-in by typing a reply.
+						// Just log and re-throw for queue retry.
+						throw kickErr;
+					}
+
+				} else if (task.type === 'mood_flow_safety_net') {
+					// Stalled mood flow recovery. Visible handoff (Option 2): tell the
+					// user we're taking over the next step, then render whichever
+					// keyboard the flow needs based on its stored stage. The user can
+					// always opt back into the conversational path by ignoring the
+					// keyboard and just typing.
+					const { stage } = task;
+					const userId = chatId;
+					log.info('queue_safety_net_start', { chatId, stage });
+					try {
+						const flow = await moodFlow.getFlow(env, chatId);
+						if (!flow) {
+							log.info('queue_safety_net_skip', { reason: 'flow_already_ended' });
+						} else {
+							const today = moodStore.todayLondon();
+							const alreadyLogged = await moodStore.getTodayActivities(env, userId, today);
+							const missingActs = !alreadyLogged.length;
+							const sleepLogged = await moodStore.hasSleepLoggedToday(env, userId, today);
+							const photoLogged = await moodStore.hasPhotoLoggedToday(env, userId, today);
+
+							// Pick the next missing piece. Order: activities -> photo -> wrap.
+							// Sleep is left for prose since it's a single number ask.
+							const { sendActivitiesKeyboardTool, sendPhotoRequestTool } = await import('./tools/moodKeyboards');
+							const toolCtx = { chatId, userId, source: flow.source };
+
+							if (missingActs) {
+								await telegram.sendMessage(chatId, threadId, 'Quick one before we wrap — what activities did you do today?', env);
+								await sendActivitiesKeyboardTool.execute({ preamble: 'Tap any that fit, then ✓ Done.' }, env, toolCtx);
+							} else if (!photoLogged && !flow.photo?.skipped) {
+								await telegram.sendMessage(chatId, threadId, 'Quick one before we wrap — a photo from today?', env);
+								await sendPhotoRequestTool.execute({ preamble: 'Send any photo, or tap Skip.' }, env, toolCtx);
+							} else if (sleepLogged === null || sleepLogged === undefined) {
+								await telegram.sendMessage(chatId, threadId, 'Quick one before we wrap — how many hours did you sleep last night?', env);
+							} else {
+								// Nothing structured missing — just nudge wrap-up.
+								await telegram.sendMessage(chatId, threadId, 'Anything else from today before I wrap this up?', env);
+							}
+							log.info('queue_safety_net_done', { chatId, stage });
+						}
+					} catch (snErr) {
+						log.error('queue_safety_net_error', { msg: snErr.message });
 					}
 				}
 

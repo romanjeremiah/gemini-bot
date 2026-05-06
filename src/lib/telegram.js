@@ -327,6 +327,7 @@ export async function registerCommands(env) {
 			{ command: "architect", description: "Innovation research" },
 			{ command: "persona", description: "Switch AI personality" },
 			{ command: "clear", description: "Reset conversation" },
+			{ command: "setuptopics", description: "Create or verify private chat topics" },
 			{ command: "start", description: "Welcome message" }
 		]
 	});

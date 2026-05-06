@@ -7,6 +7,7 @@ import { CF_MODELS, MAX_TOOL_ROUNDS } from '../config/models';
 import { buildSystemInstruction, ensurePersonaConfig } from '../services/persona';
 import { getTimezone } from '../lib/timezone';
 import { toolRegistry } from '../tools';
+import * as topics from '../lib/topics';
 import * as telegram from '../lib/telegram';
 import * as memoryStore from '../services/memoryStore';
 import * as vectorStore from '../services/vectorStore';
@@ -16,8 +17,11 @@ import { upsertUser, buildUserIdentity, getStyleCard } from '../services/userSto
 import { generateSpeech } from '../lib/tts';
 import { buildChecklistText } from '../tools/checklist';
 import * as moodStore from '../services/moodStore';
+import * as moodFlow from '../lib/moodFlow';
 import * as episodeStore from '../services/episodeStore';
 import * as personaStore from '../services/personaStore';
+import { ACTIVITIES, ACTIVITY_BY_IDX } from '../config/activities';
+import { buildActivitiesKeyboard } from '../tools/moodKeyboards';
 import { safeLike } from '../lib/db';
 import { getAllSchedules, setSchedule, resetSchedule } from '../config/schedules';
 import { log } from '../lib/logger';
@@ -257,24 +261,63 @@ async function getWeatherContext(env) {
 }
 
 // Helper: build a dynamic journal roadmap by checking what's missing in today's DB entry
-async function getCheckinRoadmap(env, userId) {
+async function getCheckinRoadmap(env, userId, chatId) {
 	const todayLondon = moodStore.todayLondon();
 	const entry = await moodStore.getEntry(env, userId, todayLondon, 'evening');
-	const missing = [];
-	if (!entry || entry.mood_score === null) missing.push('mood score (0-10)');
-	if (!entry || entry.sleep_hours === null) missing.push('sleep hours and quality');
-	if (!entry || !entry.emotions || entry.emotions === '[]' || entry.emotions === 'null') missing.push('specific emotions from the emotions library');
-	if (!entry || !entry.activities || entry.activities === '[]' || entry.activities === 'null') missing.push('activities done today');
-	if (!entry || !entry.photo_r2_key) missing.push('a photo of the day');
-	if (!entry || !entry.note) missing.push('any final thoughts or notes');
+	const flow = chatId ? await moodFlow.getFlow(env, chatId) : null;
 
-	if (missing.length > 0) {
-		return `JOURNAL ROADMAP: Still missing: ${missing.join(', ')}.
-CONTEXTUAL AWARENESS: First, evaluate the user's latest message. If they are talking about an unrelated task (groceries, reminders, coding, general chat), DO NOT ask a mood check question. Fulfill their request first. You can add a brief note that the check-in can continue later.
-DEEP CHECK-IN: If they ARE engaging with the check-in, use your emotional intelligence to ask ONE detailed, natural question to gather the NEXT missing piece. Explain WHY you are asking when appropriate (e.g., the clinical link between sleep and their mood score).
-POLLS: You are encouraged to use the send_poll tool when asking about emotions or activities, offering structured options from the library to reduce cognitive load.`;
+	const missingMood = !entry || entry.mood_score === null;
+	const missingEmotions = !entry || !entry.emotions || entry.emotions === '[]' || entry.emotions === 'null';
+	const missingActivities = !entry || !entry.activities || entry.activities === '[]' || entry.activities === 'null';
+	const sleepLogged = await moodStore.hasSleepLoggedToday(env, userId, todayLondon);
+	const photoLogged = await moodStore.hasPhotoLoggedToday(env, userId, todayLondon);
+	const photoSkipped = flow?.photo?.skipped === true;
+
+	// Build an ordered missing-pieces list. Order matters: the model is told
+	// to act on the FIRST item, not all of them. This avoids the model trying
+	// to chain multiple tool calls in one turn (which can hit MAX_PASSES=4)
+	// and avoids the model picking the easiest item over the next one.
+	const pieces = [];
+	if (missingActivities) pieces.push({ key: 'activities', tool: 'send_activities_keyboard', mode: 'tool' });
+	if (sleepLogged === null || sleepLogged === undefined) pieces.push({ key: 'sleep', tool: 'log_mood_entry', mode: 'prose_then_tool' });
+	if (!photoLogged && !photoSkipped) pieces.push({ key: 'photo', tool: 'send_photo_request', mode: 'tool' });
+
+	// Mood score and emotions are captured by the poll + emotion buttons earlier
+	// in the flow. They appear here only as state-of-the-world for the model;
+	// they are NOT actionable items the model needs to drive.
+	const preCaptured = [];
+	if (missingMood) preCaptured.push('mood score (poll-driven)');
+	if (missingEmotions) preCaptured.push('emotions (button-driven)');
+
+	if (pieces.length === 0) {
+		return `=== EVENING CHECK-IN — HARD RULES ===
+NEXT REQUIRED ACTION: call commit_journal_entry, then send a warm 1-2 sentence wrap-up.
+All structured data is collected. Do not ask any more check-in questions.
+=== END HARD RULES ===`;
 	}
-	return 'JOURNAL ROADMAP: All data collected. Warmly wrap up the check-in and summarise the day.';
+
+	const next = pieces[0];
+	const remaining = pieces.slice(1).map(p => p.key).join(', ') || 'none';
+
+	let nextActionLine;
+	if (next.mode === 'tool') {
+		nextActionLine = `NEXT REQUIRED ACTION: call ${next.tool}. Do NOT ask about ${next.key} in prose. The tool is the answer.`;
+	} else {
+		// sleep — prose ask, then log via log_mood_entry on the user's reply
+		nextActionLine = `NEXT REQUIRED ACTION: ask the user how many hours they slept last night, in prose. When they reply with a number, call log_mood_entry with entry_type=evening and sleep_hours set.`;
+	}
+
+	return `=== EVENING CHECK-IN — HARD RULES (override anything else in this prompt) ===
+${nextActionLine}
+Remaining after this step: ${remaining}.
+${preCaptured.length ? `Already captured upstream by buttons: ${preCaptured.join(', ')}.
+` : ''}RULES:
+1. If the user's latest message is about an unrelated topic (groceries, code, reminders, casual chat), drop the check-in and help with their request. The check-in resumes later.
+2. If the user IS engaging, do exactly ONE thing: the NEXT REQUIRED ACTION above. Do not chain tools. Do not ask about more than one missing piece in the same turn.
+3. For activities and photo, the tool IS the question. Calling the tool sends the keyboard or photo prompt to the user. Do not also write a prose question alongside the tool call.
+4. For sleep, ask in prose, then on the next user reply call log_mood_entry.
+5. When commit_journal_entry is the next action, call it then send a short wrap-up. The tool will block if anything critical is still missing.
+=== END HARD RULES ===`;
 }
 
 function getPersona(key) {
@@ -451,8 +494,12 @@ async function handleCommand(command, msg, env) {
 			if (pollRes?.ok) {
 				const pollId = pollRes.result.poll.id;
 				await env.CHAT_KV.put(`mood_poll_${pollId}`, JSON.stringify({
-					chatId, threadId, type: 'mood_checkin', sentAt: Date.now()
+					chatId, threadId, type: 'mood_checkin', sentAt: Date.now(), source: 'manual_command'
 				}), { expirationTtl: 86400 });
+				// Initialise the deterministic flow tracker. Manual /mood always re-runs
+				// the full sequence — this overwrites any prior in-flight flow for today.
+				await moodFlow.startFlow(env, chatId, 'manual_command');
+				log.info('mood_command_invoked', { chatId, pollId });
 			}
 			return true;
 		}
@@ -959,6 +1006,27 @@ Be bold. Reference actual file paths.` }] }],
 			await telegram.sendMessage(chatId, threadId, text, env);
 			return true;
 		}
+		case "/setuptopics": {
+			if (!env.OWNER_ID || String(msg.from.id) !== String(env.OWNER_ID)) {
+				await telegram.sendMessage(chatId, threadId, "This command is owner-only.", env);
+				return true;
+			}
+			const map = await topics.ensureTopics(env, chatId);
+			const labels = {
+				secondBrain: "🧠 Second Brain",
+				moodJournal: "❤️ Mood Journal",
+				weeklyReports: "📊 Weekly Reports"
+			};
+			const lines = Object.entries(labels).map(
+				([k, name]) => `${name}: ${map[k] ? `thread <code>${map[k]}</code> ✅` : "missing ❌"}`
+			);
+			await telegram.sendMessage(
+				chatId, threadId,
+				`<b>Topic setup</b>\n\n${lines.join("\n")}\n\n<i>General is the default for everything else. Existing IDs are preserved.</i>`,
+				env
+			);
+			return true;
+		}
 		default: return false;
 	}
 }
@@ -1195,10 +1263,12 @@ export async function handleMessage(msg, env) {
 		// Build dynamic journal roadmap for evening check-ins
 		let checkinProgress = '';
 		if (currentCheckin === 'evening') {
-			const roadmap = await getCheckinRoadmap(env, userId);
+			const roadmap = await getCheckinRoadmap(env, userId, chatId);
 			if (roadmap.includes('All data collected')) {
 				checkinProgress = ` | ${roadmap}`;
-				env.CHAT_KV.delete(`health_checkin_active_${chatId}`);
+				// Don't auto-clear the active flag here — commit_journal_entry now
+				// owns the lifecycle. Clearing here used to short-circuit the AI's
+				// chance to send a wrap-up message.
 			} else {
 				checkinProgress = ` | ${roadmap}`;
 			}
@@ -1553,12 +1623,38 @@ export async function handleMessage(msg, env) {
 						userParts.unshift({ text: "Describe or respond to this media." });
 					}
 				}
-				// Store media in R2 (fire-and-forget) — pass raw buffer, no decoding
+				// Store media in R2. Normally fire-and-forget, but if the user is in
+				// the photo step of an evening check-in, we AWAIT and auto-link the
+				// photo to today's mood entry, then signal back to the AI.
 				if (env.MEDIA_BUCKET) {
 					const mediaType = media.mimeHint.split('/')[0];
-					mediaStore.storeMedia(env, userId, mediaType, buffer, media.mimeHint, {
-						messageId: String(messageId), filename: media.fileId,
-					}).catch(e => console.error('R2 store error:', e.message));
+					const awaitingPhoto = (mediaType === 'image') && (await moodFlow.isAwaitingPhoto(env, chatId).catch(() => false));
+					if (awaitingPhoto) {
+						try {
+							const storedKey = await mediaStore.storeMedia(env, userId, mediaType, buffer, media.mimeHint, {
+								messageId: String(messageId), filename: media.fileId,
+							});
+							if (storedKey) {
+								const flow = await moodFlow.getFlow(env, chatId);
+								await moodStore.upsertEntry(env, userId, moodStore.todayLondon(), 'evening', {
+									photo_r2_key: storedKey,
+									source: flow?.source || 'cron_poll',
+								});
+								// Edit the original photo prompt message so the Skip button disappears
+								if (flow?.photo?.msg_id) {
+									await telegram.editMessage(chatId, flow.photo.msg_id, 'Photo received. ✓', env, { inline_keyboard: [] }).catch(() => {});
+								}
+								await moodFlow.setStage(env, chatId, 'wrap');
+								log.info('photo_linked_to_journal', { chatId, key: storedKey });
+							}
+						} catch (linkErr) {
+							log.warn('photo_link_failed', { msg: linkErr.message });
+						}
+					} else {
+						mediaStore.storeMedia(env, userId, mediaType, buffer, media.mimeHint, {
+							messageId: String(messageId), filename: media.fileId,
+						}).catch(e => console.error('R2 store error:', e.message));
+					}
 				}
 			} catch (e) {
 				await telegram.sendMessage(chatId, threadId, `⚠️ Media error: ${e.message}`, env, messageId);
@@ -1905,6 +2001,127 @@ export async function handleMessage(msg, env) {
 	}
 }
 
+// ----- Mood-flow callback handlers (added 2026-05-05) -----
+// All callbacks here run inside a deterministic mood-flow stage and update
+// the mood_flow_${chatId} KV state. Side effects on success:
+//   - mood_act|<idx>           toggle activity in pending list, edit keyboard
+//   - mood_act|mode|new        switch keyboard to New mode, edit keyboard
+//   - mood_act|mode|completed  switch keyboard to Completed mode, edit keyboard
+//   - mood_act|done            commit pending adds/removes, advance flow
+//   - mood_act|noop            answer callback only (decorative buttons)
+//   - mood_photo|skip          mark photo skipped, advance flow
+
+async function handleActivitiesCallback(data, callbackQuery, env) {
+	const chatId = callbackQuery.message.chat.id;
+	const threadId = callbackQuery.message.message_thread_id || 'default';
+	const userId = callbackQuery.from?.id || chatId;
+	const msgId = callbackQuery.message.message_id;
+
+	const flow = await moodFlow.getFlow(env, chatId);
+	if (!flow || !flow.activities) {
+		await telegram.answerCallbackQuery(callbackQuery.id, env, 'This keyboard is no longer active.');
+		return;
+	}
+
+	const parts = data.split('|');
+	const sub = parts[1];
+
+	if (sub === 'noop') {
+		return;
+	}
+
+	if (sub === 'mode') {
+		const newMode = parts[2] === 'completed' ? 'completed' : 'new';
+		await moodFlow.setActivitiesMode(env, chatId, newMode);
+		await rerenderActivitiesKeyboard(env, chatId, msgId, threadId, userId);
+		return;
+	}
+
+	if (sub === 'done') {
+		const today = moodStore.todayLondon();
+		const { added, removed } = await moodStore.mergeActivities(
+			env, userId, today, 'evening',
+			flow.activities.pending_new || [],
+			flow.activities.pending_remove || [],
+			flow.source || 'cron_poll'
+		);
+
+		// Render summary directly into the keyboard message so the user sees what landed.
+		const summaryParts = [];
+		if (added.length) summaryParts.push(`Added: ${added.map(k => labelOf(k)).join(', ')}`);
+		if (removed.length) summaryParts.push(`Removed: ${removed.map(k => labelOf(k)).join(', ')}`);
+		const summary = summaryParts.length
+			? summaryParts.join('. ') + '.'
+			: 'No changes to activities.';
+
+		await telegram.editMessage(chatId, msgId, summary, env, { inline_keyboard: [] });
+		await moodFlow.clearActivitiesPending(env, chatId);
+		log.info('activities_committed', { chatId, added: added.length, removed: removed.length });
+
+		// Hand back to the AI with a synthetic user turn describing what was logged.
+		// This lets Xaridotis comment naturally and decide the next step (sleep / photo).
+		const syntheticText = `[I just updated my activities for today. ${summary}]`;
+		const syntheticMsg = {
+			chat: { id: chatId, type: callbackQuery.message.chat.type },
+			from: callbackQuery.from,
+			message_id: msgId,
+			message_thread_id: callbackQuery.message.message_thread_id,
+			text: syntheticText,
+		};
+		await handleMessage(syntheticMsg, env);
+		return;
+	}
+
+	// Otherwise: numeric activity index toggle
+	const idx = parseInt(sub, 10);
+	const activity = ACTIVITY_BY_IDX(idx);
+	if (!activity) {
+		await telegram.answerCallbackQuery(callbackQuery.id, env, 'Unknown activity.');
+		return;
+	}
+	await moodFlow.toggleActivityPending(env, chatId, activity.key);
+	await rerenderActivitiesKeyboard(env, chatId, msgId, threadId, userId);
+}
+
+async function rerenderActivitiesKeyboard(env, chatId, msgId, threadId, userId) {
+	const flow = await moodFlow.getFlow(env, chatId);
+	if (!flow?.activities) return;
+	const today = moodStore.todayLondon();
+	const alreadyLogged = await moodStore.getTodayActivities(env, userId, today);
+	const keyboard = buildActivitiesKeyboard(
+		flow.activities.mode,
+		alreadyLogged,
+		flow.activities.pending_new || [],
+		flow.activities.pending_remove || []
+	);
+	// We only need to update the markup, not the text. editMessageReplyMarkup
+	// is cheaper and avoids "message is not modified" errors for unchanged text.
+	await telegram.editMessageReplyMarkup(chatId, msgId, keyboard, env);
+}
+
+function labelOf(key) {
+	const a = ACTIVITIES.find(x => x.key === key);
+	return a?.label || key;
+}
+
+async function handlePhotoSkipCallback(callbackQuery, env) {
+	const chatId = callbackQuery.message.chat.id;
+	const msgId = callbackQuery.message.message_id;
+	await moodFlow.markPhotoSkipped(env, chatId);
+	await telegram.editMessage(chatId, msgId, 'Photo skipped for today.', env, { inline_keyboard: [] });
+	log.info('photo_skipped', { chatId });
+
+	// Hand back to AI for wrap-up
+	const syntheticMsg = {
+		chat: { id: chatId, type: callbackQuery.message.chat.type },
+		from: callbackQuery.from,
+		message_id: msgId,
+		message_thread_id: callbackQuery.message.message_thread_id,
+		text: '[I skipped the photo for today.]',
+	};
+	await handleMessage(syntheticMsg, env);
+}
+
 export async function handleCallback(callbackQuery, env) {
 	const chatId = callbackQuery.message.chat.id, threadId = callbackQuery.message.message_thread_id || "default";
 	const userId = callbackQuery.from?.id;
@@ -2066,6 +2283,10 @@ export async function handleCallback(callbackQuery, env) {
 			.map(row => row[0].callback_data.split('|')[2]);
 		await env.CHAT_KV.put(`mood_checklist_${chatId}`, JSON.stringify(checkedItems), { expirationTtl: 3600 });
 
+	} else if (data.startsWith("mood_act|")) {
+		await handleActivitiesCallback(data, callbackQuery, env);
+	} else if (data === 'mood_photo|skip') {
+		await handlePhotoSkipCallback(callbackQuery, env);
 	} else if (data.startsWith("chk|")) {
 		const parts = data.split("|");
 		const index = parseInt(parts[1]);
@@ -2266,15 +2487,15 @@ export async function handleCallback(callbackQuery, env) {
 			const selectedStr = await env.CHAT_KV.get(`mood_emo_selected_${chatId}`) || '[]';
 			const selected = JSON.parse(selectedStr);
 
-			// Save all emotions to mood journal
+			// Save emotions to mood journal (fast, <500ms — safe inline).
 			const today = moodStore.todayLondon();
 			if (selected.length > 0) {
 				await moodStore.upsertEntry(env, userId, today, 'evening', { emotions: JSON.stringify(selected) });
 				log.info('mood_emotions_logged', { userId, emotions: selected });
 
-				// Background: auto-tag mood entry with clinical categories (CF AI, free)
+				// Background tagger (CF AI, free) — fire-and-forget, fits inside waitUntil.
 				import('../services/cfAi').then(async ({ tagMoodEntry }) => {
-				const todayEntry = await moodStore.getEntry(env, userId, today, 'evening').catch(() => null);
+					const todayEntry = await moodStore.getEntry(env, userId, today, 'evening').catch(() => null);
 					const parsed = todayEntry?.data ? (typeof todayEntry.data === 'string' ? JSON.parse(todayEntry.data) : todayEntry.data) : {};
 					const tags = await tagMoodEntry(env, parsed.mood_score, selected, parsed.note);
 					if (tags) {
@@ -2284,104 +2505,48 @@ export async function handleCallback(callbackQuery, env) {
 				}).catch(e => console.error('Mood tagging error:', e.message));
 			}
 
-			// Clean up KV
 			await env.CHAT_KV.delete(`mood_emo_selected_${chatId}`);
 
-			// Separate into positive and negative for Nightfall's context
-			const negativeList = ['devastated', 'empty', 'frustrated', 'scared', 'angry', 'depressed', 'sad', 'anxious', 'annoyed', 'insecure', 'lonely', 'confused', 'tired', 'bored', 'nervous', 'disappointed', 'lost'];
-			const negSelected = selected.filter(e => negativeList.includes(e));
-			const posSelected = selected.filter(e => !negativeList.includes(e));
-
-			// Pull recent mood history for context (last 30 days)
-			const recentEntries = await moodStore.getHistory(env, userId, 30, 'evening').catch(() => []);
-			let pastContext = 'No previous check-ins found.';
-			if (recentEntries.length > 1) {
-				const summaries = recentEntries.slice(0, 10).map(e => {
-					const parsed = typeof e.data === 'string' ? JSON.parse(e.data || '{}') : (e.data || {});
-					return `${e.date}: score ${parsed.mood_score ?? '?'}, emotions: ${parsed.emotions || 'none'}`;
-				}).join(' | ');
-				pastContext = `Recent evening check-ins (up to 30 days): ${summaries}`;
-			}
-
-			// Pull therapeutic notes for clinical depth
-			const therapeuticNotes = await env.DB.prepare(
-				`SELECT category, fact FROM memories WHERE user_id = ? AND category IN ('pattern','trigger','schema','insight','homework','growth') ORDER BY created_at DESC LIMIT 10`
-			).bind(userId).all().then(r => r.results || []).catch(() => []);
-			const clinicalCtx = therapeuticNotes.length
-				? 'Clinical notes:\n' + therapeuticNotes.map(n => `[${n.category}] ${n.fact}`).join('\n')
-				: '';
-
-			// Pull semantic context related to their current emotions
-			const emotionQuery = [...negSelected, ...posSelected].join(' ') || 'mood emotions feelings';
-			const semanticCtx = await vectorStore.getSemanticContext(env, userId, emotionQuery).catch(() => '');
-
-			// Pull relevant past episodes (CoALA episodic memory)
-			const allEmotions = [...negSelected, ...posSelected];
-			const relevantEpisodes = allEmotions.length
-				? await episodeStore.getEpisodesByEmotion(env, userId, allEmotions, 5).catch(() => [])
-				: await episodeStore.getRecentEpisodes(env, userId, 5).catch(() => []);
-			const episodeCtx = episodeStore.formatEpisodesForContext(relevantEpisodes);
-
-			// Today's mood score (pull from the entry we just updated)
-			const todayEntry = await moodStore.getEntry(env, userId, today, 'evening').catch(() => null);
-			const todayParsed = todayEntry?.data ? (typeof todayEntry.data === 'string' ? JSON.parse(todayEntry.data) : todayEntry.data) : {};
-			const todayScore = todayParsed.mood_score;
-
-			const contextPrompt = `The user just completed their full mood check-in. Analyse everything and give a meaningful therapeutic summary.
-
-TODAY'S CHECK-IN:
-Mood score: ${todayScore ?? 'not recorded'}/10
-Positive emotions: ${posSelected.length > 0 ? posSelected.join(', ') : 'none selected'}
-Negative emotions: ${negSelected.length > 0 ? negSelected.join(', ') : 'none selected'}
-
-RECENT MOOD HISTORY:
-${pastContext}
-
-${clinicalCtx}
-
-${episodeCtx}
-
-${semanticCtx}
-
-YOUR RESPONSE (follow this structure naturally, not as a list):
-1. Acknowledge what they shared today. Name the emotions they selected. If the mix of positive and negative is notable (e.g. "inspired but lonely"), explore that tension.
-2. Compare to recent days. Is the score trending up, down, or stable? Are certain emotions recurring? Note any patterns without being clinical.
-3. If past episodes are available, reference what happened in similar emotional states before. What helped? What didn't? Use this to inform your suggestion.
-4. Draw one therapeutic observation. Connect today's emotions to known patterns, triggers, or schemas from the clinical notes. Use therapeutic frameworks (AEDP, IFS, schema therapy) as lenses for YOUR thinking — do NOT name them to the user.
-5. End with ONE natural question that invites deeper conversation but doesn't pressure.
-
-Keep it warm, direct, and personal. 3-5 sentences. No bullet points. No clinical jargon unless it adds genuine insight. You know this person well.`;
-
-			try {
-				// Pro + high thinking for therapeutic synthesis (matching Eukara's pattern).
-				// This is the deepest call in the mood flow — quality matters more than speed.
-				const response = await generateDeepResponse(contextPrompt, personas.xaridotis.instruction, env, {
-					thinkingLevel: 'high',
-					maxOutputTokens: 2000,
-				});
-				const synthesis = response || `Thank you for sharing. What has been on your mind today?`;
-				await telegram.sendMessage(chatId, threadId, synthesis, env);
-
-				// Persist BOTH the synthetic user turn and the synthesis in history.
-				// This gives follow-up messages context about the check-in without
-				// re-encoding the button flow as conversation.
-				const selectionLabel = selected.length
-					? `[I finished my check-in. Selected emotions: ${selected.join(', ')}]`
-					: `[I finished my check-in without selecting specific emotions]`;
-				const histKey = `chat_${chatId}_${threadId}`;
-				let hist = await env.CHAT_KV.get(histKey, { type: 'json' }) || [];
-				hist.push({ role: 'user', parts: [{ text: selectionLabel }] });
-				hist.push({ role: 'model', parts: [{ text: synthesis }] });
-				if (hist.length > 24) hist = hist.slice(-24);
-				await env.CHAT_KV.put(histKey, JSON.stringify(hist), { expirationTtl: 604800 });
-
-				// Clear the check-in active flag — the flow is complete
-				await env.CHAT_KV.delete(`health_checkin_active_${chatId}`);
-
-				log.info('mood_synthesis_sent', { userId, emotionsCount: selected.length, synthesisLen: synthesis.length });
-			} catch (e) {
-				log.error('mood_emotion_response', { msg: e.message });
-				await telegram.sendMessage(chatId, threadId, `You selected: ${selected.join(', ')}. What has been driving those feelings?`, env);
+			// Hand off the Pro+thinking synthesis to the queue. Reasons:
+			//   1. The synthesis call is 10-25s on Pro+high thinking. The downstream
+			//      kick that follows is another 5-15s on a full handleMessage pass.
+			//      Together they exceed the 30s waitUntil budget — confirmed by the
+			//      "waitUntil() tasks did not complete" cancellation we hit on
+			//      2026-05-06.
+			//   2. Each step gets its own 15-min queue budget and 3 retries.
+			//   3. If kick fails, retrying the kick alone is safe — the synthesis
+			//      message has already been sent to the user.
+			if (env.TASK_QUEUE) {
+				try {
+					await env.TASK_QUEUE.send({
+						type: 'mood_synthesis_after_emotions',
+						chatId,
+						userId,
+						threadId,
+						msgId,
+						chatType: callbackQuery.message.chat.type,
+						messageThreadId: callbackQuery.message.message_thread_id,
+						fromUser: callbackQuery.from,
+						selected,
+					});
+					log.info('mood_synthesis_queued', { chatId, emotionsCount: selected.length });
+				} catch (queueErr) {
+					log.warn('mood_synthesis_queue_failed', { msg: queueErr.message });
+					// Last-resort fallback: a brief acknowledgement so the user isn't
+					// left staring at a dead chat. The detailed synthesis won't run
+					// because the queue is unavailable.
+					const fallback = selected.length
+						? `You selected: ${selected.join(', ')}. What has been driving those feelings?`
+						: 'What has been on your mind today?';
+					await telegram.sendMessage(chatId, threadId, fallback, env).catch(() => {});
+				}
+			} else {
+				// No queue binding configured. Send a brief acknowledgement so the
+				// flow doesn't feel broken to the user.
+				const noqueue = selected.length
+					? `You selected: ${selected.join(', ')}. What has been driving those feelings?`
+					: 'What has been on your mind today?';
+				await telegram.sendMessage(chatId, threadId, noqueue, env).catch(() => {});
 			}
 		}
 

@@ -4,7 +4,86 @@ A log of significant engineering sessions on Xaridotis (gemini-bot). Most recent
 
 ================================================================================
 
-## 2026-05-06 (latest) — Mood flow Round 3: stripped mid-flow AI, end-only synthesis on Cloudflare-first cascade
+## 2026-05-07 (latest) — Mood flow Round 4: activities and photo always asked, sleep is the only conditional step
+
+### What
+
+Round 3 had a bug. The end-of-flow synthesis used `computeDayCompleteness()` to decide whether the day was "done", and the deterministic flow router used the same day-level check to decide which keyboard or prose ask to send next. That meant: if today already had activities (logged earlier in the day), `/mood` would skip the activities step. If today already had a photo, `/mood` would skip the photo step. The user explicitly never asked for that and pushed back.
+
+The correction: activities and photo are ALWAYS asked. The keyboards already support reviewing today's existing selections and adding or removing items, so re-prompting is the right behaviour. Sleep is the ONLY step that gets skipped if today's data already has it, because asking "how many hours did you sleep last night" twice in one day is real friction.
+
+### Decision: per-step routing, not day-level skipping
+
+`driveNextDeterministicStep` now takes an explicit `step` parameter (`'activities' | 'photo' | 'sleep'`) supplied by the caller. The function no longer reads day-level completeness from D1. It just sends what the caller asked for:
+
+- `step: 'activities'` — always sends the activities keyboard via `sendActivitiesKeyboardTool`. Preamble mentions "ones you have already logged are still here, you can add or remove" so the user knows the keyboard is review-and-modify. Returns true.
+- `step: 'photo'` — always sends the photo prompt with a Skip button. Bypasses `sendPhotoRequestTool` (which noops if a photo already exists today) and sends the keyboard directly via `telegram.sendMessage` + `moodFlow.initPhotoPending`. Returns true.
+- `step: 'sleep'` — the only conditional step. Calls `moodStore.hasSleepLoggedToday`. If sleep is logged, returns false so the caller can fire `maybeFireSynthesis`. If not, sends the prose "How many hours did you sleep last night?" ask and returns true.
+
+Call sites:
+- `mood_emo_done` (after emotions micro-ack) → `driveNextDeterministicStep(…, 'activities')`
+- Activities Done callback → `driveNextDeterministicStep(…, 'photo')`
+- Photo skip callback AND photo upload handler in `handleMessage` → `driveNextDeterministicStep(…, 'sleep')`. If returns false (sleep already logged), caller imports and calls `maybeFireSynthesis`. The photo upload handler returns early so the AI generation pipeline doesn't run on top.
+- Sleep prose reply → user types hours → `log_mood_entry` tool runs → `maybeFireSynthesis` fires from `tools/mood.js`.
+
+### Synthesis trigger simplified
+
+`maybeFireSynthesis` no longer reads day-level completeness flags. The only check is `hasSleepLoggedToday`. Score, emotions, activities, and photo are guaranteed answered "this run" by call-site invariant: the photo handler is the synthesis trigger, and reaching the photo handler means the user has already walked poll → emotions Done → activities Done → photo step in order.
+
+The old log event `mood_synthesis_not_ready` (which dumped a flag breakdown) is replaced with `mood_synthesis_waiting_for_sleep` — clearer signal, since the only thing the function ever waits for now is sleep.
+
+### D1 dedup non-issue
+
+Separate concern raised: "the database shouldn't accumulate redundant records." After querying D1 directly via the Cloudflare MCP, this isn't a real problem. The `mood_journal` schema enforces unique `(user_id, date, entry_type)`, so each entry_type has at most one row per day. Re-running `/mood` UPDATES the existing evening row in place; it doesn't create duplicates. Photo upload either fills `photo_r2_key` on the existing row or overwrites it. The merge logic for activities only writes when adds or removes are non-empty.
+
+If in future we want multiple distinct evening rows per day (one per `flow.started_at` for example), that's a schema change — not in scope.
+
+### What changed
+
+- `src/services/moodSynthesis.js`:
+  - `maybeFireSynthesis` rewritten: only checks sleep day-level. Removed `computeDayCompleteness` call and the flags-breakdown log.
+  - File header comment updated to reflect new behaviour (no more "day-level completeness reads ALL of today's mood rows" claim).
+  - `computeDayCompleteness` function removed entirely (~30 lines + docstring) since `maybeFireSynthesis` was its only caller. Confirmed no other references in `src/`.
+  - Trailing duplicate `} catch` block (left over from an earlier edit) cleaned up.
+  - Renamed log event `mood_synthesis_not_ready` → `mood_synthesis_waiting_for_sleep`.
+- `src/bot/handlers.js`:
+  - `driveNextDeterministicStep(env, chatId, userId, threadId, step)` rewritten with explicit step parameter and three branches as described above.
+  - `mood_emo_done` calls it with `'activities'`.
+  - Activities Done handler calls it with `'photo'` after merge + `advanceStage`.
+  - `handlePhotoSkipCallback` calls it with `'sleep'`. Returns false → imports `maybeFireSynthesis` from `moodSynthesis` and fires.
+  - Photo upload handler in `handleMessage` does the same and returns early.
+
+### Verification plan
+
+1. `grep -rn "computeDayCompleteness" src/` — should return nothing.
+2. `npx wrangler deploy --dry-run` — typecheck.
+3. `npx wrangler deploy --minify`.
+4. Live test `/mood`. Tail should show this trace for a day where sleep is already logged from morning:
+   - poll tap → score-ack (Llama or Gemma)
+   - emotions Done → emotions-ack → `drive_step_activities`
+   - activities Done → `drive_step_photo`
+   - photo upload or Skip → `drive_step_sleep_skipped` → `mood_synthesis_enqueued` → `mood_synthesis_final` consumer runs → `mood_synthesis_tier_ok`
+5. Live test `/mood` for a day where sleep is NOT yet logged:
+   - same up to photo step
+   - photo upload or Skip → `drive_step_sleep` (prose ask sent)
+   - user replies with hours → `log_mood_entry` runs → `mood_synthesis_enqueued` → synthesis runs
+6. `mood_synthesis_waiting_for_sleep` should fire if (and only if) the photo handler reached `maybeFireSynthesis` before sleep was in.
+
+### Risk
+
+Low. The change shrinks logic rather than adding it. The keyboards being unconditional means a small additional friction — user always sees activities and photo prompts even on a duplicate run — but that was Roma's stated preference and matches the keyboard semantics (review and modify, not skip-if-present).
+
+If future use shows the activities preamble is misleading or the keyboard pre-check state isn't obvious, that's a UX iteration on the keyboard, not on the flow router.
+
+### Open thread
+
+- Mood check-in / photo upload investigation from 2026-05-04 still paused. Earlier D1 query showed `photo_r2_key` was always NULL despite the photo step running. With Round 4's photo step now ALWAYS firing (not skipping when today has a photo), this should be easier to root-cause: tail logs after deploy will show whether `photo_linked_to_journal` fires when expected.
+- Cloudflare Workflows rewrite of the health check-in system still queued for a dedicated session.
+- Vectorize migration from 768-dim Matryoshka to 1536-dim `gemini-embedding-2` still deferred as Phase 2.
+
+================================================================================
+
+## 2026-05-06 — Mood flow Round 3: stripped mid-flow AI, end-only synthesis on Cloudflare-first cascade
 
 ### What
 

@@ -610,14 +610,6 @@ async function handleMoodPollAnswer(userId, chatId, threadId, score, env, source
 	if (hist.length > 24) hist = hist.slice(-24);
 	await env.CHAT_KV.put(threadKey, JSON.stringify(hist), { expirationTtl: 604800 });
 
-	// If for some reason emotions are already logged elsewhere today, the day
-	// could be complete after the score lands. Check now so we don't strand a
-	// completed check-in waiting for emotion buttons that were already answered.
-	const { maybeFireSynthesis } = await import('./services/moodSynthesis');
-	await maybeFireSynthesis(env, chatId, userId, threadId).catch((e) => {
-		log.warn('mood_synthesis_fire_failed', { msg: e.message, where: 'after_score' });
-	});
-
 	log.info('mood_score_handled', { userId, score, ackLen: ackText.length });
 }
 

@@ -17,10 +17,11 @@
 // 5-8s. Each tier uses error-feedback first, timeout as silent-hang safety
 // net.
 //
-// Day-level completeness: maybeFireSynthesis() reads ALL of today's mood
-// rows (morning, midday, evening) before deciding to fire. This means
-// sleep logged in the morning won't be re-asked at evening, and the
-// synthesis sees the combined picture of the day.
+// Synthesis-readiness check: maybeFireSynthesis() only checks whether sleep
+// has been logged today (across any entry_type). Score/emotions/activities/
+// photo are guaranteed by the call-site invariant — the photo handler is
+// the synthesis trigger, and reaching the photo handler means the user has
+// already walked poll → emotions → activities Done → photo step in order.
 
 import * as moodStore from './moodStore';
 import * as episodeStore from './episodeStore';
@@ -84,23 +85,31 @@ export async function runSynthesisCascade(env, userId, startedAtMs, systemPrompt
 }
 
 /**
- * Check whether today's mood check-in is fully complete and, if so,
- * enqueue the final synthesis task. Idempotent — uses a KV guard
- * (`mood_synthesis_fired_${chatId}_${date}`) to ensure the task fires
- * at most once per chat per day.
+ * Check whether today's mood check-in can complete and, if so, enqueue the
+ * final synthesis task. Idempotent — uses a KV guard
+ * (`mood_synthesis_fired_${chatId}_${date}`) to ensure the task fires at most
+ * once per chat per day.
  *
- * Day-level completeness: ALL of today's rows (morning + midday + evening)
- * are checked. If any row has the piece, it counts.
+ * Called from exactly two places:
+ *   1. Photo upload handler / photo skip handler — by the time we get here,
+ *      score / emotions / activities / photo are guaranteed answered this
+ *      run (the user walked poll → emotions Done → activities Done → photo
+ *      step in order). The only thing left to check is whether sleep is
+ *      already in today's data; if not, the caller sends a prose sleep ask
+ *      instead of firing synthesis.
+ *   2. logMoodEntryTool.execute — fires after the user replies with sleep
+ *      hours in prose. By this point sleep IS in today's data, so this
+ *      call always returns ready=true (assuming the user did walk the flow).
  *
- * Required pieces:
- *   - mood_score (in any row)
- *   - emotions   (non-empty in any row)
- *   - activities (non-empty in any row)
- *   - sleep_hours (in any row) — OR end of day reached without sleep
- *   - photo_r2_key (in any row) OR photo skipped in flow
+ * The check that gates firing is therefore minimal: do today's rows contain
+ * any sleep_hours? If yes, fire. If no, return false so the caller can ask
+ * for sleep.
  *
- * Called from every advance point (poll-answer, emotions-done,
- * activities-done, photo-upload, photo-skip, log_mood_entry tool).
+ * NOTE on activities + photo: we deliberately do NOT day-level check those
+ * pieces. The previous implementation did, which meant /mood would skip
+ * activities and photo if today already had them. That was wrong — the user
+ * may have new activities or another photo to add. The keyboards already
+ * support add/remove against today's existing items.
  *
  * @param {object} env       Worker env
  * @param {number} chatId    Telegram chat id
@@ -120,31 +129,11 @@ export async function maybeFireSynthesis(env, chatId, userId, threadId) {
 			return false;
 		}
 
-		const dayEntries = await moodStore.getDayEntries(env, userId, today);
-		const completeness = computeDayCompleteness(dayEntries);
-
-		// Photo + flow-skip combined check (photo can be skipped via the flow
-		// keyboard, not just by being present in D1).
-		const moodFlow = await import('../lib/moodFlow');
-		const flow = await moodFlow.getFlow(env, chatId);
-		const photoOk = completeness.hasPhoto || flow?.photo?.skipped === true;
-
-		const ready = completeness.hasScore
-			&& completeness.hasEmotions
-			&& completeness.hasActivities
-			&& completeness.hasSleep
-			&& photoOk;
-
-		if (!ready) {
-			log.info('mood_synthesis_not_ready', {
-				chatId,
-				userId,
-				score: completeness.hasScore,
-				emo: completeness.hasEmotions,
-				act: completeness.hasActivities,
-				sleep: completeness.hasSleep,
-				photo: photoOk,
-			});
+		// Sleep is the only piece we check day-level. Score/emotions/activities/
+		// photo are guaranteed by the call-site invariant (see docstring).
+		const hasSleep = await moodStore.hasSleepLoggedToday(env, userId, today);
+		if (!hasSleep) {
+			log.info('mood_synthesis_waiting_for_sleep', { chatId, userId });
 			return false;
 		}
 
@@ -152,6 +141,9 @@ export async function maybeFireSynthesis(env, chatId, userId, threadId) {
 			log.warn('mood_synthesis_no_queue_binding', { chatId });
 			return false;
 		}
+
+		const moodFlow = await import('../lib/moodFlow');
+		const flow = await moodFlow.getFlow(env, chatId);
 
 		// Set the guard BEFORE enqueueing to avoid double-fire if two advance
 		// points race (e.g. activities-done and photo-skip happen in quick
@@ -175,44 +167,6 @@ export async function maybeFireSynthesis(env, chatId, userId, threadId) {
 }
 
 // ---- Data assembly ----
-
-/**
- * Compute day-level completeness flags by walking ALL of today's mood rows.
- * Each flag is true if ANY row has the piece. This is what makes the flow
- * skip already-answered pieces across entry_types.
- */
-function computeDayCompleteness(dayEntries) {
-	const flags = {
-		hasScore: false,
-		hasEmotions: false,
-		hasActivities: false,
-		hasSleep: false,
-		hasPhoto: false,
-	};
-
-	for (const row of (dayEntries || [])) {
-		if (row.mood_score !== null && row.mood_score !== undefined) flags.hasScore = true;
-
-		if (row.emotions && row.emotions !== '[]' && row.emotions !== 'null') {
-			try {
-				const parsed = JSON.parse(row.emotions);
-				if (Array.isArray(parsed) && parsed.length > 0) flags.hasEmotions = true;
-			} catch { /* skip */ }
-		}
-
-		if (row.activities && row.activities !== '[]' && row.activities !== 'null') {
-			try {
-				const parsed = JSON.parse(row.activities);
-				if (Array.isArray(parsed) && parsed.length > 0) flags.hasActivities = true;
-			} catch { /* skip */ }
-		}
-
-		if (row.sleep_hours !== null && row.sleep_hours !== undefined) flags.hasSleep = true;
-		if (row.photo_r2_key) flags.hasPhoto = true;
-	}
-
-	return flags;
-}
 
 /**
  * Build the data block injected into the synthesis prompt. Pulls today's

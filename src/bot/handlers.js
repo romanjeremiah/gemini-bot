@@ -486,11 +486,20 @@ async function handleCommand(command, msg, env) {
 			if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
 				try {
 					const today = moodStore.todayLondon();
-					const instanceId = `mood_eve_${chatId}_${today}`;
+					// Append timestamp suffix so each /mood invocation gets a unique
+					// instance ID. createBatch is idempotent on existing IDs within the
+					// retention window, which silently no-ops re-runs after the first
+					// terminated/completed instance of the day. The suffix bypasses
+					// that. Cost: two rapid /mood calls in the same second create two
+					// workflows. Acceptable trade-off for trial.
+					const instanceId = `mood_eve_${chatId}_${today}_${Date.now()}`;
 					await env.MOOD_EVE_WORKFLOW.createBatch([{
 						id: instanceId,
-						params: { chatId, userId: msg.from?.id || chatId, threadId, today },
+						params: { chatId, userId: msg.from?.id || chatId, threadId, today, instanceId },
 					}]);
+					// Stash the active instance id so callbacks can find it without
+					// reconstructing the (now timestamped) ID. Key resets daily.
+					await env.CHAT_KV.put(`mood_workflow_active_${chatId}_${today}`, instanceId, { expirationTtl: 24 * 3600 });
 					await moodFlow.startFlow(env, chatId, 'manual_command');
 					log.info('mood_command_workflow_started', { chatId, instanceId });
 					return true;
@@ -1674,7 +1683,9 @@ export async function handleMessage(msg, env) {
 								if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
 									try {
 										const todayLondon = moodStore.todayLondon();
-										const instance = await env.MOOD_EVE_WORKFLOW.get(`mood_eve_${chatId}_${todayLondon}`);
+										const instanceId = await env.CHAT_KV.get(`mood_workflow_active_${chatId}_${todayLondon}`);
+										if (!instanceId) throw new Error('no_active_workflow');
+										const instance = await env.MOOD_EVE_WORKFLOW.get(instanceId);
 										await instance.sendEvent({ type: 'photo_done', payload: { skipped: false, photo_r2_key: storedKey } });
 										log.info('mood_workflow_event_sent', { chatId, type: 'photo_done', skipped: false });
 										return;
@@ -2123,7 +2134,9 @@ async function handleActivitiesCallback(data, callbackQuery, env) {
 		if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
 			try {
 				const today = moodStore.todayLondon();
-				const instance = await env.MOOD_EVE_WORKFLOW.get(`mood_eve_${chatId}_${today}`);
+				const instanceId = await env.CHAT_KV.get(`mood_workflow_active_${chatId}_${today}`);
+				if (!instanceId) throw new Error('no_active_workflow');
+				const instance = await env.MOOD_EVE_WORKFLOW.get(instanceId);
 				await instance.sendEvent({ type: 'activities_done', payload: { added, removed } });
 				workflowHandled = true;
 				log.info('mood_workflow_event_sent', { chatId, type: 'activities_done' });
@@ -2187,7 +2200,9 @@ async function handlePhotoSkipCallback(callbackQuery, env) {
 	if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
 		try {
 			const today = moodStore.todayLondon();
-			const instance = await env.MOOD_EVE_WORKFLOW.get(`mood_eve_${chatId}_${today}`);
+			const instanceId = await env.CHAT_KV.get(`mood_workflow_active_${chatId}_${today}`);
+			if (!instanceId) throw new Error('no_active_workflow');
+			const instance = await env.MOOD_EVE_WORKFLOW.get(instanceId);
 			await instance.sendEvent({ type: 'photo_done', payload: { skipped: true } });
 			log.info('mood_workflow_event_sent', { chatId, type: 'photo_done', skipped: true });
 			return;
@@ -2242,7 +2257,9 @@ async function handleSleepCallback(data, callbackQuery, env) {
 	// the workflow trial.
 	if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
 		try {
-			const instance = await env.MOOD_EVE_WORKFLOW.get(`mood_eve_${chatId}_${today}`);
+			const instanceId = await env.CHAT_KV.get(`mood_workflow_active_${chatId}_${today}`);
+			if (!instanceId) throw new Error('no_active_workflow');
+			const instance = await env.MOOD_EVE_WORKFLOW.get(instanceId);
 			await instance.sendEvent({ type: 'sleep_logged', payload: { sleep_hours: sleepHours, skipped } });
 			log.info('mood_workflow_event_sent', { chatId, type: 'sleep_logged' });
 		} catch (wfErr) {
@@ -2763,7 +2780,9 @@ export async function handleCallback(callbackQuery, env) {
 			if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
 				try {
 					const today = moodStore.todayLondon();
-					const instance = await env.MOOD_EVE_WORKFLOW.get(`mood_eve_${chatId}_${today}`);
+					const instanceId = await env.CHAT_KV.get(`mood_workflow_active_${chatId}_${today}`);
+					if (!instanceId) throw new Error('no_active_workflow');
+					const instance = await env.MOOD_EVE_WORKFLOW.get(instanceId);
 					await instance.sendEvent({ type: 'emotions_done', payload: { emotions: selected } });
 					workflowHandled = true;
 					log.info('mood_workflow_event_sent', { chatId, type: 'emotions_done' });

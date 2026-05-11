@@ -618,7 +618,8 @@ async function handleMoodPollAnswer(userId, chatId, threadId, score, env, source
 	// continues unchanged.
 	if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
 		try {
-			const instanceId = `mood_eve_${chatId}_${today}`;
+			const instanceId = await env.CHAT_KV.get(`mood_workflow_active_${chatId}_${today}`);
+			if (!instanceId) throw new Error('no_active_workflow');
 			const instance = await env.MOOD_EVE_WORKFLOW.get(instanceId);
 			await instance.sendEvent({ type: 'score_received', payload: { score } });
 			log.info('mood_workflow_event_sent', { chatId, type: 'score_received' });

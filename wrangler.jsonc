@@ -10,6 +10,9 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
+	"vars": {
+		"USE_MOOD_WORKFLOW": "true"
+	},
 	"limits": {
 		"cpu_ms": 300000
 	},
@@ -51,6 +54,11 @@
 			"name": "xaridotis-deep-research",
 			"binding": "RESEARCH_WORKFLOW",
 			"class_name": "DeepResearchWorkflow"
+		},
+		{
+			"name": "xaridotis-mood-eve-checkin",
+			"binding": "MOOD_EVE_WORKFLOW",
+			"class_name": "MoodEveningCheckinWorkflow"
 		}
 	],
 	"queues": {

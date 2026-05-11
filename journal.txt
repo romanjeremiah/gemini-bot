@@ -6,6 +6,12 @@ A log of significant engineering sessions on Xaridotis (gemini-bot). Most recent
 
 ## 2026-05-07 (latest) — Mood flow Round 4: activities and photo always asked, sleep is the only conditional step
 
+### Session arc (important context)
+
+This session went through TWO designs. The first attempt implemented day-level skipping for activities and photo ("if today already has activities, don't ask again"), reusing `computeDayCompleteness` from Round 3 to gate both the flow router and the synthesis trigger. Roma pushed back hard mid-session: "There is a fundamentally wrong implementation. I have never asked not to trigger activities; we even implemented the option to select previously selected activities from previous or current mood checks to track them and change them during the day."
+
+The correct rule is below. The journal entry describes the FINAL design only — the abandoned first attempt is not preserved here because it was never deployed beyond a partial test, but the lesson worth carrying forward is: **the activities and photo keyboards are review-and-modify primitives. Their existence in today's data is not a reason to skip them. Sleep is different because the prose ask creates real friction when repeated.**
+
 ### What
 
 Round 3 had a bug. The end-of-flow synthesis used `computeDayCompleteness()` to decide whether the day was "done", and the deterministic flow router used the same day-level check to decide which keyboard or prose ask to send next. That meant: if today already had activities (logged earlier in the day), `/mood` would skip the activities step. If today already had a photo, `/mood` would skip the photo step. The user explicitly never asked for that and pushed back.

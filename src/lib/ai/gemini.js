@@ -140,7 +140,7 @@ async function getOrCreateCache(personaInstruction, formattingRules, mentalHealt
       model,
       config: {
         systemInstruction: staticContent,
-        tools: [{ functionDeclarations: normalizedTools }, { googleSearch: {} }, { codeExecution: {} }],
+        tools: [{ functionDeclarations: normalizedTools }, { googleSearch: {} }],
         toolConfig: { includeServerSideToolInvocations: true },
         ttl: CACHE_TTL,
         displayName: cacheKey,
@@ -167,8 +167,12 @@ function hashStr(str) {
 }
 
 function buildConfig(systemInstruction, opts = {}) {
+  // codeExecution removed: was leaking ⚙️ Computing... segments into user-facing
+  // replies (notably after reminder/tool flows). The Python sandbox cannot access
+  // env, DB, KV, or user data — it was only ever useful for arithmetic, which our
+  // tools already handle. opts.skipCodeExecution is now a no-op kept for call-site
+  // compatibility; remove in a follow-up cleanup.
   const tools = [{ functionDeclarations: normalizedTools }, { googleSearch: {} }];
-  if (!opts.skipCodeExecution) tools.push({ codeExecution: {} });
 
   const config = {
     systemInstruction,
@@ -232,8 +236,6 @@ export async function* sendChatMessage(chat, message, opts = {}) {
   const parts = response.candidates?.[0]?.content?.parts || [];
   for (const part of parts) {
     if (part.text && !part.thought) yield { type: 'text', text: part.text };
-    if (part.executableCode) yield { type: 'text', text: `\n<i>⚙️ Computing...</i>\n` };
-    if (part.codeExecutionResult) yield { type: 'text', text: `\n<b>Result:</b> <code>${part.codeExecutionResult.output.trim()}</code>\n` };
   }
   const calls = parts.filter(p => p.functionCall && p.functionCall.name !== 'googleSearch');
   if (calls.length) yield { type: 'functionCall', calls };
@@ -298,8 +300,6 @@ export async function* sendChatMessageStream(chat, message) {
     const parts = chunk.candidates?.[0]?.content?.parts || [];
     for (const part of parts) {
       if (part.text && !part.thought) yield { type: 'text', text: part.text };
-      if (part.executableCode) yield { type: 'text', text: `\n<i>⚙️ Computing...</i>\n` };
-      if (part.codeExecutionResult) yield { type: 'text', text: `\n<b>Result:</b> <code>${part.codeExecutionResult.output.trim()}</code>\n` };
     }
     const calls = parts.filter(p => p.functionCall && p.functionCall.name !== 'googleSearch');
     if (calls.length) yield { type: 'functionCall', calls };

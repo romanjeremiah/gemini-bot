@@ -37,9 +37,6 @@ function stripLeakedThoughts(text) {
 		// Remove ALL [bracketed internal actions/thoughts] — italic or not
 		.replace(/<i>\s*\[[^\]]{0,300}\]\s*<\/i>/gi, '')
 		.replace(/\[(?:Noticing|Thinking|Considering|Reflecting|Observing|Planning|Analyzing|Processing|Noting|Recalling|Checking|Looking|Adjusting|Scanning|Reviewing|Connecting|Sensing|Reading|Pulling|Searching|Querying|Loading|Fetching|Parsing)[^\]]{0,300}\]/gi, '')
-		// Remove ⚙️ Computing... Result: ... lines
-		.replace(/⚙️\s*Computing[^\n]*\n?/g, '')
-		.replace(/^Result:\s*.*?timestamp:\s*\d+\s*$/gm, '')
 		// Remove ACTION PLAN leaks
 		.replace(/ACTION PLAN[^\n]*(?:\n[-•*][^\n]*)*/g, '')
 		// Remove PROCEDURAL MEMORY leaks
@@ -482,6 +479,26 @@ async function handleCommand(command, msg, env) {
 		}
 		case "/mood": {
 			await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 1800 });
+
+			// Workflow path (trial): when USE_MOOD_WORKFLOW is on, the workflow
+			// instance sends the poll, owns step ordering, and fires synthesis.
+			// The existing KV state machine still runs in parallel for safety.
+			if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
+				try {
+					const today = moodStore.todayLondon();
+					const instanceId = `mood_eve_${chatId}_${today}`;
+					await env.MOOD_EVE_WORKFLOW.createBatch([{
+						id: instanceId,
+						params: { chatId, userId: msg.from?.id || chatId, threadId, today },
+					}]);
+					await moodFlow.startFlow(env, chatId, 'manual_command');
+					log.info('mood_command_workflow_started', { chatId, instanceId });
+					return true;
+				} catch (wfErr) {
+					log.warn('mood_workflow_start_failed_falling_back', { chatId, msg: wfErr.message });
+					// Fall through to the legacy path below.
+				}
+			}
 
 			// Send mood poll (0-10 bipolar scale). Uses the canonical MOOD_POLL_OPTIONS
 			// imported from config/moodScale.js — same text as the scheduled evening poll.
@@ -1652,6 +1669,18 @@ export async function handleMessage(msg, env) {
 								});
 								log.info('photo_linked_to_journal', { chatId, key: storedKey });
 
+								// Workflow path: send photo_done event and skip the legacy
+								// sleep ask + synthesis (workflow owns both).
+								if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
+									try {
+										const todayLondon = moodStore.todayLondon();
+										const instance = await env.MOOD_EVE_WORKFLOW.get(`mood_eve_${chatId}_${todayLondon}`);
+										await instance.sendEvent({ type: 'photo_done', payload: { skipped: false, photo_r2_key: storedKey } });
+										log.info('mood_workflow_event_sent', { chatId, type: 'photo_done', skipped: false });
+										return;
+									} catch (wfErr) { /* fall through to legacy */ }
+								}
+
 								// Sleep is the only conditional step. If sleep is already logged
 								// somewhere today, we're done collecting — fire the synthesis.
 								// Otherwise ask for sleep in prose; the user's reply triggers
@@ -2087,7 +2116,22 @@ async function handleActivitiesCallback(data, callbackQuery, env) {
 
 		// Always send the photo prompt next. The user can re-upload to add another
 		// photo to the day, or tap Skip to move on.
-		await driveNextDeterministicStep(env, chatId, userId, threadId, 'photo');
+		//
+		// Workflow path: send activities_done and skip the deterministic step
+		// (workflow owns the photo prompt).
+		let workflowHandled = false;
+		if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
+			try {
+				const today = moodStore.todayLondon();
+				const instance = await env.MOOD_EVE_WORKFLOW.get(`mood_eve_${chatId}_${today}`);
+				await instance.sendEvent({ type: 'activities_done', payload: { added, removed } });
+				workflowHandled = true;
+				log.info('mood_workflow_event_sent', { chatId, type: 'activities_done' });
+			} catch (wfErr) { /* fall through to legacy step */ }
+		}
+		if (!workflowHandled) {
+			await driveNextDeterministicStep(env, chatId, userId, threadId, 'photo');
+		}
 		return;
 	}
 
@@ -2138,6 +2182,18 @@ async function handlePhotoSkipCallback(callbackQuery, env) {
 
 	const threadId = callbackQuery.message.message_thread_id || 'default';
 
+	// Workflow path: send photo_done and skip the legacy sleep ask + synthesis
+	// path (workflow owns both).
+	if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
+		try {
+			const today = moodStore.todayLondon();
+			const instance = await env.MOOD_EVE_WORKFLOW.get(`mood_eve_${chatId}_${today}`);
+			await instance.sendEvent({ type: 'photo_done', payload: { skipped: true } });
+			log.info('mood_workflow_event_sent', { chatId, type: 'photo_done', skipped: true });
+			return;
+		} catch (wfErr) { /* fall through to legacy */ }
+	}
+
 	// Sleep is the only conditional step. If sleep is already logged today, fire
 	// the synthesis directly. Otherwise ask for sleep; the user's reply triggers
 	// log_mood_entry which fires the synthesis from there.
@@ -2147,6 +2203,51 @@ async function handlePhotoSkipCallback(callbackQuery, env) {
 		await maybeFireSynthesis(env, chatId, userId, threadId).catch((e) => {
 			log.warn('mood_synthesis_fire_failed', { msg: e.message, where: 'after_photo_skip' });
 		});
+	}
+}
+
+async function handleSleepCallback(data, callbackQuery, env) {
+	const chatId = callbackQuery.message.chat.id;
+	const userId = callbackQuery.from?.id || chatId;
+	const msgId = callbackQuery.message.message_id;
+	const sub = data.split('|')[1];
+
+	const today = moodStore.todayLondon();
+	let sleepHours = null;
+	let skipped = false;
+	let summary = '';
+
+	if (sub === 'skip') {
+		skipped = true;
+		summary = 'Sleep skipped.';
+	} else {
+		const n = parseInt(sub, 10);
+		if (!Number.isFinite(n) || n < 4 || n > 12) {
+			await telegram.answerCallbackQuery(callbackQuery.id, env, 'Unknown value.');
+			return;
+		}
+		sleepHours = n;
+		await moodStore.upsertEntry(env, userId, today, 'evening', {
+			sleep_hours: n,
+			source: 'manual_command',
+		});
+		summary = `Sleep: ${n}h logged.`;
+	}
+
+	await telegram.editMessage(chatId, msgId, summary, env, { inline_keyboard: [] }).catch(() => {});
+	log.info('mood_sleep_callback', { chatId, sleepHours, skipped });
+
+	// Send sleep_logged event to the workflow if it exists. This is the only
+	// path that fires this event — sleep is not landed any other way during
+	// the workflow trial.
+	if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
+		try {
+			const instance = await env.MOOD_EVE_WORKFLOW.get(`mood_eve_${chatId}_${today}`);
+			await instance.sendEvent({ type: 'sleep_logged', payload: { sleep_hours: sleepHours, skipped } });
+			log.info('mood_workflow_event_sent', { chatId, type: 'sleep_logged' });
+		} catch (wfErr) {
+			log.warn('mood_workflow_sleep_event_failed', { chatId, msg: wfErr.message });
+		}
 	}
 }
 
@@ -2399,6 +2500,8 @@ export async function handleCallback(callbackQuery, env) {
 		await handleActivitiesCallback(data, callbackQuery, env);
 	} else if (data === 'mood_photo|skip') {
 		await handlePhotoSkipCallback(callbackQuery, env);
+	} else if (data.startsWith('mood_sleep|')) {
+		await handleSleepCallback(data, callbackQuery, env);
 	} else if (data.startsWith("chk|")) {
 		const parts = data.split("|");
 		const index = parseInt(parts[1]);
@@ -2652,7 +2755,23 @@ export async function handleCallback(callbackQuery, env) {
 			// Always send the activities keyboard next. The keyboard reads today's
 			// activities and lets the user add or remove — "already logged" is not
 			// a reason to skip this step.
-			await driveNextDeterministicStep(env, chatId, userId, threadId, 'activities');
+			//
+			// Workflow path: when USE_MOOD_WORKFLOW is on, the workflow owns the
+			// activities step. We send the emotions_done event and skip the
+			// deterministic step here to avoid double-sending the keyboard.
+			let workflowHandled = false;
+			if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
+				try {
+					const today = moodStore.todayLondon();
+					const instance = await env.MOOD_EVE_WORKFLOW.get(`mood_eve_${chatId}_${today}`);
+					await instance.sendEvent({ type: 'emotions_done', payload: { emotions: selected } });
+					workflowHandled = true;
+					log.info('mood_workflow_event_sent', { chatId, type: 'emotions_done' });
+				} catch (wfErr) { /* fall through to legacy step */ }
+			}
+			if (!workflowHandled) {
+				await driveNextDeterministicStep(env, chatId, userId, threadId, 'activities');
+			}
 		}
 
 		// Generate dynamic response for MEDICATION callbacks only (mood_score and mood_cat handle their own)

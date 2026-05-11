@@ -25,6 +25,7 @@ import { wrapD1 } from './lib/db';
 // Export Workflow classes for Cloudflare Workflows binding
 export { MemoryConsolidationWorkflow } from './workflows/memoryConsolidation';
 export { DeepResearchWorkflow } from './workflows/deepResearch';
+export { MoodEveningCheckinWorkflow } from './workflows/moodEveningCheckin';
 
 const BIZ_CONN_TTL = 2592000; // 30 days
 
@@ -611,6 +612,20 @@ async function handleMoodPollAnswer(userId, chatId, threadId, score, env, source
 	await env.CHAT_KV.put(threadKey, JSON.stringify(hist), { expirationTtl: 604800 });
 
 	log.info('mood_score_handled', { userId, score, ackLen: ackText.length });
+
+	// Workflow event: if a mood workflow exists for this chat+date, advance it.
+	// Best-effort — if no workflow exists or the call fails, the legacy KV path
+	// continues unchanged.
+	if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
+		try {
+			const instanceId = `mood_eve_${chatId}_${today}`;
+			const instance = await env.MOOD_EVE_WORKFLOW.get(instanceId);
+			await instance.sendEvent({ type: 'score_received', payload: { score } });
+			log.info('mood_workflow_event_sent', { chatId, type: 'score_received' });
+		} catch (wfErr) {
+			// Workflow may not exist (cron path, no workflow created). Silent.
+		}
+	}
 }
 
 // ---- Spontaneous "Thinking of You" Outreach ----

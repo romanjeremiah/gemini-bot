@@ -60,6 +60,48 @@ function extractEffectEmoji(msg, effectId) {
 // Runs inside the cron handler. Checks London time and sends check-ins as Nightfall.
 
 /**
+ * Handle my_chat_member updates. Fires when a user blocks/unblocks the bot
+ * (private chat), or when the bot is added/removed from a group. The kicked
+ * flag lives in KV and gates cron-driven sends so we don't burn AI tokens
+ * trying to message a chat that will reject every send.
+ *
+ * Status values per Bot API:
+ *   member, administrator, creator           — reachable
+ *   left, kicked, banned, restricted          — not reachable
+ *
+ * Date-stamped daily keys (health_checkin_morning_${today}) are NOT cleared
+ * here because they expire naturally at 24h TTL. Persistent per-chat keys
+ * like topics_${chatId}, timezone_${chatId}, persona_${chatId} are also
+ * preserved so the bot resumes cleanly when the user unblocks.
+ */
+async function handleMyChatMember(update, env) {
+	const cm = update.my_chat_member;
+	const chatId = cm?.chat?.id;
+	const newStatus = cm?.new_chat_member?.status;
+	const oldStatus = cm?.old_chat_member?.status;
+	if (!chatId || !newStatus) return;
+
+	const unreachable = new Set(['left', 'kicked', 'banned', 'restricted']);
+	const reachable = new Set(['member', 'administrator', 'creator']);
+
+	if (unreachable.has(newStatus)) {
+		log.info('bot_chat_member_kicked', { chatId, oldStatus, newStatus });
+		await env.CHAT_KV.put(`bot_kicked_${chatId}`, '1', { expirationTtl: 30 * 86400 });
+		await Promise.all([
+			env.CHAT_KV.delete(`health_checkin_active_${chatId}`),
+			env.CHAT_KV.delete(`med_pending_${chatId}`),
+			env.CHAT_KV.delete(`nudge_pending_morning_${chatId}`),
+			env.CHAT_KV.delete(`nudge_pending_midday_${chatId}`),
+			env.CHAT_KV.delete(`nudge_pending_evening_${chatId}`),
+			env.CHAT_KV.delete(`mood_flow_${chatId}`),
+		]);
+	} else if (reachable.has(newStatus) && unreachable.has(oldStatus)) {
+		log.info('bot_chat_member_reactivated', { chatId, oldStatus, newStatus });
+		await env.CHAT_KV.delete(`bot_kicked_${chatId}`);
+	}
+}
+
+/**
  * Build grounding context for a check-in greeting. Pulls last-24h memories and
  * recent episodes so the model has REAL signals to weave in, not invented ones.
  *
@@ -1218,6 +1260,14 @@ async function enqueueHealthTasks(env) {
 	const today = localTime.toISOString().split('T')[0];
 	const currentMins = hour * 60 + minute;
 
+	// Skip when the bot has been kicked/blocked. handleMyChatMember sets this
+	// flag, and clears it when the user unblocks. Prevents cron from burning
+	// AI tokens trying to message a chat that will reject every send.
+	if (await env.CHAT_KV.get(`bot_kicked_${chatId}`)) {
+		if (minute % 10 === 0) log.info('cron_skip_kicked', { chatId });
+		return;
+	}
+
 	// DIAGNOSTIC: log every cron pass so we can see in tail logs what window
 	// the scheduler is in and which guards fire. Cheap (1 log/min) but invaluable
 	// when a check-in mysteriously doesn't fire. Remove once schedule trust restored.
@@ -1452,7 +1502,7 @@ export default {
 			const workerUrl = `${url.protocol}//${url.host}/`;
 			const body = {
 				url: workerUrl,
-				allowed_updates: ['message', 'callback_query', 'inline_query', 'message_reaction', 'poll_answer', 'business_connection', 'business_message'],
+				allowed_updates: ['message', 'callback_query', 'inline_query', 'message_reaction', 'poll_answer', 'business_connection', 'business_message', 'my_chat_member'],
 			};
 			if (env.WEBHOOK_SECRET) body.secret_token = env.WEBHOOK_SECRET;
 			const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/setWebhook`, {
@@ -1498,6 +1548,14 @@ export default {
 		if (update.message_reaction) {
 			log.info('reaction_received', { chatId: update.message_reaction.chat?.id, msgId: update.message_reaction.message_id });
 			task = handleReactionFeedback(update.message_reaction, env);
+		}
+		else if (update.my_chat_member) {
+			log.info('my_chat_member_received', {
+				chatId: update.my_chat_member.chat?.id,
+				old: update.my_chat_member.old_chat_member?.status,
+				new: update.my_chat_member.new_chat_member?.status,
+			});
+			task = handleMyChatMember(update, env);
 		}
 		else if (update.business_connection) {
 			const bc = update.business_connection;

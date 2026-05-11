@@ -4,6 +4,261 @@ A log of significant engineering sessions on Xaridotis (gemini-bot). Most recent
 
 ================================================================================
 
+## 2026-05-11 (later) — Production hygiene batch: 8 fixes, 1 revert, 1 already-done
+
+### What
+
+Worked through a 10-item production hygiene plan. Eight changes landed, one was
+reverted after a sanity check, and one was already in the codebase from earlier
+work. Goal across the batch: fewer silent failures, less wasted cron AI cost,
+cleaner data going into the LoRA dataset, and the database actually telling
+the truth about when things changed.
+
+The migration is already live in remote D1 (ran via Cloudflare MCP). Code
+changes are staged for the next `wrangler deploy`. See "How to deploy" below.
+
+### The 10-item plan and what landed
+
+1. **my_chat_member handler** — LANDED. New `handleMyChatMember` function in
+   `src/index.js` near `handleHealthCheckIns`. Sets `bot_kicked_${chatId}` KV
+   flag (30-day TTL) when the bot is kicked/blocked, clears it when the user
+   unblocks. Clears immediate-state KV keys on kick:
+   `health_checkin_active`, `med_pending`, `nudge_pending_{morning,midday,evening}`,
+   `mood_flow`. Daily-stamped keys (e.g. `health_checkin_morning_${today}`)
+   are NOT cleared because they expire naturally at 24h TTL. Persistent
+   per-chat keys (`topics_${chatId}`, `timezone_${chatId}`, `persona_${chatId}`,
+   `last_seen_${chatId}`) are preserved so the bot resumes cleanly when
+   unblocked. `enqueueHealthTasks` now early-returns on the kicked flag,
+   logged as `cron_skip_kicked` every 10 minutes. Added `'my_chat_member'`
+   to `allowed_updates` in `/setup-webhook` and a dispatch branch in the
+   webhook router (`my_chat_member_received` log).
+
+2. **retry_after backoff** — LANDED on both surfaces:
+   - `src/lib/telegram.js` `tgApi`: one-shot 429 retry parsing
+     `data.parameters.retry_after` (seconds), capped at `MAX_429_WAIT_MS = 30_000`.
+     Logs `⏳ Telegram 429 on {method} — sleeping {Nms}ms (server: {Ns}s)`.
+   - `src/lib/ai/gemini.js` `withRetry`: prefers server-supplied retry-after
+     over fixed exponential backoff. New `parseRetryAfter(err)` helper sniffs
+     three shapes: `err.retryAfter` numeric, `err.headers['retry-after']`
+     header string, regex match on `retryDelay":"42s"` in the error body.
+     Falls back to expo backoff (1s/2s/4s). Caps at 30s. Logs reason
+     (`server retry-after Nms` vs `expo backoff Nms`).
+
+3. **Index on training_pairs(signal, persona)** — LANDED.
+   `idx_training_pairs_signal_persona` for LoRA-extract queries that slice by
+   reaction type and persona. Doesn't replace `idx_training_pairs_user_signal`;
+   complementary. Live in D1.
+
+4. **updated_at triggers** — LANDED. Four AFTER UPDATE triggers on
+   `user_profiles` (PK user_id), `persona_config` (composite PK
+   user_id+persona_key), `reminders` (PK id), `mood_journal` (PK id). Each
+   guarded by `WHEN OLD.updated_at IS NEW.updated_at` so explicit JS-side
+   writes skip the trigger and the trigger's own UPDATE doesn't recurse. Live
+   in D1. Confirmed via `SELECT type,name,tbl_name FROM sqlite_master`.
+
+5. **Strip leaked thoughts before msg_context_* write** — LANDED. Exported
+   `stripLeakedThoughts` from `src/bot/handlers.js` to `src/lib/formatter.js`
+   so the telegram lib can call it. `sendMessage` now runs it BEFORE the
+   HTML-tag strip when writing `msg_context_${chatId}_${msgId}`. Without
+   this, leaked `[Thinking...]` / `ACTION PLAN` / `PROCEDURAL MEMORY`
+   scaffolding would have survived into the training_pairs table on
+   positive reactions, and a LoRA trained on that data would have learned
+   to emit those bracketed tokens as literal text. `enrichMsgContext`
+   also strips defensively on the user-text side. handlers.js now imports
+   `stripLeakedThoughts` from formatter; single source of truth.
+
+6. **Queue retry alert gating** — ALREADY DONE. Verified the inner catches
+   on `user_message`, `mood_poll_answer`, and `mood_synthesis_final` queue
+   tasks already gate the user-facing alert behind `msg.attempts >= 3`.
+   No change needed.
+
+7. **DLQ + max_retries: 3** — LANDED in wrangler.jsonc. Consumer block now
+   has `max_retries: 3, retry_delay: 30, dead_letter_queue: "gemini-bot-tasks-dlq"`.
+   The DLQ queue MUST be created before deploy will accept the config (see
+   "How to deploy" below). 7-day retention was Roma's choice over 4.
+
+8. **R2 lifecycle rule on mood_journal/** — DEFERRED (dashboard task).
+   Roma to set lifecycle rule deleting `mood_journal/*` after 60 days on R2
+   bucket `gemini-bot-media`. Cost control for accumulated mood photos.
+   Can't be done from wrangler config alone.
+
+9. **Tool description perspective fix** — LANDED on the documented failure
+   case and one adjacent tool:
+   - `src/tools/reminder.js` `set_reminder.task_message`: added rule that
+     text is delivered BACK to user; use SECOND PERSON or imperative;
+     NEVER first person ("I am beautiful" → "You are beautiful") and
+     NEVER third person ("Roman should take his meds" → "Take your meds").
+     Includes good/bad examples. Driven by the 2026-05-04 affirmation bug
+     where the model copied user's `originalRequest` verbatim including
+     first-person.
+   - `src/tools/reminder.js` `update_reminder.new_text`: same rule,
+     references the set_reminder rule.
+   - `src/tools/checklist.js` `create_checklist.items`: imperative or
+     noun phrases ("Take meds", "Buy milk"), never first person
+     ("I take my meds"). Includes conversion guidance for when the user
+     describes their routine in first person.
+   Skipped: `quote.js` (quote is verbatim by design, reply_text already
+   second-person), `poll.js` (already conventional), `memory/episode/
+   therapeutic.js` (third-person observations ABOUT the user — perspective
+   transformation would be wrong), `draft.js` (first-person messages user
+   sends to others).
+
+10. **Nested-blockquote check in sanitiser** — REVERTED after Roma's
+    "why are we changing this" check. The Telegram rule is real ("blockquote
+    and expandable_blockquote entities can't be nested" per
+    core.telegram.org/bots/api), but the journal has no observed incidents
+    of it firing in production. The reminder cron path is already safe
+    (escapeHtml escapes inner `<` `>`). The model-output path is theoretical.
+    The existing strip-all-tags fallback in `sendMessage` already protects
+    against the hard failure mode. Defending against a speculative failure
+    is exactly the pattern that bit us on 2026-05-04 (the `isOverload`
+    keyword check that didn't cover the actual error shape). YAGNI applies
+    here. If `Bad Request: can't parse entities` with a nested blockquote
+    shows up in tail logs, add it then.
+
+### Why I shared the classifier picture before starting
+
+Roma asked at the top of the session whether we have a proper LLM classifier
+or just regex routing. The answer is BOTH, and the split is deliberate:
+
+`tagConversationMode` in `src/services/cfAi.js` IS a real 4-tier waterfall
+classifier (Llama 3.1 8B → Gemma 4 26B → Gemini Flash → Flash-Lite →
+heuristic floor) returning `{mode, confidence, source}` where mode is
+venting/processing/transactional/crisis.
+
+But per `src/ai/router.js` rule 8 comment, we ONLY honour two of those four
+modes for routing: `crisis` (→ Pro for safety) and `transactional` (→
+Flash-Lite for de-escalation). `venting` and `processing` are explicitly
+ignored after the 2026-05-04 incident where a casual 30-char message got
+tagged 'venting' and routed to Pro at 35s. The bulk of routing is regex
+via `COMPLEXITY_PATTERNS.emotional`, `detectComplexTask`, `isSimpleMessage`.
+
+Defensible design: the tagger drives the two high-stakes corners where
+false-negatives are expensive (crisis missed, transactional escalated by
+mistake); regex handles the volume where false-positives are cheap.
+
+No change needed in this batch — just flagging the picture for the next
+session on routing.
+
+### Files changed
+
+- new: `src/migration_005_hygiene.sql` (index + 4 triggers; already applied
+  to remote D1 via Cloudflare MCP, file kept for reference and future
+  fresh installs)
+- `schema.sql`: mirrored the migration so the canonical schema stays in sync
+- `wrangler.jsonc`: queue consumer block gained `max_retries`, `retry_delay`,
+  `dead_letter_queue`
+- `src/lib/formatter.js`: exported `stripLeakedThoughts`
+- `src/lib/telegram.js`: imported `stripLeakedThoughts`, added
+  `MAX_429_WAIT_MS`, rewrote `tgApi` with one-shot 429 retry, updated
+  `sendMessage` and `enrichMsgContext` to strip thoughts before KV writes
+- `src/lib/ai/gemini.js`: rewrote `withRetry`, added `parseRetryAfter` helper
+- `src/bot/handlers.js`: removed local `stripLeakedThoughts`, imports from
+  formatter
+- `src/index.js`: new `handleMyChatMember` function; `bot_kicked` early-return
+  guard in `enqueueHealthTasks`; `'my_chat_member'` added to `allowed_updates`
+  in `/setup-webhook`; dispatch branch in webhook router
+- `src/tools/reminder.js`: perspective rules on `set_reminder.task_message`
+  and `update_reminder.new_text`
+- `src/tools/checklist.js`: perspective rule on `create_checklist.items`
+
+### How to deploy
+
+In order, from `~/Documents/GitHub/gemini-bot`:
+
+1. Create the DLQ queue (must exist before deploy accepts the new wrangler
+   config). 7-day retention per Roma's choice:
+   ```
+   npx wrangler queues create gemini-bot-tasks-dlq --message-retention-period-secs=604800
+   ```
+
+2. Validate the wrangler config compiles:
+   ```
+   npx wrangler deploy --dry-run
+   ```
+
+3. Deploy:
+   ```
+   npx wrangler deploy --minify
+   ```
+
+4. Re-run `/setup-webhook` so Telegram starts sending `my_chat_member`
+   updates (the `allowed_updates` change only takes effect after
+   re-registration):
+   ```
+   curl https://gemini-bot.<worker-subdomain>.workers.dev/setup-webhook
+   ```
+   Or just hit the URL from a browser — it's a GET endpoint.
+
+5. Cloudflare dashboard: set R2 lifecycle rule on bucket `gemini-bot-media`
+   deleting `mood_journal/*` objects after 60 days. Item #8 in the plan.
+
+### Verification after deploy
+
+- `wrangler tail` should show no `bot_kicked_${chatId}` value (you haven't
+  kicked the bot). If you ever do block/unblock, expect
+  `my_chat_member_received` then `bot_chat_member_kicked` (and the
+  symmetrical `bot_chat_member_reactivated`).
+- The first 429 from Telegram or Gemini should now log the new format
+  (`⏳ Telegram 429 on {method} — sleeping ...ms` or
+  `⏳ Gemini retry 1/3 in {N}ms (server retry-after ...)`). May not show
+  up at all if you don't hit a rate limit — absence here is fine.
+- React positively to a bot reply and inspect the resulting `training_pairs`
+  row's `bot_response` column. Should NOT contain any `[Thinking...]` or
+  `ACTION PLAN` text.
+- Ask the model to set an affirmation reminder for yourself. The stored
+  `text` should be in second person ("You are ...") not first person
+  ("I am ..."). If the model still emits first person, the description
+  isn't biting and we revisit.
+- Update a row in any of the four trigger-bound tables and check
+  `updated_at` actually changes: e.g.
+  `UPDATE reminders SET text = text WHERE id = (SELECT id FROM reminders LIMIT 1);`
+  then check `updated_at` is fresh.
+
+### What was already done
+
+- Item #6 (queue retry alert gating). Inner catches in the queue consumer
+  for `user_message`, `mood_poll_answer`, and `mood_synthesis_final` already
+  gate the user-facing alert on `msg.attempts >= 3`. Outer catch logs and
+  retries without alert. No regression risk from this batch.
+
+### Lessons worth carrying forward
+
+1. **Defend against documented constraints, not speculative ones.** The
+   nested-blockquote sanitiser was reverted because nothing in the journal
+   shows the failure mode actually firing. The existing strip-all-tags
+   fallback already covers the hard failure case. Roma flagged this and
+   the revert was correct.
+2. **Single source of truth for shared helpers.** `stripLeakedThoughts`
+   moved from `handlers.js` to `formatter.js` because the telegram lib
+   needed it too. Two copies would have drifted.
+3. **Run migrations via the MCP when destructive risk is low.** Index
+   creation and idempotent trigger creation (with `IF NOT EXISTS`) are safe
+   to run remotely. Saves the round-trip to `wrangler d1 execute`.
+4. **Verify the live schema before writing triggers.** Confirmed all four
+   target tables have `updated_at` columns before writing the triggers.
+   Cheap query, prevents a deploy-time failure.
+5. **Tagger usage is intentionally narrow.** The 4-tier `tagConversationMode`
+   classifier exists and works, but routing only honours `crisis` and
+   `transactional` outputs. Don't widen this without rolling back the
+   2026-05-04 regression first.
+
+### Open thread
+
+- DLQ queue creation and the `/setup-webhook` re-registration are still
+  pending Roma's hands. R2 lifecycle rule is a dashboard task.
+- The mood check-in / photo upload investigation from 2026-05-04 is still
+  paused. Unrelated to this batch.
+- The `hasMedia ? null : setupCache(...)` conditional in `handlers.js`
+  line ~1417 may now be droppable post-codeExecution removal. Still
+  deferred pending the multimodal cache+media end-to-end verification.
+- The stale comment at `handlers.js` line ~1412 about `codeExecution`
+  being "baked into the cache" is still there. Not touched this session.
+- Persona `TOOL SELECTION RULES` block still references `codeExecution`
+  which no longer exists. Cosmetic cleanup, deferred.
+
+================================================================================
+
 ## 2026-05-11 (latest) — Mood flow Round 5: Cloudflare Workflows rewrite of /mood evening check-in, + Computing leak fix
 
 ### Two changes in one session, both shipped

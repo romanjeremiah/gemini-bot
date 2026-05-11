@@ -31,7 +31,7 @@ export const checklistTool = {
 				items: {
 					type: "ARRAY",
 					items: { type: "STRING" },
-					description: "List of tasks (1-30 items)."
+					description: "List of tasks (1-30 items). PERSPECTIVE: tasks are presented BACK to the user, so use imperative or noun phrases — NEVER first person. Good: 'Take meds', 'Email Sarah', 'Buy milk', 'Morning shower'. Bad: 'I take my meds', 'I email Sarah'. If the user describes their routine in first person ('I take meds, I shower'), convert each item to imperative ('Take meds', 'Shower')."
 				}
 			},
 			required: ["title", "items"]

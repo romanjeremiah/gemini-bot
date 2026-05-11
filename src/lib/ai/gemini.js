@@ -47,8 +47,20 @@ async function withRetry(fn, maxRetries = 3, fallbackFn = null) {
         || err?.status === 503 || err?.status === 429;
       if (!isRetryable) throw err;
       lastError = err;
-      const wait = Math.pow(2, i) * 1000;
-      console.log(`⏳ Gemini retry ${i + 1}/${maxRetries} in ${wait / 1000}s`);
+
+      // Prefer the server-supplied Retry-After / retry_after when present.
+      // Gemini sometimes returns it as a Retry-After header (seconds) and
+      // sometimes inside the JSON error body's details. The SDK surfaces the
+      // raw error text in err.message, so we sniff a few shapes. Falls back
+      // to exponential backoff (1s, 2s, 4s) when nothing useful is present.
+      const serverWaitMs = parseRetryAfter(err);
+      const expoMs = Math.pow(2, i) * 1000;
+      const wait = Math.min(
+        Math.max(serverWaitMs ?? expoMs, expoMs),
+        30_000, // cap so a runaway value can't pin the Worker
+      );
+      const reason = serverWaitMs ? `server retry-after ${serverWaitMs}ms` : `expo backoff ${expoMs}ms`;
+      console.log(`⏳ Gemini retry ${i + 1}/${maxRetries} in ${wait}ms (${reason})`);
       await new Promise(r => setTimeout(r, wait));
     }
   }
@@ -57,6 +69,31 @@ async function withRetry(fn, maxRetries = 3, fallbackFn = null) {
     return await fallbackFn();
   }
   throw lastError;
+}
+
+// Best-effort extraction of a retry-after hint from a Gemini SDK error.
+// Looks at: err.headers['retry-after'] (string seconds), err.retryAfter
+// (number seconds), and a JSON body in err.message with retryInfo.retryDelay.
+// Returns milliseconds, or null when nothing trustworthy is present.
+function parseRetryAfter(err) {
+  if (!err) return null;
+  // 1. Explicit numeric field (SDK convenience)
+  if (typeof err.retryAfter === 'number' && err.retryAfter > 0) {
+    return Math.min(err.retryAfter * 1000, 30_000);
+  }
+  // 2. Header style (string seconds)
+  const header = err.headers?.['retry-after'] || err.headers?.['Retry-After'];
+  if (header) {
+    const sec = Number(header);
+    if (Number.isFinite(sec) && sec > 0) return Math.min(sec * 1000, 30_000);
+  }
+  // 3. Embedded protobuf-style detail in error message: "retryDelay":"42s"
+  const m = (err.message || '').match(/retryDelay"?\s*:\s*"?(\d+(?:\.\d+)?)s"?/i);
+  if (m) {
+    const ms = Math.round(parseFloat(m[1]) * 1000);
+    if (ms > 0) return Math.min(ms, 30_000);
+  }
+  return null;
 }
 
 /**

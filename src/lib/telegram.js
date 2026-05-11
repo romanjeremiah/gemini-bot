@@ -1,13 +1,36 @@
-import { sanitizeTelegramHTML } from './formatter';
+import { sanitizeTelegramHTML, stripLeakedThoughts } from './formatter';
+
+// Hard ceiling for a single 429 wait. Telegram occasionally returns very large
+// retry_after values during incidents; we cap so a runaway call doesn't pin
+// a Worker invocation. Beyond this cap we let the error bubble.
+const MAX_429_WAIT_MS = 30_000;
 
 // ---- Core helper ----
 async function tgApi(method, env, payload) {
-	const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/${method}`, {
+	let res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/${method}`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(payload)
 	});
-	const data = await res.json();
+	let data = await res.json();
+
+	// One-shot 429 retry using the server-supplied retry_after. Telegram returns
+	// this in parameters.retry_after (seconds). Older paths used a fixed 120ms
+	// inter-message gap which works for the common case but doesn't help when
+	// the API explicitly tells you how long to wait.
+	if (!data.ok && res.status === 429) {
+		const waitSec = Number(data.parameters?.retry_after) || 1;
+		const waitMs = Math.min(waitSec * 1000, MAX_429_WAIT_MS);
+		console.warn(`⏳ Telegram 429 on ${method} — sleeping ${waitMs}ms (server: ${waitSec}s)`);
+		await new Promise(r => setTimeout(r, waitMs));
+		res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/${method}`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(payload)
+		});
+		data = await res.json();
+	}
+
 	if (!data.ok && !data.description?.includes("message is not modified")) {
 		console.error(`❌ Telegram API Error [${method}]:`, data.description);
 	}
@@ -94,8 +117,14 @@ export async function sendMessage(chatId, threadId, text, env, replyId = null, m
 	// Cache bot message context for reaction correlation (24h TTL)
 	// Stores JSON with bot response text. User message + persona are added by handleMessage
 	// after sendMessage returns, via enrichMsgContext().
+	//
+	// stripLeakedThoughts runs FIRST so any "[Thinking...]" / ACTION PLAN /
+	// PROCEDURAL MEMORY scaffolding never reaches the training_pairs table.
+	// Without this, a LoRA trained on positive-reaction pairs would learn to
+	// emit those bracketed tokens as literal text. The HTML-tag strip below
+	// only removes <tags>, not bracket leaks.
 	if (res.ok && res.result?.message_id && text.length > 20) {
-		const plainText = cleanText.replace(/<[^>]*>/g, '').slice(0, 300);
+		const plainText = stripLeakedThoughts(cleanText).replace(/<[^>]*>/g, '').slice(0, 300);
 		env.CHAT_KV.put(`msg_context_${chatId}_${res.result.message_id}`, JSON.stringify({ botResponse: plainText }), { expirationTtl: 86400 }).catch(() => {});
 	}
 
@@ -104,18 +133,22 @@ export async function sendMessage(chatId, threadId, text, env, replyId = null, m
 
 // Enrich an existing msg_context entry with user message + persona for training pair collection.
 // Called by handleMessage after the bot response is sent.
+//
+// userText is also passed through stripLeakedThoughts in case it contains
+// quoted bracketed content (rare but defensive — the user can paste anything).
 export async function enrichMsgContext(chatId, msgId, userText, persona, env) {
 	const key = `msg_context_${chatId}_${msgId}`;
 	const raw = await env.CHAT_KV.get(key);
 	if (!raw) return;
+	const cleanUserText = stripLeakedThoughts(userText || '').slice(0, 500);
 	try {
 		const ctx = JSON.parse(raw);
-		ctx.userMessage = (userText || '').slice(0, 500);
+		ctx.userMessage = cleanUserText;
 		ctx.persona = persona || 'xaridotis';
 		await env.CHAT_KV.put(key, JSON.stringify(ctx), { expirationTtl: 86400 });
 	} catch {
 		// If the stored value wasn't JSON (legacy format), overwrite with structured data
-		await env.CHAT_KV.put(key, JSON.stringify({ botResponse: raw?.slice(0, 300), userMessage: (userText || '').slice(0, 500), persona: persona || 'xaridotis' }), { expirationTtl: 86400 });
+		await env.CHAT_KV.put(key, JSON.stringify({ botResponse: raw?.slice(0, 300), userMessage: cleanUserText, persona: persona || 'xaridotis' }), { expirationTtl: 86400 });
 	}
 }
 

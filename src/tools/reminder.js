@@ -8,7 +8,7 @@ export const reminderTool = {
 		parameters: {
 			type: "OBJECT",
 			properties: {
-				task_message: { type: "STRING", description: "The reminder text to deliver. Any times in the text MUST use 24-hour format (e.g. '20:00', NOT '8 PM'; '09:30', NOT '9:30 AM')." },
+				task_message: { type: "STRING", description: "The reminder text delivered BACK to the user as a notification. Any times in the text MUST use 24-hour format (e.g. '20:00', NOT '8 PM'; '09:30', NOT '9:30 AM'). PERSPECTIVE: this text is READ BY the user, so use SECOND PERSON or imperative — NEVER first person, NEVER third person. If the user says 'remind me that I am beautiful', the reminder MUST say 'You are beautiful'. If the user says 'remind me to take my meds', say 'Take your meds'. Bad: 'I am beautiful' (first-person, breaks the affirmation when the user reads it); 'Roman should take his meds' (third-person, sounds clinical). Good: 'You are beautiful'; 'Take your meds'." },
 				context: { type: "STRING", description: "The 'why' behind this reminder, phrased as the user would say it to themselves. Use SECOND PERSON ('you', 'your') or neutral verb phrases. NEVER use third person ('Roman', 'he', 'his', 'Roman promised...'). ALL times in 24-hour format (13:00, NOT '1 PM'; 20:30, NOT '8:30 PM'). Good: 'You said you would take it 30 min after the 13:00 check-in', 'Promised to text Mum about the weekend'. Bad: 'Roman promised to take his medication', 'after our 1 PM check-in'. Keep it brief — one sentence maximum." },
 				due_at_timestamp: { type: "INTEGER", description: "Unix timestamp (UTC) when the reminder should fire" },
 				recurrence_type: { type: "STRING", enum: ["none", "daily", "weekly", "monthly"] },
@@ -142,7 +142,7 @@ export const updateReminderTool = {
 				},
 				new_text: {
 					type: "STRING",
-					description: "Replacement reminder text. Same formatting rules as set_reminder — 24-hour times. Omit to leave unchanged."
+					description: "Replacement reminder text. Same rules as set_reminder.task_message — 24-hour times AND second-person/imperative perspective ('You are beautiful', 'Take your meds', NOT 'I am beautiful' and NOT 'Roman should take his meds'). Omit to leave unchanged."
 				},
 				new_due_at_timestamp: {
 					type: "INTEGER",

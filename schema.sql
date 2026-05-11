@@ -166,3 +166,57 @@ CREATE TABLE IF NOT EXISTS training_pairs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_training_pairs_user_signal ON training_pairs(user_id, signal);
+CREATE INDEX IF NOT EXISTS idx_training_pairs_signal_persona ON training_pairs(signal, persona);
+
+-- ==========================================
+-- updated_at triggers (migration 005)
+--
+-- SQLite does not auto-bump DATETIME columns on UPDATE; the
+-- DEFAULT CURRENT_TIMESTAMP only applies on INSERT. These triggers fix that.
+-- The `WHEN OLD.updated_at IS NEW.updated_at` guard makes them idempotent:
+-- if application code already set updated_at explicitly, the trigger skips.
+-- ==========================================
+
+DROP TRIGGER IF EXISTS trg_user_profiles_updated_at;
+CREATE TRIGGER trg_user_profiles_updated_at
+    AFTER UPDATE ON user_profiles
+    FOR EACH ROW
+    WHEN OLD.updated_at IS NEW.updated_at
+BEGIN
+    UPDATE user_profiles
+       SET updated_at = CURRENT_TIMESTAMP
+     WHERE user_id = NEW.user_id;
+END;
+
+DROP TRIGGER IF EXISTS trg_persona_config_updated_at;
+CREATE TRIGGER trg_persona_config_updated_at
+    AFTER UPDATE ON persona_config
+    FOR EACH ROW
+    WHEN OLD.updated_at IS NEW.updated_at
+BEGIN
+    UPDATE persona_config
+       SET updated_at = CURRENT_TIMESTAMP
+     WHERE user_id = NEW.user_id AND persona_key = NEW.persona_key;
+END;
+
+DROP TRIGGER IF EXISTS trg_reminders_updated_at;
+CREATE TRIGGER trg_reminders_updated_at
+    AFTER UPDATE ON reminders
+    FOR EACH ROW
+    WHEN OLD.updated_at IS NEW.updated_at
+BEGIN
+    UPDATE reminders
+       SET updated_at = CURRENT_TIMESTAMP
+     WHERE id = NEW.id;
+END;
+
+DROP TRIGGER IF EXISTS trg_mood_journal_updated_at;
+CREATE TRIGGER trg_mood_journal_updated_at
+    AFTER UPDATE ON mood_journal
+    FOR EACH ROW
+    WHEN OLD.updated_at IS NEW.updated_at
+BEGIN
+    UPDATE mood_journal
+       SET updated_at = CURRENT_TIMESTAMP
+     WHERE id = NEW.id;
+END;

@@ -1,4 +1,5 @@
 import { personas, FORMATTING_RULES, MENTAL_HEALTH_DIRECTIVE, SECOND_BRAIN_DIRECTIVE } from '../config/personas';
+import { stripLeakedThoughts } from '../lib/formatter';
 import { MOOD_POLL_OPTIONS } from '../config/moodScale';
 import { createChat, sendChatMessage, sendChatMessageStream, generateImage, setupCache, PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, FLASH_LITE_TEXT_MODEL, generateShortResponse, generateWithFallback, generateDeepResponse, StreamIdleError } from '../lib/ai/gemini';
 import { routeMessage, createProvider } from '../ai/router';
@@ -30,21 +31,9 @@ const HISTORY_LENGTH = 24;
 const HISTORY_TTL = 604800;
 const DRAFT_THROTTLE_MS = 500;
 
-/** Strip leaked thinking/internal reasoning from model output */
-function stripLeakedThoughts(text) {
-	if (!text) return text;
-	return text
-		// Remove ALL [bracketed internal actions/thoughts] — italic or not
-		.replace(/<i>\s*\[[^\]]{0,300}\]\s*<\/i>/gi, '')
-		.replace(/\[(?:Noticing|Thinking|Considering|Reflecting|Observing|Planning|Analyzing|Processing|Noting|Recalling|Checking|Looking|Adjusting|Scanning|Reviewing|Connecting|Sensing|Reading|Pulling|Searching|Querying|Loading|Fetching|Parsing)[^\]]{0,300}\]/gi, '')
-		// Remove ACTION PLAN leaks
-		.replace(/ACTION PLAN[^\n]*(?:\n[-•*][^\n]*)*/g, '')
-		// Remove PROCEDURAL MEMORY leaks
-		.replace(/PROCEDURAL MEMORY[^\n]*(?:\n[-•*][^\n]*)*/g, '')
-		// Clean up resulting double newlines
-		.replace(/\n{3,}/g, '\n\n')
-		.trim();
-}
+// stripLeakedThoughts moved to lib/formatter.js so the telegram lib can call it
+// before caching model output into msg_context_*. Same implementation, single
+// source of truth.
 
 /** Split long text into chunks at paragraph boundaries, preserving HTML tag state across chunks */
 function splitMessage(text, maxLen = 3900) {

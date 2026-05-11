@@ -14,6 +14,41 @@ const PLAIN_ALLOWED_TAGS = new Set([
 ]);
 
 /**
+ * Strip leaked thinking / internal reasoning from model output.
+ *
+ * Lives here (not handlers.js) so the telegram lib can call it BEFORE caching
+ * model output into msg_context_* KV entries. Without this, leaked bracketed
+ * thoughts like "[Thinking...]" survive into the training_pairs table when
+ * the user reacts positively, and a LoRA trained on that data would learn to
+ * produce those bracketed tokens as literal conversational text.
+ *
+ * Matches three classes of leak:
+ *   1. <i>[bracket]</i> wrappers — both the italic markers and the brackets.
+ *   2. [Verb...] bracketed thought blocks (Noticing, Thinking, Reflecting,
+ *      Considering, etc.) — verb list curated from observed Gemini leaks.
+ *   3. ACTION PLAN and PROCEDURAL MEMORY scaffolding blocks that occasionally
+ *      escape the model's internal reasoning into the user-facing reply.
+ *
+ * NOT a sanitiser for safety — only for cleaning model artefacts. Caller
+ * should still pass the result through sanitizeTelegramHTML for HTML safety.
+ */
+export function stripLeakedThoughts(text) {
+	if (!text) return text;
+	return text
+		// Remove ALL [bracketed internal actions/thoughts] — italic or not
+		.replace(/<i>\s*\[[^\]]{0,300}\]\s*<\/i>/gi, '')
+		.replace(/\[(?:Noticing|Thinking|Considering|Reflecting|Observing|Planning|Analyzing|Processing|Noting|Recalling|Checking|Looking|Adjusting|Scanning|Reviewing|Connecting|Sensing|Reading|Pulling|Searching|Querying|Loading|Fetching|Parsing)[^\]]{0,300}\]/gi, '')
+		// Remove ACTION PLAN leaks
+		.replace(/ACTION PLAN[^\n]*(?:\n[-•*][^\n]*)*/g, '')
+		// Remove PROCEDURAL MEMORY leaks
+		.replace(/PROCEDURAL MEMORY[^\n]*(?:\n[-•*][^\n]*)*/g, '')
+		// Clean up resulting double newlines
+		.replace(/\n{3,}/g, '\n\n')
+		.trim();
+}
+
+
+/**
  * Sanitise a string to be safe for Telegram's HTML parse_mode.
  *
  * Behaviour:

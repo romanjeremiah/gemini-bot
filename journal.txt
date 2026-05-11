@@ -4,7 +4,120 @@ A log of significant engineering sessions on Xaridotis (gemini-bot). Most recent
 
 ================================================================================
 
-## 2026-05-07 (latest) — Mood flow Round 4: activities and photo always asked, sleep is the only conditional step
+## 2026-05-11 (latest) — Mood flow Round 5: Cloudflare Workflows rewrite of /mood evening check-in, + Computing leak fix
+
+### Two changes in one session, both shipped
+
+1. Removed the `codeExecution` Gemini tool at SDK level, killing the long-running `⚙️ Computing...` leak that appeared after reminders and other tool calls.
+2. Replaced the KV-state-machine driving the `/mood` evening check-in with a Cloudflare Workflow that owns step ordering durably and fires synthesis as the last step. Trial-gated behind `USE_MOOD_WORKFLOW=true`. Legacy `moodFlow.js` KV path still runs in parallel for now.
+
+The Computing fix was straightforward. The Workflows rewrite took three deploys to land cleanly because of two subtle bugs that I owe to writing too much code before validating assumptions. Both bugs and their fixes are documented below.
+
+### Why a workflow at all
+
+The Round 4 KV state machine had a Bug A + Bug B that surfaced on 2026-05-10: activities keyboards were being re-fired at 20-21 minute intervals if the user took longer than `STALL_THRESHOLD_MS` (20 min) to respond. Root cause: `moodFlow.js` had `FLOW_TTL_SECONDS = 30 * 60` and a stall detector that re-triggered the current step. Both were trying to be helpful and ended up duplicating user-visible UI.
+
+We considered three fixes:
+- A. Tune the stall threshold and TTL to not overlap
+- B. Remove the stall detector
+- C. Move /mood to Cloudflare Workflows where step ordering is durable by construction
+
+C won because Roma scoped it that way and because the stall detector was solving the wrong problem (Telegram already delivers callbacks reliably; users just take time). Workflows replace the homemade state machine with a primitive built for exactly this — multi-step flows with arbitrary pauses, retries, and `step.waitForEvent`.
+
+We stayed with Workflows rather than Durable Objects because D1 still owns the mood data and we did not want to migrate that to DO storage. Workflows + D1 is the right combination here.
+
+### Architecture
+
+New file: `src/workflows/moodEveningCheckin.js`. Class `MoodEveningCheckinWorkflow extends WorkflowEntrypoint`. Twelve steps:
+
+1. `send-score-poll` — posts the 0-10 bipolar poll to Telegram via direct fetch. Stashes poll_id → workflow context in KV under `mood_poll_${pollId}` so the existing poll_answer dispatcher can route the response back.
+2. `await-score` — waits 4h for event `score_received` payload `{score}`.
+3. `await-emotions` — waits 4h for event `emotions_done` payload `{emotions: string[]}`. The existing handler in `index.js` (`handleMoodPollAnswer`) handles the score-ack AI message and emotion category buttons; we did NOT duplicate that into the workflow. Same for the post-emotions ack via `handleMoodPollAnswer`'s sibling `runEmotionsAck` triggered by the `mood_emo_done` callback handler.
+4. `send-activities-keyboard` — workflow renders the keyboard directly (this is the bug-A fix: only the workflow can render it now, not the stall detector).
+5. `await-activities` — waits 4h for `activities_done` payload `{added, removed}`.
+6. `send-photo-prompt` — renders the photo ask. If `hasPhotoLoggedToday` is true, returns `{skipped: true}` and the workflow skips the wait.
+7. `await-photo` — gated behind `if (!photoStepResult?.skipped)`. Waits 4h for `photo_done` payload `{skipped, photo_r2_key?}`.
+8. `send-sleep-keyboard` — NEW UX: deterministic keyboard `[4h] [5h] [6h] / [7h] [8h] [9h] / [10h] [11h] [12h+] / [Skip]`. Same skip pattern: if `hasSleepLoggedToday`, returns `{skipped: true}`.
+9. `await-sleep` — gated behind `if (!sleepStepResult?.skipped)`. Waits 4h for `sleep_logged` payload.
+10. `fire-synthesis` — runs the existing 6-tier cascade `runSynthesisCascade` INLINE inside the workflow step. Sets the KV synthesis guard first to avoid double-fire with the legacy queue path. Sends typing indicator then the synthesis message. Cleans up `moodFlow.endFlow` and `health_checkin_active_${chatId}`.
+
+Six wiring points in `handlers.js` and one in `index.js` (`handleMoodPollAnswer`) emit the events. Each is gated on `env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW` and looks up the active instance ID from KV (see Bug 2 below). When the workflow is active, the legacy `driveNextDeterministicStep` call is skipped — the workflow renders the next keyboard, not the callback handler.
+
+New callback `handleSleepCallback` added for `mood_sleep|<value>` pattern. Routes to D1 upsert + emits `sleep_logged` event.
+
+New workflow binding in `wrangler.jsonc`: `MOOD_EVE_WORKFLOW` → class `MoodEveningCheckinWorkflow` name `xaridotis-mood-eve-checkin`. New `vars` block with `USE_MOOD_WORKFLOW: "true"`. Export added to `src/index.js`.
+
+### Bug 1: `createBatch` is idempotent on existing instance IDs within retention window
+
+First run worked end-to-end except for stalling at `await-sleep`. We fixed that with the photo/sleep skip guards (commit `d05f9a2`). On the next run, `/mood` started logging `mood_command_workflow_started` but then nothing else fired — no poll, no Telegram messages, no further workflow events.
+
+Diagnosis took longer than it should have. The instance ID was `mood_eve_${chatId}_${today}` — fully deterministic, one per day. The Cloudflare docs note that `createBatch` is idempotent: "if an existing instance with the same ID is still within its retention limit, it will be skipped and excluded from the returned array." I had read that but underweighted it. The first run's stuck instance (which we terminated via the dashboard) was still in retention, so every subsequent `/mood` silently no-op'd at the `createBatch` call. The `mood_command_workflow_started` log fired regardless because it sits BEFORE the actual idempotency check — misleading. Lesson: log AFTER the side effect, not before.
+
+Quick fix: appended `Date.now()` to the instance ID so each `/mood` invocation is unique. Stashed the instance ID in KV under `mood_workflow_active_${chatId}_${today}` (24h TTL) so the five callback handlers could look it up without reconstructing it.
+
+### Bug 2: `handleMoodPollAnswer` in `index.js` still constructed the old deterministic ID
+
+After the timestamp-suffix fix, the next run got further: `mood_workflow_event_sent` fired for `emotions_done`, `activities_done`, `photo_done`. But `score_received` never appeared. The workflow stalled at `await-score`.
+
+Reason: I had updated the five callback sites in `handlers.js` to read the instance ID from KV, but missed `handleMoodPollAnswer` in `index.js`. It was still constructing `mood_eve_${chatId}_${today}` (no timestamp), calling `MOOD_EVE_WORKFLOW.get(instanceId)`, and the `sendEvent` was being dropped because the instance didn't exist. The catch block was silent — no log line, no surfaced error. The workflow processed `emotions_done` and later events but they were dropped on the floor because the workflow was still in `await-score` (Workflows discard events that arrive before the matching `waitForEvent` is reached).
+
+Fixed by updating `index.js` to read from the same KV key. Lesson: when refactoring the call pattern at one site, grep for every site sharing the same shape.
+
+### Final successful run (2026-05-11 10:25 BST)
+
+Instance `mood_eve_62047005_2026-05-11_1778491464911`. Status `✅ Completed`, success `✅ Yes`. All 9 active steps ran (sleep keyboard skipped because `sleep_hours=7` was already in today's row from late last night). End-to-end duration 1m22s. Synthesis fired from `fire-synthesis-1` inline: `llama-3.3-70b`, 13.8s, 1611 chars. Confirmed no `queue_task_received` for `mood_synthesis_final` in the tail during the workflow run — synthesis ran inside the workflow, not via the queue.
+
+A stray tail log `MoodEveningCheckinWorkflow.run - Exception Thrown` appeared at 10:24:28 but that timestamp matched the START of the run, not its end. After re-reading the tail it became clear that log was surfacing the terminated previous instance, not a failure in the successful run.
+
+### Computing leak fix
+
+Separate from the workflow work. `src/lib/ai/gemini.js`:
+- Removed `{ codeExecution: {} }` from the cache `tools` array and from `buildConfig`.
+- Removed `executableCode` and `codeExecutionResult` yield branches from `sendChatMessage` and `sendChatMessageStream`. Those were emitting `⚙️ Computing...` and `Result: ...` strings into the stream.
+- Left `opts.skipCodeExecution` as a no-op for call-site compat. Marked as dead code for cleanup.
+
+`src/bot/handlers.js`:
+- Removed the `⚙️ Computing` and `Result: ... timestamp:` regexes from `stripLeakedThoughts`. They were a second line of defence that's no longer needed.
+
+The Gemini Python sandbox cannot access env / DB / KV / user data — only useful for arithmetic, which our tools already handle natively. The cost-benefit was nowhere close, especially given the leak.
+
+Verified via Cloudflare cache+media docs that multimodal caching IS supported on Gemini 3.x. The `hasMedia ? null : setupCache(...)` conditional in `handlers.js` line ~1417 can probably be dropped, but I deferred it — pairs with the paused photo upload investigation, and removing one without the other risks confusing failure modes.
+
+### Files changed
+
+- new: `src/workflows/moodEveningCheckin.js` (~250 lines)
+- `wrangler.jsonc`: added workflow binding, added `vars` block with `USE_MOOD_WORKFLOW: "true"`
+- `src/index.js`: exported workflow class; updated `handleMoodPollAnswer` to read instance ID from KV and emit `score_received` event
+- `src/bot/handlers.js`: six wiring points emitting workflow events; new `handleSleepCallback` for `mood_sleep|<value>`; `/mood` command now creates the workflow instance (with timestamp suffix) when `USE_MOOD_WORKFLOW=true`
+- `src/lib/ai/gemini.js`: removed `codeExecution` tool registration and emitter branches
+
+### Commits shipped
+
+- `ac2cfae` feat(mood): workflow rewrite of evening check-in + remove codeExecution leak
+- `d05f9a2` fix(mood-workflow): skip waitForEvent when photo/sleep step was skipped
+- Final fix commit for the instance-ID lookup bug (Bug 2)
+
+### Lessons worth carrying forward
+
+1. **Workflows `createBatch` is idempotent on terminated instances within retention.** Re-using a deterministic ID across the day will silently no-op once the first instance lands in retention, even if it terminated. Either include a timestamp/version suffix or call `.get(id).restart()` explicitly. We chose the timestamp suffix for the trial; a cleaner approach is a versioned suffix for re-runs.
+2. **Log events AFTER the side effect, not before.** `mood_command_workflow_started` fired before `createBatch` actually started anything. That cost real diagnosis time.
+3. **Workflows discard `sendEvent` calls that arrive before the matching `waitForEvent` is reached.** When events seem to be received but the workflow doesn't progress, check the instance's current `Last Successful Step` — the events you're sending may be for steps the workflow hasn't reached yet.
+4. **When refactoring how a pattern is called, grep for every call site.** Bug 2 was a single missed call site in `index.js` that swallowed `score_received` events silently. The silent catch made it look like the workflow was misbehaving when actually our wiring was the problem.
+5. **Trial-gating with a feature flag was worth it.** Three deploys, three bugs caught and fixed without users (just me) noticing because the legacy KV path ran in parallel throughout. `USE_MOOD_WORKFLOW=false` would have been a one-line revert.
+
+### What's deferred for follow-up
+
+- Cron-driven evening check-in still uses the legacy KV path. Migration is a future session — the workflow only triggers on `/mood` for now.
+- The legacy KV state machine in `moodFlow.js` still runs in parallel. Once the workflow is stable for a week, delete the redundant path. Some helpers (`initActivitiesPending`, `initPhotoPending`) are still called from the workflow as bridges to the existing keyboard callbacks; we'll need to inline those before deleting.
+- `opts.skipCodeExecution` in `gemini.js` is dead code.
+- Stale comment at `handlers.js` line ~1412 about cache having `codeExecution` baked in is wrong now.
+- Persona `TOOL SELECTION RULES` block — `codeExecution` rule describes a nonexistent tool, can be cleaned up.
+- `hasMedia ? null : setupCache(...)` investigation, paired with the paused photo upload investigation. Multimodal cache+media on Gemini 3.x is documented as supported but not yet verified end-to-end in this codebase.
+- The new sleep keyboard wasn't visible in today's tests because today's row already had `sleep_hours=7` from last night's late-rolling entry. First proper visual test of the sleep keyboard happens tomorrow when the row resets.
+
+================================================================================
+
+## 2026-05-07 — Mood flow Round 4: activities and photo always asked, sleep is the only conditional step
 
 ### Session arc (important context)
 

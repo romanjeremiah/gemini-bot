@@ -152,7 +152,7 @@ export class MoodEveningCheckinWorkflow extends WorkflowEntrypoint {
 		});
 
 		// ----- 8. Send photo prompt -----
-		await step.do('send-photo-prompt', {
+		const photoStepResult = await step.do('send-photo-prompt', {
 			retries: { limit: 2, delay: '2 seconds', backoff: 'exponential' },
 			timeout: '15 seconds',
 		}, async () => {
@@ -182,18 +182,20 @@ export class MoodEveningCheckinWorkflow extends WorkflowEntrypoint {
 		});
 
 		// ----- 9. Wait for photo or skip -----
-		// If the photo step was skipped at send time (already-today shortcut),
-		// the photo_done event is sent immediately by the dispatcher. Either
-		// way we wait for it.
-		await step.waitForEvent('await-photo', {
-			type: 'photo_done',
-			timeout: '4 hours',
-		});
+		// Only wait if the photo prompt actually rendered. If we skipped because
+		// a photo was already logged today, there is no UI for the user to act
+		// on, so waiting would stall the workflow for 4 hours.
+		if (!photoStepResult?.skipped) {
+			await step.waitForEvent('await-photo', {
+				type: 'photo_done',
+				timeout: '4 hours',
+			});
+		}
 
 		// ----- 10. Send sleep keyboard -----
 		// Deterministic. 4h..12h+ + Skip. If sleep is already logged today,
 		// skip the prompt and treat as already-done.
-		await step.do('send-sleep-keyboard', {
+		const sleepStepResult = await step.do('send-sleep-keyboard', {
 			retries: { limit: 2, delay: '2 seconds', backoff: 'exponential' },
 			timeout: '15 seconds',
 		}, async () => {
@@ -241,10 +243,13 @@ export class MoodEveningCheckinWorkflow extends WorkflowEntrypoint {
 		});
 
 		// ----- 11. Wait for sleep -----
-		await step.waitForEvent('await-sleep', {
-			type: 'sleep_logged',
-			timeout: '4 hours',
-		});
+		// Same shortcut as photo: skip the wait if the keyboard wasn't rendered.
+		if (!sleepStepResult?.skipped) {
+			await step.waitForEvent('await-sleep', {
+				type: 'sleep_logged',
+				timeout: '4 hours',
+			});
+		}
 
 		// ----- 12. Fire synthesis -----
 		// Runs the 6-tier cascade inline (not via the queue) so we can persist

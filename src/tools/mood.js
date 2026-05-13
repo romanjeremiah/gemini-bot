@@ -132,10 +132,60 @@ IMPORTANT for SOURCE: do NOT pass a 'source' parameter — the runtime sets it a
 			// the final synthesis. The AI should NOT also write a wrap-up reply in
 			// the same turn — the synthesis is the wrap-up. We signal this back via
 			// the next_step field below.
-			try {
-				const { maybeFireSynthesis } = await import('../services/moodSynthesis');
-				synthesisFired = await maybeFireSynthesis(env, context.chatId, context.userId, context.threadId);
-			} catch { /* best-effort */ }
+			//
+			// LAYER 3 (2026-05-13) workflow bridge: when the user types data (score,
+			// emotions, activities, sleep) instead of tapping the keyboard, dispatch
+			// the matching event(s) to the active workflow so it can progress. The
+			// workflow's step 13 owns synthesis on this path. Without this bridge,
+			// the workflow would sit at waitForEvent for the full 4h timeout.
+			let workflowHandledFlow = false;
+			if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
+				try {
+					const instanceId = await env.CHAT_KV.get(`mood_workflow_active_${context.chatId}_${date}`);
+					if (instanceId) {
+						const instance = await env.MOOD_EVE_WORKFLOW.get(instanceId);
+						// Dispatch one event per field present. Workflow drains them in
+						// order via successive waitForEvent calls. Sending an event the
+						// workflow has already moved past is harmless — it queues and
+						// is consumed on the next waitForEvent, or expires.
+						if (args.mood_score !== undefined && args.mood_score !== null) {
+							await instance.sendEvent({ type: 'score_received', payload: { score: args.mood_score } });
+							console.log(`📨 Workflow bridge: score_received score=${args.mood_score}`);
+						}
+						if (args.emotions && Array.isArray(args.emotions) && args.emotions.length) {
+							await instance.sendEvent({ type: 'emotions_done', payload: { emotions: args.emotions } });
+							console.log(`📨 Workflow bridge: emotions_done count=${args.emotions.length}`);
+						}
+						if (canonActivities && canonActivities.length) {
+							await instance.sendEvent({ type: 'activities_done', payload: { activities: canonActivities } });
+							console.log(`📨 Workflow bridge: activities_done count=${canonActivities.length}`);
+						}
+						if (args.sleep_hours !== undefined && args.sleep_hours !== null) {
+							await instance.sendEvent({ type: 'sleep_logged', payload: { sleep_hours: args.sleep_hours, skipped: false } });
+							console.log(`📨 Workflow bridge: sleep_logged hours=${args.sleep_hours}`);
+							// Sleep is the last collection step; workflow will fire synthesis
+							// immediately after. Tell the AI to keep its reply brief.
+							synthesisFired = true;
+						}
+						workflowHandledFlow = true;
+					}
+				} catch (wfErr) {
+					console.log(`⚠️ Workflow bridge failed, falling back to legacy: ${wfErr.message}`);
+				}
+			}
+
+			if (!workflowHandledFlow) {
+				// Legacy / fallback path: no active workflow for today (either disabled,
+				// not started, or workflow create failed at cron time). Use the
+				// queue-based synthesis trigger. Note: the mood_synthesis_final consumer
+				// branch is a silent drop post-Layer-3 — keeping this call ensures the
+				// fallback path still goes through `maybeFireSynthesis` for its guard +
+				// readiness checks even if the dispatched task is dropped.
+				try {
+					const { maybeFireSynthesis } = await import('../services/moodSynthesis');
+					synthesisFired = await maybeFireSynthesis(env, context.chatId, context.userId, context.threadId);
+				} catch { /* best-effort */ }
+			}
 		}
 
 		// Dynamic feedback: tell the AI what's still missing.

@@ -469,28 +469,44 @@ async function handleCommand(command, msg, env) {
 		case "/mood": {
 			await env.CHAT_KV.put(`health_checkin_active_${chatId}`, 'evening', { expirationTtl: 1800 });
 
-			// Workflow path (trial): when USE_MOOD_WORKFLOW is on, the workflow
-			// instance sends the poll, owns step ordering, and fires synthesis.
-			// The existing KV state machine still runs in parallel for safety.
+			// Layer 3 (2026-05-13): workflow is the single source of truth for the
+			// evening mood check-in. Auto-terminate any existing instance for today
+			// and start fresh so /mood always restarts cleanly.
 			if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
 				try {
 					const today = moodStore.todayLondon();
-					// Append timestamp suffix so each /mood invocation gets a unique
-					// instance ID. createBatch is idempotent on existing IDs within the
-					// retention window, which silently no-ops re-runs after the first
-					// terminated/completed instance of the day. The suffix bypasses
-					// that. Cost: two rapid /mood calls in the same second create two
-					// workflows. Acceptable trade-off for trial.
+
+					// Auto-terminate the existing instance (Issue 1b). Errors here are
+					// non-fatal — the old instance may already be done/errored/expired.
+					const existingId = await env.CHAT_KV.get(`mood_workflow_active_${chatId}_${today}`);
+					if (existingId) {
+						try {
+							const oldInstance = await env.MOOD_EVE_WORKFLOW.get(existingId);
+							await oldInstance.terminate();
+							log.info('workflow_terminated_old', { chatId, existingId, reason: 'mood_command_restart' });
+						} catch (termErr) { /* already gone */ }
+						await env.CHAT_KV.delete(`mood_workflow_active_${chatId}_${today}`);
+						// Clear the synthesis-fired guard so the fresh workflow can fire
+						// synthesis once it completes today's flow.
+						await env.CHAT_KV.delete(`mood_synthesis_fired_${chatId}_${today}`).catch(() => {});
+					}
+
 					const instanceId = `mood_eve_${chatId}_${today}_${Date.now()}`;
-					await env.MOOD_EVE_WORKFLOW.createBatch([{
+					await env.MOOD_EVE_WORKFLOW.create({
 						id: instanceId,
-						params: { chatId, userId: msg.from?.id || chatId, threadId, today, instanceId },
-					}]);
-					// Stash the active instance id so callbacks can find it without
-					// reconstructing the (now timestamped) ID. Key resets daily.
+						params: {
+							chatId,
+							userId: msg.from?.id || chatId,
+							threadId,
+							today,
+							source: 'manual_command',
+							// /mood is user-initiated — bypass quiet hours (Issue A).
+							respect_quiet_hours: false,
+						},
+					});
 					await env.CHAT_KV.put(`mood_workflow_active_${chatId}_${today}`, instanceId, { expirationTtl: 24 * 3600 });
 					await moodFlow.startFlow(env, chatId, 'manual_command');
-					log.info('mood_command_workflow_started', { chatId, instanceId });
+					log.info('workflow_evening_created', { chatId, instanceId, source: 'manual_command' });
 					return true;
 				} catch (wfErr) {
 					log.warn('mood_workflow_start_failed_falling_back', { chatId, msg: wfErr.message });
@@ -2231,19 +2247,14 @@ async function handleSleepCallback(data, callbackQuery, env) {
 			return;
 		}
 		sleepHours = n;
-		await moodStore.upsertEntry(env, userId, today, 'evening', {
-			sleep_hours: n,
-			source: 'manual_command',
-		});
 		summary = `Sleep: ${n}h logged.`;
 	}
 
+	// UI feedback first (both paths) — user sees the keyboard collapse to a confirmation.
 	await telegram.editMessage(chatId, msgId, summary, env, { inline_keyboard: [] }).catch(() => {});
 	log.info('mood_sleep_callback', { chatId, sleepHours, skipped });
 
-	// Send sleep_logged event to the workflow if it exists. This is the only
-	// path that fires this event — sleep is not landed any other way during
-	// the workflow trial.
+	// Layer 3: workflow owns the D1 save. Callback dispatches the event only.
 	if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
 		try {
 			const instanceId = await env.CHAT_KV.get(`mood_workflow_active_${chatId}_${today}`);
@@ -2251,9 +2262,19 @@ async function handleSleepCallback(data, callbackQuery, env) {
 			const instance = await env.MOOD_EVE_WORKFLOW.get(instanceId);
 			await instance.sendEvent({ type: 'sleep_logged', payload: { sleep_hours: sleepHours, skipped } });
 			log.info('mood_workflow_event_sent', { chatId, type: 'sleep_logged' });
+			return;
 		} catch (wfErr) {
-			log.warn('mood_workflow_sleep_event_failed', { chatId, msg: wfErr.message });
+			log.warn('mood_workflow_send_event_failed', { chatId, type: 'sleep_logged', msg: wfErr.message });
+			// Fall through to legacy D1 save below.
 		}
+	}
+
+	// ----- LEGACY PATH (workflow unavailable or dispatch failed) -----
+	if (!skipped && sleepHours != null) {
+		await moodStore.upsertEntry(env, userId, today, 'evening', {
+			sleep_hours: sleepHours,
+			source: 'manual_command',
+		});
 	}
 }
 
@@ -2703,26 +2724,40 @@ export async function handleCallback(callbackQuery, env) {
 
 		} else if (data === 'mood_emo_done') {
 			await telegram.editMessageReplyMarkup(chatId, msgId, null, env);
-			await telegram.sendChatAction(chatId, threadId, 'typing', env);
 
 			const selectedStr = await env.CHAT_KV.get(`mood_emo_selected_${chatId}`) || '[]';
 			const selected = JSON.parse(selectedStr);
+			await env.CHAT_KV.delete(`mood_emo_selected_${chatId}`);
 
-			// Save emotions to mood journal (fast, <500ms — safe inline).
+			// Layer 3: workflow owns the side effects (D1 save, tagger, ack,
+			// history persistence). Callback just dispatches the event.
+			if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
+				try {
+					const today = moodStore.todayLondon();
+					const instanceId = await env.CHAT_KV.get(`mood_workflow_active_${chatId}_${today}`);
+					if (!instanceId) throw new Error('no_active_workflow');
+					const instance = await env.MOOD_EVE_WORKFLOW.get(instanceId);
+					await instance.sendEvent({ type: 'emotions_done', payload: { emotions: selected } });
+					log.info('mood_workflow_event_sent', { chatId, type: 'emotions_done', emotionCount: selected.length });
+					return;
+				} catch (wfErr) {
+					log.warn('mood_workflow_send_event_failed', { chatId, type: 'emotions_done', msg: wfErr.message });
+					// Fall through to legacy below.
+				}
+			}
+
+			// ----- LEGACY PATH (workflow unavailable or dispatch failed) -----
+			await telegram.sendChatAction(chatId, threadId, 'typing', env);
+
 			const today = moodStore.todayLondon();
 			if (selected.length > 0) {
 				await moodStore.upsertEntry(env, userId, today, 'evening', { emotions: JSON.stringify(selected) });
 				log.info('mood_emotions_logged', { userId, emotions: selected });
 
-				// Advance the deterministic flow tracker. Emotions have landed; the
-				// stage now reflects whatever piece is missing next (activities,
-				// photo, sleep, or wrap). Without this, the safety net would still
-				// see stage='score' or 'emotions' and pick the wrong recovery path.
 				await moodFlow.advanceStage(env, chatId, userId).catch((e) => {
 					log.warn('mood_flow_advance_failed', { msg: e.message, where: 'after_emotions' });
 				});
 
-				// Background tagger (CF AI, free) — fire-and-forget, fits inside waitUntil.
 				import('../services/cfAi').then(async ({ tagMoodEntry }) => {
 					const todayEntry = await moodStore.getEntry(env, userId, today, 'evening').catch(() => null);
 					const parsed = todayEntry?.data ? (typeof todayEntry.data === 'string' ? JSON.parse(todayEntry.data) : todayEntry.data) : {};
@@ -2734,10 +2769,6 @@ export async function handleCallback(callbackQuery, env) {
 				}).catch(e => console.error('Mood tagging error:', e.message));
 			}
 
-			await env.CHAT_KV.delete(`mood_emo_selected_${chatId}`);
-
-			// Light micro-acknowledgement on Workers AI. ~1-3s realistic latency.
-			// Falls through to a static text if both Cloudflare tiers fail.
 			const { runEmotionsAck } = await import('../services/moodMicroAck');
 			const flow = await moodFlow.getFlow(env, chatId);
 			let ackText;
@@ -2749,7 +2780,6 @@ export async function handleCallback(callbackQuery, env) {
 			}
 			await telegram.sendMessage(chatId, threadId, ackText, env);
 
-			// Persist in chat history.
 			const histKey = `chat_${chatId}_${threadId}`;
 			let hist = await env.CHAT_KV.get(histKey, { type: 'json' }) || [];
 			const label = selected.length ? `[I selected emotions: ${selected.join(', ')}]` : '[I finished emotion selection without picking any]';
@@ -2758,28 +2788,7 @@ export async function handleCallback(callbackQuery, env) {
 			if (hist.length > 24) hist = hist.slice(-24);
 			await env.CHAT_KV.put(histKey, JSON.stringify(hist), { expirationTtl: 604800 });
 
-			// Always send the activities keyboard next. The keyboard reads today's
-			// activities and lets the user add or remove — "already logged" is not
-			// a reason to skip this step.
-			//
-			// Workflow path: when USE_MOOD_WORKFLOW is on, the workflow owns the
-			// activities step. We send the emotions_done event and skip the
-			// deterministic step here to avoid double-sending the keyboard.
-			let workflowHandled = false;
-			if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
-				try {
-					const today = moodStore.todayLondon();
-					const instanceId = await env.CHAT_KV.get(`mood_workflow_active_${chatId}_${today}`);
-					if (!instanceId) throw new Error('no_active_workflow');
-					const instance = await env.MOOD_EVE_WORKFLOW.get(instanceId);
-					await instance.sendEvent({ type: 'emotions_done', payload: { emotions: selected } });
-					workflowHandled = true;
-					log.info('mood_workflow_event_sent', { chatId, type: 'emotions_done' });
-				} catch (wfErr) { /* fall through to legacy step */ }
-			}
-			if (!workflowHandled) {
-				await driveNextDeterministicStep(env, chatId, userId, threadId, 'activities');
-			}
+			await driveNextDeterministicStep(env, chatId, userId, threadId, 'activities');
 		}
 
 		// Generate dynamic response for MEDICATION callbacks only (mood_score and mood_cat handle their own)

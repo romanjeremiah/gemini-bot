@@ -609,6 +609,23 @@ async function handleMoodPollAnswer(userId, chatId, threadId, score, env, source
 	const today = new Date().toISOString().split('T')[0];
 	log.info('mood_poll_score', { userId, chatId, score, source });
 
+	// Layer 3 (2026-05-13): workflow owns all side effects (D1 save, score ack,
+	// emotion buttons, history persistence). Callback just dispatches the event.
+	if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
+		try {
+			const instanceId = await env.CHAT_KV.get(`mood_workflow_active_${chatId}_${today}`);
+			if (!instanceId) throw new Error('no_active_workflow');
+			const instance = await env.MOOD_EVE_WORKFLOW.get(instanceId);
+			await instance.sendEvent({ type: 'score_received', payload: { score } });
+			log.info('mood_workflow_event_sent', { chatId, type: 'score_received', score });
+			return;
+		} catch (wfErr) {
+			log.warn('mood_workflow_send_event_failed', { chatId, type: 'score_received', msg: wfErr.message });
+			// Fall through to legacy path below.
+		}
+	}
+
+	// ----- LEGACY PATH (workflow unavailable or dispatch failed) -----
 	// Save mood score (keyed by user, not chat). Tag with the source that owns
 	// this check-in so the cron suppression logic can tell scheduled vs manual
 	// vs casual chat-driven entries apart.
@@ -622,8 +639,6 @@ async function handleMoodPollAnswer(userId, chatId, threadId, score, env, source
 
 	// Light micro-acknowledgement on Workers AI. 2-tier Cloudflare-only cascade,
 	// ~1-3s realistic latency, falls through to static text if both tiers fail.
-	// The deeper therapeutic synthesis fires at the END of the flow once all
-	// pieces are collected (see moodSynthesis.maybeFireSynthesis).
 	const { runScoreAck } = await import('./services/moodMicroAck');
 	const flow = await moodFlow.getFlow(env, chatId);
 	let ackText;
@@ -634,14 +649,14 @@ async function handleMoodPollAnswer(userId, chatId, threadId, score, env, source
 		ackText = 'Got it. Tap below to share what you are feeling.';
 	}
 
-	// Show emotion buttons for normal range (2-8). Crisis/mania scores skip the
-	// buttons — the persona handles severity tone in the ack itself.
-	const btns = (score >= 2 && score <= 8) ? {
+	// Layer 3 decision 4: emotion buttons sent for EVERY score (no extreme-score
+	// exception). Persona handles severity tone in the ack text itself.
+	const btns = {
 		inline_keyboard: [[
 			{ text: '☀️ Positive', callback_data: 'mood_cat_positive', style: 'success' },
 			{ text: '🌧 Negative', callback_data: 'mood_cat_negative', style: 'danger' }
 		]]
-	} : undefined;
+	};
 
 	await telegram.sendMessage(chatId, threadId, ackText, env, null, btns);
 
@@ -654,21 +669,6 @@ async function handleMoodPollAnswer(userId, chatId, threadId, score, env, source
 	await env.CHAT_KV.put(threadKey, JSON.stringify(hist), { expirationTtl: 604800 });
 
 	log.info('mood_score_handled', { userId, score, ackLen: ackText.length });
-
-	// Workflow event: if a mood workflow exists for this chat+date, advance it.
-	// Best-effort — if no workflow exists or the call fails, the legacy KV path
-	// continues unchanged.
-	if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
-		try {
-			const instanceId = await env.CHAT_KV.get(`mood_workflow_active_${chatId}_${today}`);
-			if (!instanceId) throw new Error('no_active_workflow');
-			const instance = await env.MOOD_EVE_WORKFLOW.get(instanceId);
-			await instance.sendEvent({ type: 'score_received', payload: { score } });
-			log.info('mood_workflow_event_sent', { chatId, type: 'score_received' });
-		} catch (wfErr) {
-			// Workflow may not exist (cron path, no workflow created). Silent.
-		}
-	}
 }
 
 // ---- Spontaneous "Thinking of You" Outreach ----
@@ -1288,79 +1288,117 @@ async function enqueueHealthTasks(env) {
 
 	// Morning check-in
 	if (currentMins >= morningMins && currentMins < middayMins) {
-		const key = `health_checkin_morning_${today}`;
-		const alreadyLocked = await env.CHAT_KV.get(key);
-		if (!alreadyLocked && !isUserActive) {
-			await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
+		const doneKey = `health_checkin_morning_${today}`;
+		const inflightKey = `health_checkin_morning_inflight_${today}`;
+		const alreadyDone = await env.CHAT_KV.get(doneKey);
+		const inflight = await env.CHAT_KV.get(inflightKey);
+		if (!alreadyDone && !inflight && !isUserActive) {
 			const alreadyLogged = await moodStore.hasCheckedInToday(env, userId, 'morning');
 			if (!alreadyLogged) {
+				// Fix 1a (2026-05-13): hold an in-flight lock (10 min TTL) to dedupe
+				// concurrent enqueues; the consumer sets the 24h done flag AFTER the
+				// sendMessage succeeds and deletes this lock. If the consumer crashes,
+				// the lock expires and the next cron tick retries.
+				await env.CHAT_KV.put(inflightKey, '1', { expirationTtl: 10 * 60 });
 				log.info('cron_morning_enqueue', { chatId, today });
-				await env.TASK_QUEUE.send({ type: 'health_checkin', period: 'morning', chatId });
+				await env.TASK_QUEUE.send({ type: 'health_checkin', period: 'morning', chatId, today });
 			} else {
 				log.info('cron_window_skip', { period: 'morning', reason: 'already_logged_today' });
 			}
-		} else if (alreadyLocked) {
-			// Spammy if logged every minute — only log on a transition, every 10 min
-			if (minute % 10 === 0) log.info('cron_window_skip', { period: 'morning', reason: 'already_locked' });
+		} else if (alreadyDone) {
+			if (minute % 10 === 0) log.info('cron_window_skip', { period: 'morning', reason: 'already_done' });
+		} else if (inflight) {
+			if (minute % 10 === 0) log.info('cron_window_skip', { period: 'morning', reason: 'in_flight' });
 		} else if (isUserActive) {
 			if (minute % 10 === 0) log.info('cron_window_skip', { period: 'morning', reason: 'user_active' });
 		}
 	}
 	// Midday check-in
 	else if (currentMins >= middayMins && currentMins < eveningMins) {
-		const key = `health_checkin_midday_${today}`;
-		if (!(await env.CHAT_KV.get(key)) && !isUserActive) {
-			await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
+		const doneKey = `health_checkin_midday_${today}`;
+		const inflightKey = `health_checkin_midday_inflight_${today}`;
+		const alreadyDone = await env.CHAT_KV.get(doneKey);
+		const inflight = await env.CHAT_KV.get(inflightKey);
+		if (!alreadyDone && !inflight && !isUserActive) {
 			if (!(await moodStore.hasCheckedInToday(env, userId, 'midday'))) {
-				await env.TASK_QUEUE.send({ type: 'health_checkin', period: 'midday', chatId });
+				await env.CHAT_KV.put(inflightKey, '1', { expirationTtl: 10 * 60 });
+				log.info('cron_midday_enqueue', { chatId, today });
+				await env.TASK_QUEUE.send({ type: 'health_checkin', period: 'midday', chatId, today });
 			}
 		}
 	}
 	// Evening check-in
+	// Layer 3: create a workflow instance instead of enqueuing a mood_poll task.
+	// The workflow owns the full evening flow (poll → emotions → activities → photo
+	// → sleep → synthesis) including its own quiet-hours and timeout handling.
 	// Grace window: defer for 2 hours if user is active. After the grace window,
-	// send the poll regardless — missing the evening mood check entirely is worse
-	// than a brief interruption. This prevents late-working days from skipping
-	// the day's evening entry entirely.
+	// fire regardless — missing the evening mood check entirely is worse than a
+	// brief interruption.
 	else if (currentMins >= eveningMins) {
-		const key = `health_checkin_evening_${today}`;
+		const doneKey = `health_checkin_evening_${today}`;
 		const graceEndMins = eveningMins + 120; // 2-hour grace
 		const shouldDefer = isUserActive && currentMins < graceEndMins;
-		if (!(await env.CHAT_KV.get(key)) && !shouldDefer) {
-			await env.CHAT_KV.put(key, '1', { expirationTtl: 86400 });
-			// Source-based suppression (2026-05-05): only skip if a REAL evening
-			// check-in (cron_poll or manual_command) has happened today.
-			if (!(await moodStore.hasRealEveningCheckin(env, userId))) {
+		if (!(await env.CHAT_KV.get(doneKey)) && !shouldDefer) {
+			// Source-based suppression: only skip if a REAL evening check-in
+			// (cron_poll or manual_command) has happened today. Casual mid-day
+			// mentions tagged 'inline_chat' don't block.
+			if (await moodStore.hasRealEveningCheckin(env, userId)) {
+				log.info('cron_window_skip', { period: 'evening', reason: 'real_checkin_already_today' });
+			} else if (env.USE_MOOD_WORKFLOW === 'true' && env.MOOD_EVE_WORKFLOW) {
+				try {
+					// Auto-terminate any existing workflow instance for today
+					// (e.g. a /mood run earlier) and start the cron one fresh.
+					const existingId = await env.CHAT_KV.get(`mood_workflow_active_${chatId}_${today}`);
+					if (existingId) {
+						try {
+							const oldInstance = await env.MOOD_EVE_WORKFLOW.get(existingId);
+							await oldInstance.terminate();
+							log.info('workflow_terminated_old', { chatId, existingId, reason: 'cron_evening_restart' });
+						} catch (termErr) { /* already gone */ }
+						await env.CHAT_KV.delete(`mood_workflow_active_${chatId}_${today}`);
+						await env.CHAT_KV.delete(`mood_synthesis_fired_${chatId}_${today}`).catch(() => {});
+					}
+
+					const threadIdEve = await threadOrDefault(env, chatId, TOPIC_KEYS.MOOD_JOURNAL);
+					const instanceId = `mood_eve_${chatId}_${today}_${Date.now()}`;
+					await env.MOOD_EVE_WORKFLOW.create({
+						id: instanceId,
+						params: {
+							chatId,
+							userId,
+							threadId: threadIdEve,
+							today,
+							source: 'cron_poll',
+							// Cron path respects quiet hours.
+							respect_quiet_hours: true,
+						},
+					});
+					await env.CHAT_KV.put(`mood_workflow_active_${chatId}_${today}`, instanceId, { expirationTtl: 24 * 3600 });
+					// Mark the day done so we don't re-create on the next minute tick.
+					await env.CHAT_KV.put(doneKey, '1', { expirationTtl: 86400 });
+					await env.CHAT_KV.put(`nudge_pending_evening_${chatId}`, String(Date.now()), { expirationTtl: 7200 });
+					log.info('workflow_evening_created', { chatId, instanceId, source: 'cron_poll' });
+				} catch (wfErr) {
+					log.error('workflow_evening_create_failed', { chatId, msg: wfErr.message });
+					// Fall back to legacy queue path so the evening check-in still fires.
+					await env.CHAT_KV.put(doneKey, '1', { expirationTtl: 86400 });
+					await env.TASK_QUEUE.send({ type: 'mood_poll', chatId });
+				}
+			} else {
+				// Workflow disabled — legacy queue path.
+				await env.CHAT_KV.put(doneKey, '1', { expirationTtl: 86400 });
 				log.info('cron_evening_enqueue', { chatId, today });
 				await env.TASK_QUEUE.send({ type: 'mood_poll', chatId });
-			} else {
-				log.info('cron_window_skip', { period: 'evening', reason: 'real_checkin_already_today' });
 			}
 		}
 	}
 
-	// Stalled-flow safety-net (added 2026-05-05). If a deterministic mood flow is
-	// active and hasn't progressed for STALL_THRESHOLD_MS (20 min), the AI got
-	// stuck mid-conversation. Take over with a visible handoff message and
-	// render whichever keyboard is still missing.
-	if (env.OWNER_ID) {
-		try {
-			const stalled = await moodFlow.isStalled(env, chatId);
-			if (stalled) {
-				const flow = await moodFlow.getFlow(env, chatId);
-				if (flow) {
-					const safetyKey = `mood_flow_safety_${today}_${flow.stage}`;
-					const alreadyRun = await env.CHAT_KV.get(safetyKey);
-					if (!alreadyRun) {
-						await env.CHAT_KV.put(safetyKey, '1', { expirationTtl: 3600 });
-						await env.TASK_QUEUE.send({ type: 'mood_flow_safety_net', chatId, stage: flow.stage });
-						log.info('mood_flow_stall_detected', { chatId, stage: flow.stage });
-					}
-				}
-			}
-		} catch (e) {
-			log.warn('mood_flow_stall_check_failed', { msg: e.message });
-		}
-	}
+	// Layer 3 (2026-05-13): the stalled-flow KV safety-net is gone. The workflow
+	// owns timeout handling natively — each waitForEvent has a 4h timeout that
+	// cleans up the active sent message and jumps to synthesis with whatever data
+	// landed. No more dual-system competition with the workflow rendering a
+	// keyboard from a step while the cron safety-net renders the same keyboard
+	// from a queue task. (Was: mood_flow_safety_net branch.)
 
 	// Medication nudge check
 	for (const type of ['morning', 'midday']) {
@@ -1800,7 +1838,8 @@ export default {
 			log.info('queue_task_received', { type: task.type, hasMessage: !!task.message });
 			try {
 				const chatId = task.chatId || Number(env.OWNER_ID);
-				const isMoodTask = task.type === 'health_checkin' || task.type === 'mood_poll' || task.type === 'med_nudge' || task.type === 'mood_flow_safety_net';
+				// Layer 3 (2026-05-13): mood_flow_safety_net removed; workflow owns evening flow.
+				const isMoodTask = task.type === 'health_checkin' || task.type === 'mood_poll' || task.type === 'med_nudge';
 				const threadId = isMoodTask
 					? await threadOrDefault(env, chatId, TOPIC_KEYS.MOOD_JOURNAL)
 					: 'default';
@@ -1830,6 +1869,15 @@ export default {
 					const greeting = await generateShortResponse(prompt, personas.xaridotis.instruction, env)
 						|| (task.period === 'morning' ? 'Morning. How did you sleep? Have you taken your meds?' : 'Quick midday check. Have you taken your meds?');
 					await telegram.sendMessage(chatId, threadId, greeting, env);
+
+					// Fix 1a (2026-05-13): set the 24h done flag and delete the in-flight
+					// lock AFTER the send succeeds. If telegram.sendMessage throws above,
+					// these don't run — the next cron tick (after 10-min inflight expiry)
+					// will retry. Task body carries `today` so cross-midnight is safe.
+					const localToday = task.today || (await getLocalTime(chatId, env)).toISOString().split('T')[0];
+					await env.CHAT_KV.put(`health_checkin_${task.period}_${localToday}`, '1', { expirationTtl: 86400 });
+					await env.CHAT_KV.delete(`health_checkin_${task.period}_inflight_${localToday}`).catch(() => {});
+
 					await env.CHAT_KV.put(`med_pending_${chatId}`, task.period, { expirationTtl: 7200 });
 					await env.CHAT_KV.put(`nudge_pending_${task.period}_${chatId}`, String(Date.now()), { expirationTtl: 3600 });
 
@@ -1904,116 +1952,13 @@ export default {
 						}
 						throw mpErr; // re-throw for queue retry
 					}
-				} else if (task.type === 'mood_synthesis_final') {
-					// End-of-flow synthesis. Fired once per check-in once ALL pieces are
-					// collected (score, emotions, activities, sleep, photo-or-skipped).
-					// 6-tier cascade (Llama → Gemma → Flash-Lite → Flash → Pro → fixed).
-					// Looped typing indicator keeps the user aware while the model thinks.
-					const { chatId: sChatId, userId: sUserId, threadId: sThreadId, startedAtMs: sStartedAtMs } = task;
-					log.info('queue_mood_synthesis_final_start', { chatId: sChatId, userId: sUserId });
-
-					// Looped typing indicator: send every 4s while synthesis runs.
-					// Telegram's typing indicator fades after ~5s; loop keeps it visible
-					// across the realistic 5-15s synthesis time and even longer cascade fallbacks.
-					let typingActive = true;
-					const typingLoop = (async () => {
-						while (typingActive) {
-							await telegram.sendChatAction(sChatId, sThreadId, 'typing', env).catch(() => {});
-							await new Promise((r) => setTimeout(r, 4000));
-						}
-					})();
-
-					try {
-						const { runSynthesisCascade } = await import('./services/moodSynthesis');
-						const result = await runSynthesisCascade(
-							env,
-							sUserId,
-							sStartedAtMs,
-							personas.xaridotis.instruction,
-						);
-						typingActive = false;
-						await telegram.sendMessage(sChatId, sThreadId, result.text, env);
-
-						// Persist in chat history so the next message has context.
-						const histKey = `chat_${sChatId}_${sThreadId}`;
-						let sHist = await env.CHAT_KV.get(histKey, { type: 'json' }) || [];
-						sHist.push({ role: 'user', parts: [{ text: '[I finished my mood check-in for the day]' }] });
-						sHist.push({ role: 'model', parts: [{ text: result.text }] });
-						if (sHist.length > 24) sHist = sHist.slice(-24);
-						await env.CHAT_KV.put(histKey, JSON.stringify(sHist), { expirationTtl: 604800 });
-
-						// End the flow now that the day is wrapped.
-						await moodFlow.endFlow(env, sChatId).catch(() => {});
-
-						log.info('queue_mood_synthesis_final_done', {
-							chatId: sChatId,
-							source: result.source,
-							ms: result.ms,
-							len: result.text.length,
-						});
-					} catch (synthErr) {
-						typingActive = false;
-						const attempts = msg.attempts || 1;
-						log.error('queue_mood_synthesis_final_error', {
-							chatId: sChatId,
-							attempt: attempts,
-							msg: synthErr.message,
-						});
-						if (attempts >= 3) {
-							const { FIXED_FALLBACK_TEXT } = await import('./services/moodSynthesis');
-							await telegram.sendMessage(sChatId, sThreadId, FIXED_FALLBACK_TEXT, env).catch(() => {});
-							await moodFlow.endFlow(env, sChatId).catch(() => {});
-						}
-						throw synthErr;
-					} finally {
-						typingActive = false;
-						// Best-effort drain so the loop's pending setTimeout doesn't keep
-						// the worker alive past task completion.
-						await typingLoop.catch(() => {});
-					}
-
-				} else if (task.type === 'mood_flow_safety_net') {
-					// Stalled mood flow recovery. Visible handoff (Option 2): tell the
-					// user we're taking over the next step, then render whichever
-					// keyboard the flow needs based on its stored stage. The user can
-					// always opt back into the conversational path by ignoring the
-					// keyboard and just typing.
-					const { stage } = task;
-					const userId = chatId;
-					log.info('queue_safety_net_start', { chatId, stage });
-					try {
-						const flow = await moodFlow.getFlow(env, chatId);
-						if (!flow) {
-							log.info('queue_safety_net_skip', { reason: 'flow_already_ended' });
-						} else {
-							const today = moodStore.todayLondon();
-							const alreadyLogged = await moodStore.getTodayActivities(env, userId, today);
-							const missingActs = !alreadyLogged.length;
-							const sleepLogged = await moodStore.hasSleepLoggedToday(env, userId, today);
-							const photoLogged = await moodStore.hasPhotoLoggedToday(env, userId, today);
-
-							// Pick the next missing piece. Order: activities -> photo -> wrap.
-							// Sleep is left for prose since it's a single number ask.
-							const { sendActivitiesKeyboardTool, sendPhotoRequestTool } = await import('./tools/moodKeyboards');
-							const toolCtx = { chatId, userId, source: flow.source };
-
-							if (missingActs) {
-								await telegram.sendMessage(chatId, threadId, 'Quick one before we wrap — what activities did you do today?', env);
-								await sendActivitiesKeyboardTool.execute({ preamble: 'Tap any that fit, then ✓ Done.' }, env, toolCtx);
-							} else if (!photoLogged && !flow.photo?.skipped) {
-								await telegram.sendMessage(chatId, threadId, 'Quick one before we wrap — a photo from today?', env);
-								await sendPhotoRequestTool.execute({ preamble: 'Send any photo, or tap Skip.' }, env, toolCtx);
-							} else if (sleepLogged === null || sleepLogged === undefined) {
-								await telegram.sendMessage(chatId, threadId, 'Quick one before we wrap — how many hours did you sleep last night?', env);
-							} else {
-								// Nothing structured missing — just nudge wrap-up.
-								await telegram.sendMessage(chatId, threadId, 'Anything else from today before I wrap this up?', env);
-							}
-							log.info('queue_safety_net_done', { chatId, stage });
-						}
-					} catch (snErr) {
-						log.error('queue_safety_net_error', { msg: snErr.message });
-					}
+				} else if (task.type === 'mood_synthesis_final' || task.type === 'mood_flow_safety_net') {
+					// Layer 3 (2026-05-13): both branches retired.
+					// mood_synthesis_final → workflow's fire-synthesis step (always runs, even after timeout).
+					// mood_flow_safety_net → workflow's per-step waitForEvent timeouts (4h) handle stalls natively.
+					// In-flight tasks from before deploy: drop silently rather than retry, since the
+					// workflow already owns whichever flow they belonged to.
+					log.info('queue_legacy_mood_task_dropped', { type: task.type, chatId });
 				}
 
 				msg.ack();

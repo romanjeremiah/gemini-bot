@@ -1,10 +1,14 @@
 // Evening mood check-in flow tracker.
 //
-// Lives alongside the AI-driven journal flow as a *progress tracker*, not a
-// hard state machine. The AI still drives stage transitions by calling tools
-// (send_activities_keyboard, send_photo_request, commit_journal_entry). This
-// module records what's been done so the safety-net cron can take over if
-// the AI stalls.
+// LAYER 3 STATUS (2026-05-13): demoted to write-through cache.
+//
+// The Cloudflare Workflow (src/workflows/moodEveningCheckin.js) is now the
+// single source of truth for the evening flow. This module is kept ONLY so
+// the AI-driven tools (send_activities_keyboard, send_photo_request,
+// commit_journal_entry) still have a place to record progress markers that
+// the persona prompt can read. The cron-driven KV safety-net that used this
+// state has been removed. Do not add new safety-net logic here — add steps
+// to the workflow instead.
 //
 // State key: `mood_flow_${chatId}`
 // TTL: 1800s (30 min) — refreshed on every progress update

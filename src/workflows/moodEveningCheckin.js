@@ -2,57 +2,115 @@ import { WorkflowEntrypoint } from 'cloudflare:workers';
 import { MOOD_POLL_OPTIONS } from '../config/moodScale';
 
 /**
- * Mood Evening Check-in Workflow (trial, /mood only)
+ * Mood Evening Check-in Workflow — single source of truth (Layer 3, 2026-05-13).
  *
- * Durable, event-driven replacement for the KV state machine in moodFlow.js.
- * The cron-triggered evening check-in still uses the existing path; this
- * workflow is gated behind env.USE_MOOD_WORKFLOW and only fires from /mood.
+ * Replaces the legacy KV+queue+safety-net path. ALL evening check-ins
+ * (both cron and /mood) route through this workflow. The KV moodFlow.js
+ * is kept as a thin write-through cache so AI tools (commit_journal_entry,
+ * isAwaitingPhoto) keep working, but it no longer drives the flow.
+ *
+ * Design principles:
+ *   - Workflow steps own all side effects. Webhook callbacks dispatch events
+ *     and otherwise stay silent (with a small exception for the activities
+ *     toggle UI and the photo-upload R2 store — see Layer 3 plan, Issue B).
+ *   - Every waitForEvent is wrapped in try/catch. On timeout we delete the
+ *     active sent message (to keep the chat clean) and jump to synthesis
+ *     with whatever data we have. The instance ends cleanly — no errored
+ *     state for users who walk away mid-flow.
+ *   - Step bodies are idempotent via `wf_${instanceId}_${stepName}` KV
+ *     markers. Even if a step throws after a Telegram send (e.g. transient
+ *     network blip after sendMessage delivered), the retry sees the marker
+ *     and skips the send. No duplicate keyboards.
+ *   - Extreme scores (0/1/9/10) follow the same flow as 2-8. No special
+ *     skip-emotions path. The persona handles severity tone in the ack.
  *
  * Flow:
- *   1. send-score-poll              -> waitForEvent('score_received')
- *   2. send-score-response          (AI message + emotion category buttons)
- *   3.                              waitForEvent('emotions_done')
- *   4. emotions-ack                 (Workers AI micro-ack)
- *   5. send-activities-keyboard     -> waitForEvent('activities_done')
- *   6. send-photo-prompt            -> waitForEvent('photo_done')
- *   7. send-sleep-keyboard          -> waitForEvent('sleep_logged')
- *   8. fire-synthesis               (the 6-tier cascade)
+ *   0. quiet-hours-check (skippable via payload.respect_quiet_hours=false)
+ *   1. send-score-poll        -> registers poll, starts KV flow cache
+ *   2. waitForEvent('score_received')
+ *   3. process-score          -> D1 save, score ack, emotion buttons
+ *   4. waitForEvent('emotions_done')
+ *   5. process-emotions       -> D1 save, background tagger, emotions ack
+ *   6. send-activities-keyboard
+ *   7. waitForEvent('activities_done')  (D1 save happens in callback per Issue B)
+ *   8. send-photo-prompt
+ *   9. waitForEvent('photo_done')  (D1 save happens in upload handler)
+ *  10. send-sleep-keyboard
+ *  11. waitForEvent('sleep_logged')
+ *  12. process-sleep          -> D1 save sleep_hours
+ *  13. fire-synthesis         (ALWAYS runs, even after a timeout abort)
  *
- * Coexistence with existing flow during trial:
- *   - This workflow runs alongside the KV state machine (moodFlow.js).
- *   - The KV state machine is left untouched so the AI's commit_journal_entry
- *     tool and the existing safety net keep working.
- *   - Each step writes to D1 the same way the existing callbacks do, so the
- *     data path is identical.
- *
- * Webhook contract:
- *   The Worker fetch handler looks up this workflow by instance id
- *   `mood_eve_${chatId}_${today}` and calls .sendEvent() after each
- *   user-side action lands in D1. Events:
- *     - score_received    payload: { score }
- *     - emotions_done     payload: { emotions: string[] }
- *     - activities_done   payload: { added: string[], removed: string[] }
- *     - photo_done        payload: { skipped: boolean, photo_r2_key?: string }
- *     - sleep_logged      payload: { sleep_hours: number, skipped: boolean }
- *
- * Each waitForEvent has a 4h timeout — long enough that a user can step
- * away for hours and still resume, short enough that yesterday's stalled
- * workflow doesn't hang around forever.
+ * Payload:
+ *   { chatId, userId, threadId, today,
+ *     source: 'cron_poll' | 'manual_command',
+ *     respect_quiet_hours: boolean }
  */
 export class MoodEveningCheckinWorkflow extends WorkflowEntrypoint {
 	async run(event, step) {
-		const { chatId, userId, threadId, today } = event.payload;
+		const {
+			chatId,
+			userId,
+			threadId,
+			today,
+			source = 'cron_poll',
+			respect_quiet_hours = true,
+		} = event.payload || {};
+
 		if (!chatId || !userId || !today) {
 			throw new Error('Missing chatId/userId/today in workflow payload');
 		}
 
 		const env = this.env;
+		const instanceId = event.instanceId;
+		const startedAtMs = event.timestamp?.getTime?.() || Date.now();
+		const STEP_TIMEOUT = '4 hours';
+
+		// Idempotency marker helpers. Prevents duplicate Telegram sends if a
+		// step throws after the network round-trip succeeded.
+		const idemKey = (stepName) => `wf_${instanceId}_${stepName}`;
+		const idemGet = async (stepName) => {
+			try { return await env.CHAT_KV.get(idemKey(stepName), { type: 'json' }); }
+			catch { return null; }
+		};
+		const idemSet = async (stepName, value) => {
+			await env.CHAT_KV.put(idemKey(stepName), JSON.stringify(value || {}), {
+				expirationTtl: 86400,
+			});
+		};
+
+		// State threaded through the workflow. Message IDs captured at each
+		// send step so the timeout cleanup branches know what to delete.
+		const messageIds = {};
+		let aborted = false;
+		let score = null;
+		let emotions = [];
+		let sleepHours = null;
+		let sleepSkipped = false;
+
+		// ----- 0. Quiet-hours check (defensive) -----
+		// Decision per Issue A: cron passes respect_quiet_hours=true,
+		// /mood passes false (user-initiated action bypasses).
+		if (respect_quiet_hours) {
+			const isQuiet = await step.do('quiet-hours-check', {
+				retries: { limit: 1, delay: '2 seconds', backoff: 'constant' },
+				timeout: '10 seconds',
+			}, async () => {
+				const { isQuietTime } = await import('../tools/quietHours');
+				return await isQuietTime(env, chatId);
+			});
+			if (isQuiet) {
+				return { status: 'skipped', reason: 'quiet_hours', instanceId };
+			}
+		}
 
 		// ----- 1. Send the score poll -----
-		await step.do('send-score-poll', {
+		const pollResult = await step.do('send-score-poll', {
 			retries: { limit: 3, delay: '2 seconds', backoff: 'exponential' },
 			timeout: '15 seconds',
 		}, async () => {
+			const cached = await idemGet('send-score-poll');
+			if (cached) return cached;
+
 			const payload = {
 				chat_id: chatId,
 				question: 'How do you feel right now?',
@@ -70,214 +128,448 @@ export class MoodEveningCheckinWorkflow extends WorkflowEntrypoint {
 			const json = await res.json();
 			if (!json.ok) throw new Error(`sendPoll failed: ${json.description || 'unknown'}`);
 
-			// Map poll_id -> chat so the poll_answer webhook can route back to us.
-			// Reuses the existing key format so the existing handler picks it up.
 			const pollId = json.result.poll.id;
+			const msgId = json.result.message_id;
+			const result = { pollId, msgId };
+
+			// Mark idempotency BEFORE downstream setup so a retry skips the send.
+			await idemSet('send-score-poll', result);
+
+			// Route poll answers back to this workflow. Reuses existing key shape
+			// so the existing index.js dispatch logic picks it up unchanged.
 			await env.CHAT_KV.put(`mood_poll_${pollId}`, JSON.stringify({
 				chatId, threadId, type: 'mood_checkin', sentAt: Date.now(),
-				source: 'manual_command', workflowId: event.instanceId,
+				source, workflowId: instanceId,
 			}), { expirationTtl: 86400 });
 
-			return { pollId };
-		});
+			// Write-through cache for AI tools (commit_journal_entry,
+			// isAwaitingPhoto, etc.). Replaces the safety-net role moodFlow.js
+			// used to fill, retains the AI-tool integration.
+			const moodFlow = await import('../lib/moodFlow');
+			await moodFlow.startFlow(env, chatId, source).catch(() => {});
 
-		// ----- 2. Wait for the score -----
-		// handleMoodPollAnswer (in index.js) handles the D1 write, AI message,
-		// emotion category buttons. It sends 'score_received' to us after that
-		// work lands. Workflow does not duplicate the AI message — the existing
-		// path stays load-bearing for the score-response UX.
-		const scoreEvent = await step.waitForEvent('await-score', {
-			type: 'score_received',
-			timeout: '4 hours',
+			return result;
 		});
-		const score = scoreEvent?.payload?.score;
+		messageIds.poll = pollResult.msgId;
 
-		// ----- 3. Wait for emotions -----
-		// Extreme scores (0-1, 9-10) skip the emotion buttons entirely. In that
-		// case the existing callback handler skips emotion collection and the
-		// AI conversation proceeds in prose. Workflow still waits for the event
-		// because someone has to push it forward — we accept either real
-		// emotions or an empty list as "emotions done".
-		const emotionsEvent = await step.waitForEvent('await-emotions', {
-			type: 'emotions_done',
-			timeout: '4 hours',
-		});
-		const emotions = emotionsEvent?.payload?.emotions || [];
+		// ----- 2. Wait for score -----
+		try {
+			const scoreEvent = await step.waitForEvent('await-score', {
+				type: 'score_received',
+				timeout: STEP_TIMEOUT,
+			});
+			score = scoreEvent?.payload?.score;
+		} catch (e) {
+			await step.do('cleanup-poll-message', { retries: { limit: 1 } }, async () => {
+				if (messageIds.poll) {
+					const telegram = await import('../lib/telegram');
+					await telegram.deleteMessage(chatId, messageIds.poll, env).catch(() => {});
+				}
+			});
+			aborted = true;
+		}
 
-		// ----- 4. Emotions micro-ack -----
-		// handleMoodPollAnswer (index.js) already fires its own score-ack via
-		// runScoreAck — that lands BEFORE the user picks emotions. The existing
-		// mood_emo_done callback ALSO sends an emotions-ack via runEmotionsAck.
-		// To avoid double-ack we skip the workflow-side emotions ack and rely
-		// on the existing callback handler. Left as a marked no-op so the step
-		// numbering matches the original plan in case we move it later.
+		// ----- 3. Process score (D1 save, ack, emotion buttons) -----
+		if (!aborted && score != null) {
+			const processResult = await step.do('process-score', {
+				retries: { limit: 2, delay: '2 seconds', backoff: 'exponential' },
+				timeout: '30 seconds',
+			}, async () => {
+				const cached = await idemGet('process-score');
+				if (cached) return cached;
+
+				const moodStore = await import('../services/moodStore');
+				const moodFlow = await import('../lib/moodFlow');
+				const telegram = await import('../lib/telegram');
+
+				// D1 save
+				await moodStore.upsertEntry(env, userId, today, 'evening', {
+					mood_score: score,
+					source,
+				});
+
+				// Advance write-through cache (for AI tools that read it).
+				await moodFlow.advanceStage(env, chatId, userId).catch(() => {});
+
+				// Run score ack via CF AI cascade (cheap, falls through to fixed text
+				// if cascade fails).
+				const { runScoreAck } = await import('../services/moodMicroAck');
+				const { personas } = await import('../config/personas');
+				const flow = await moodFlow.getFlow(env, chatId);
+				let ackText;
+				try {
+					ackText = await runScoreAck(env, userId, score, flow, personas.xaridotis.instruction);
+				} catch (ackErr) {
+					ackText = 'Got it. Tap below to share what you are feeling.';
+				}
+
+				// Emotion buttons sent for EVERY score (extreme-score exception removed
+				// per Layer 3 decision 4). The persona's tone shifts based on the score
+				// inside the ack text itself.
+				const btns = {
+					inline_keyboard: [[
+						{ text: '☀️ Positive', callback_data: 'mood_cat_positive', style: 'success' },
+						{ text: '🌧 Negative', callback_data: 'mood_cat_negative', style: 'danger' }
+					]]
+				};
+				const sendRes = await telegram.sendMessage(chatId, threadId, ackText, env, null, btns);
+				const msgId = sendRes?.result?.message_id;
+
+				// Persist in chat history for downstream context.
+				const threadKey = `chat_${chatId}_${threadId}`;
+				let hist = await env.CHAT_KV.get(threadKey, { type: 'json' }) || [];
+				hist.push({ role: 'user', parts: [{ text: `[I just logged my mood as ${score}/10]` }] });
+				hist.push({ role: 'model', parts: [{ text: ackText }] });
+				if (hist.length > 24) hist = hist.slice(-24);
+				await env.CHAT_KV.put(threadKey, JSON.stringify(hist), { expirationTtl: 604800 });
+
+				const result = { msgId, ackText };
+				await idemSet('process-score', result);
+				return result;
+			});
+			messageIds.emotionButtons = processResult.msgId;
+		}
+
+		// ----- 4. Wait for emotions -----
+		if (!aborted) {
+			try {
+				const emotionsEvent = await step.waitForEvent('await-emotions', {
+					type: 'emotions_done',
+					timeout: STEP_TIMEOUT,
+				});
+				emotions = emotionsEvent?.payload?.emotions || [];
+			} catch (e) {
+				await step.do('cleanup-emotion-buttons', { retries: { limit: 1 } }, async () => {
+					if (messageIds.emotionButtons) {
+						const telegram = await import('../lib/telegram');
+						await telegram.deleteMessage(chatId, messageIds.emotionButtons, env).catch(() => {});
+					}
+				});
+				aborted = true;
+			}
+		}
+
+		// ----- 5. Process emotions (D1 save, tagger, ack) -----
+		if (!aborted) {
+			await step.do('process-emotions', {
+				retries: { limit: 2, delay: '2 seconds' },
+				timeout: '30 seconds',
+			}, async () => {
+				const cached = await idemGet('process-emotions');
+				if (cached) return cached;
+
+				const moodStore = await import('../services/moodStore');
+				const moodFlow = await import('../lib/moodFlow');
+				const telegram = await import('../lib/telegram');
+
+				if (emotions.length > 0) {
+					await moodStore.upsertEntry(env, userId, today, 'evening', {
+						emotions: JSON.stringify(emotions),
+					});
+				}
+				await moodFlow.advanceStage(env, chatId, userId).catch(() => {});
+
+				// Background tagger — fire-and-forget. CF AI free tier, no need to
+				// await before continuing.
+				import('../services/cfAi').then(async ({ tagMoodEntry }) => {
+					try {
+						const todayEntry = await moodStore.getEntry(env, userId, today, 'evening');
+						const parsed = todayEntry?.data
+							? (typeof todayEntry.data === 'string' ? JSON.parse(todayEntry.data) : todayEntry.data)
+							: {};
+						const tags = await tagMoodEntry(env, parsed.mood_score, emotions, parsed.note);
+						if (tags) {
+							await moodStore.upsertEntry(env, userId, today, 'evening', { clinical_tags: tags });
+						}
+					} catch { /* tagger is best-effort */ }
+				}).catch(() => {});
+
+				// Emotions ack
+				const { runEmotionsAck } = await import('../services/moodMicroAck');
+				const { personas } = await import('../config/personas');
+				const flow = await moodFlow.getFlow(env, chatId);
+				let ackText;
+				try {
+					ackText = await runEmotionsAck(env, userId, emotions, flow, personas.xaridotis.instruction);
+				} catch (ackErr) {
+					ackText = 'Got it.';
+				}
+				await telegram.sendMessage(chatId, threadId, ackText, env);
+
+				// History persistence
+				const threadKey = `chat_${chatId}_${threadId}`;
+				let hist = await env.CHAT_KV.get(threadKey, { type: 'json' }) || [];
+				const label = emotions.length
+					? `[I selected emotions: ${emotions.join(', ')}]`
+					: '[I finished emotion selection without picking any]';
+				hist.push({ role: 'user', parts: [{ text: label }] });
+				hist.push({ role: 'model', parts: [{ text: ackText }] });
+				if (hist.length > 24) hist = hist.slice(-24);
+				await env.CHAT_KV.put(threadKey, JSON.stringify(hist), { expirationTtl: 604800 });
+
+				await idemSet('process-emotions', {});
+				return {};
+			});
+		}
 
 		// ----- 6. Send activities keyboard -----
-		await step.do('send-activities-keyboard', {
-			retries: { limit: 2, delay: '2 seconds', backoff: 'exponential' },
-			timeout: '15 seconds',
-		}, async () => {
-			const { buildActivitiesKeyboard } = await import('../tools/moodKeyboards');
-			const moodStore = await import('../services/moodStore');
-			const alreadyLogged = await moodStore.getTodayActivities(env, userId, today).catch(() => []);
-			const keyboard = buildActivitiesKeyboard('new', alreadyLogged, [], []);
+		// Activities toggle UI lives in the callback handler (per Issue B). The
+		// workflow only renders the initial keyboard. The callback handles
+		// taps and commits to D1 when Done is pressed.
+		if (!aborted) {
+			const actResult = await step.do('send-activities-keyboard', {
+				retries: { limit: 2, delay: '2 seconds', backoff: 'exponential' },
+				timeout: '15 seconds',
+			}, async () => {
+				const cached = await idemGet('send-activities-keyboard');
+				if (cached) return cached;
 
-			const payload = {
-				chat_id: chatId,
-				text: 'What activities did you do today? Tap to add.',
-				reply_markup: keyboard,
-			};
-			if (threadId && threadId !== 'default') payload.message_thread_id = Number(threadId);
+				const moodStore = await import('../services/moodStore');
+				const moodFlow = await import('../lib/moodFlow');
+				const { buildActivitiesKeyboard } = await import('../tools/moodKeyboards');
 
-			const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
-				method: 'POST', headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify(payload),
+				const alreadyLogged = await moodStore.getTodayActivities(env, userId, today).catch(() => []);
+				const keyboard = buildActivitiesKeyboard('new', alreadyLogged, [], []);
+
+				const payload = {
+					chat_id: chatId,
+					text: 'What activities did you do today? Tap to add.',
+					reply_markup: keyboard,
+				};
+				if (threadId && threadId !== 'default') payload.message_thread_id = Number(threadId);
+
+				const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify(payload),
+				});
+				const json = await res.json();
+				if (!json.ok) throw new Error(`sendMessage failed: ${json.description || 'unknown'}`);
+				const msgId = json.result?.message_id;
+
+				// Seed the activities pending state for the callback handler.
+				await moodFlow.initActivitiesPending(env, chatId, msgId).catch(() => {});
+
+				const result = { msgId };
+				await idemSet('send-activities-keyboard', result);
+				return result;
 			});
-			const json = await res.json();
-			if (!json.ok) throw new Error(`sendMessage failed: ${json.description || 'unknown'}`);
-			const msgId = json.result?.message_id;
+			messageIds.activitiesKeyboard = actResult.msgId;
 
-			// Reuse the existing KV pending-state structure so the existing
-			// activities callback handler can keep rendering/committing. This
-			// is the bridge between the workflow and the existing handler.
-			const moodFlow = await import('../lib/moodFlow');
-			await moodFlow.initActivitiesPending(env, chatId, msgId).catch(() => {});
-			return { msgId };
-		});
-
-		// ----- 7. Wait for activities done -----
-		await step.waitForEvent('await-activities', {
-			type: 'activities_done',
-			timeout: '4 hours',
-		});
+			// ----- 7. Wait for activities -----
+			try {
+				await step.waitForEvent('await-activities', {
+					type: 'activities_done',
+					timeout: STEP_TIMEOUT,
+				});
+				// D1 save happens in the callback (Issue B). Workflow no-ops here.
+			} catch (e) {
+				await step.do('cleanup-activities-keyboard', { retries: { limit: 1 } }, async () => {
+					if (messageIds.activitiesKeyboard) {
+						const telegram = await import('../lib/telegram');
+						await telegram.deleteMessage(chatId, messageIds.activitiesKeyboard, env).catch(() => {});
+					}
+				});
+				aborted = true;
+			}
+		}
 
 		// ----- 8. Send photo prompt -----
-		const photoStepResult = await step.do('send-photo-prompt', {
-			retries: { limit: 2, delay: '2 seconds', backoff: 'exponential' },
-			timeout: '15 seconds',
-		}, async () => {
-			const moodStore = await import('../services/moodStore');
-			// If a photo has already landed today, skip straight past.
-			const hasPhoto = await moodStore.hasPhotoLoggedToday(env, userId).catch(() => false);
-			if (hasPhoto) return { skipped: true, reason: 'photo_already_today' };
+		if (!aborted) {
+			const photoStepResult = await step.do('send-photo-prompt', {
+				retries: { limit: 2, delay: '2 seconds', backoff: 'exponential' },
+				timeout: '15 seconds',
+			}, async () => {
+				const cached = await idemGet('send-photo-prompt');
+				if (cached) return cached;
 
-			const payload = {
-				chat_id: chatId,
-				text: 'Got a photo from today? Send it whenever, or tap Skip.',
-				reply_markup: { inline_keyboard: [[{ text: 'Skip photo', callback_data: 'mood_photo|skip' }]] },
-			};
-			if (threadId && threadId !== 'default') payload.message_thread_id = Number(threadId);
+				const moodStore = await import('../services/moodStore');
+				const moodFlow = await import('../lib/moodFlow');
 
-			const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
-				method: 'POST', headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify(payload),
+				const hasPhoto = await moodStore.hasPhotoLoggedToday(env, userId).catch(() => false);
+				if (hasPhoto) {
+					const result = { skipped: true, reason: 'photo_already_today' };
+					await idemSet('send-photo-prompt', result);
+					return result;
+				}
+
+				const payload = {
+					chat_id: chatId,
+					text: 'Got a photo from today? Send it whenever, or tap Skip.',
+					reply_markup: { inline_keyboard: [[{ text: 'Skip photo', callback_data: 'mood_photo|skip' }]] },
+				};
+				if (threadId && threadId !== 'default') payload.message_thread_id = Number(threadId);
+
+				const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify(payload),
+				});
+				const json = await res.json();
+				if (!json.ok) throw new Error(`sendMessage failed: ${json.description || 'unknown'}`);
+				const msgId = json.result?.message_id;
+
+				await moodFlow.initPhotoPending(env, chatId, msgId).catch(() => {});
+
+				const result = { msgId, skipped: false };
+				await idemSet('send-photo-prompt', result);
+				return result;
 			});
-			const json = await res.json();
-			if (!json.ok) throw new Error(`sendMessage failed: ${json.description || 'unknown'}`);
-			const msgId = json.result?.message_id;
+			messageIds.photoPrompt = photoStepResult.msgId;
 
-			const moodFlow = await import('../lib/moodFlow');
-			await moodFlow.initPhotoPending(env, chatId, msgId).catch(() => {});
-			return { msgId };
-		});
-
-		// ----- 9. Wait for photo or skip -----
-		// Only wait if the photo prompt actually rendered. If we skipped because
-		// a photo was already logged today, there is no UI for the user to act
-		// on, so waiting would stall the workflow for 4 hours.
-		if (!photoStepResult?.skipped) {
-			await step.waitForEvent('await-photo', {
-				type: 'photo_done',
-				timeout: '4 hours',
-			});
+			// ----- 9. Wait for photo -----
+			// Only wait if we actually rendered the prompt. If photo was already
+			// logged today, photoStepResult.skipped is true → fall straight through.
+			if (!photoStepResult.skipped) {
+				try {
+					await step.waitForEvent('await-photo', {
+						type: 'photo_done',
+						timeout: STEP_TIMEOUT,
+					});
+				} catch (e) {
+					await step.do('cleanup-photo-prompt', { retries: { limit: 1 } }, async () => {
+						if (messageIds.photoPrompt) {
+							const telegram = await import('../lib/telegram');
+							await telegram.deleteMessage(chatId, messageIds.photoPrompt, env).catch(() => {});
+						}
+					});
+					aborted = true;
+				}
+			}
 		}
 
 		// ----- 10. Send sleep keyboard -----
-		// Deterministic. 4h..12h+ + Skip. If sleep is already logged today,
-		// skip the prompt and treat as already-done.
-		const sleepStepResult = await step.do('send-sleep-keyboard', {
-			retries: { limit: 2, delay: '2 seconds', backoff: 'exponential' },
-			timeout: '15 seconds',
-		}, async () => {
-			const moodStore = await import('../services/moodStore');
-			const hasSleep = await moodStore.hasSleepLoggedToday(env, userId, today).catch(() => false);
-			if (hasSleep) return { skipped: true, reason: 'sleep_already_today' };
+		if (!aborted) {
+			const sleepStepResult = await step.do('send-sleep-keyboard', {
+				retries: { limit: 2, delay: '2 seconds', backoff: 'exponential' },
+				timeout: '15 seconds',
+			}, async () => {
+				const cached = await idemGet('send-sleep-keyboard');
+				if (cached) return cached;
 
-			const keyboard = {
-				inline_keyboard: [
-					[
-						{ text: '4h', callback_data: 'mood_sleep|4' },
-						{ text: '5h', callback_data: 'mood_sleep|5' },
-						{ text: '6h', callback_data: 'mood_sleep|6' },
-					],
-					[
-						{ text: '7h', callback_data: 'mood_sleep|7' },
-						{ text: '8h', callback_data: 'mood_sleep|8' },
-						{ text: '9h', callback_data: 'mood_sleep|9' },
-					],
-					[
-						{ text: '10h', callback_data: 'mood_sleep|10' },
-						{ text: '11h', callback_data: 'mood_sleep|11' },
-						{ text: '12h+', callback_data: 'mood_sleep|12' },
-					],
-					[
-						{ text: 'Skip', callback_data: 'mood_sleep|skip' },
-					],
-				],
-			};
+				const moodStore = await import('../services/moodStore');
+				const hasSleep = await moodStore.hasSleepLoggedToday(env, userId, today).catch(() => false);
+				if (hasSleep) {
+					const result = { skipped: true };
+					await idemSet('send-sleep-keyboard', result);
+					return result;
+				}
 
-			const payload = {
-				chat_id: chatId,
-				text: 'How did you sleep last night?',
-				reply_markup: keyboard,
-			};
-			if (threadId && threadId !== 'default') payload.message_thread_id = Number(threadId);
+				const keyboard = {
+					inline_keyboard: [
+						[
+							{ text: '4h', callback_data: 'mood_sleep|4' },
+							{ text: '5h', callback_data: 'mood_sleep|5' },
+							{ text: '6h', callback_data: 'mood_sleep|6' },
+						],
+						[
+							{ text: '7h', callback_data: 'mood_sleep|7' },
+							{ text: '8h', callback_data: 'mood_sleep|8' },
+							{ text: '9h', callback_data: 'mood_sleep|9' },
+						],
+						[
+							{ text: '10h', callback_data: 'mood_sleep|10' },
+							{ text: '11h', callback_data: 'mood_sleep|11' },
+							{ text: '12h+', callback_data: 'mood_sleep|12' },
+						],
+						[
+							{ text: 'Skip', callback_data: 'mood_sleep|skip' },
+						],
+					],
+				};
 
-			const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
-				method: 'POST', headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify(payload),
+				const payload = {
+					chat_id: chatId,
+					text: 'How did you sleep last night?',
+					reply_markup: keyboard,
+				};
+				if (threadId && threadId !== 'default') payload.message_thread_id = Number(threadId);
+
+				const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify(payload),
+				});
+				const json = await res.json();
+				if (!json.ok) throw new Error(`sendMessage failed: ${json.description || 'unknown'}`);
+				const msgId = json.result?.message_id;
+
+				const result = { msgId, skipped: false };
+				await idemSet('send-sleep-keyboard', result);
+				return result;
 			});
-			const json = await res.json();
-			if (!json.ok) throw new Error(`sendMessage failed: ${json.description || 'unknown'}`);
-			return { msgId: json.result?.message_id };
-		});
+			messageIds.sleepKeyboard = sleepStepResult.msgId;
 
-		// ----- 11. Wait for sleep -----
-		// Same shortcut as photo: skip the wait if the keyboard wasn't rendered.
-		if (!sleepStepResult?.skipped) {
-			await step.waitForEvent('await-sleep', {
-				type: 'sleep_logged',
-				timeout: '4 hours',
+			// ----- 11. Wait for sleep -----
+			if (!sleepStepResult.skipped) {
+				try {
+					const sleepEvent = await step.waitForEvent('await-sleep', {
+						type: 'sleep_logged',
+						timeout: STEP_TIMEOUT,
+					});
+					sleepHours = sleepEvent?.payload?.sleep_hours;
+					sleepSkipped = sleepEvent?.payload?.skipped === true;
+				} catch (e) {
+					await step.do('cleanup-sleep-keyboard', { retries: { limit: 1 } }, async () => {
+						if (messageIds.sleepKeyboard) {
+							const telegram = await import('../lib/telegram');
+							await telegram.deleteMessage(chatId, messageIds.sleepKeyboard, env).catch(() => {});
+						}
+					});
+					aborted = true;
+				}
+			}
+		}
+
+		// ----- 12. Process sleep (D1 save) -----
+		if (!aborted && sleepHours != null && !sleepSkipped) {
+			await step.do('process-sleep', {
+				retries: { limit: 2, delay: '2 seconds' },
+				timeout: '10 seconds',
+			}, async () => {
+				const cached = await idemGet('process-sleep');
+				if (cached) return cached;
+
+				const moodStore = await import('../services/moodStore');
+				await moodStore.upsertEntry(env, userId, today, 'evening', {
+					sleep_hours: sleepHours,
+					source,
+				});
+
+				await idemSet('process-sleep', { sleepHours });
+				return { sleepHours };
 			});
 		}
 
-		// ----- 12. Fire synthesis -----
-		// Runs the 6-tier cascade inline (not via the queue) so we can persist
-		// the result as a workflow step output. If synthesis succeeds, the
-		// text is sent to Telegram from inside this step. The KV synthesis
-		// guard is still set to prevent the queue path from firing again.
+		// ----- 13. Fire synthesis (ALWAYS, even after abort) -----
+		// Even if the user walked away mid-flow, we still fire the synthesis
+		// with the data we collected. Better to leave them a partial reflection
+		// than nothing at all.
 		const synthResult = await step.do('fire-synthesis', {
 			retries: { limit: 1, delay: '5 seconds', backoff: 'constant' },
 			timeout: '120 seconds',
 		}, async () => {
+			const cached = await idemGet('fire-synthesis');
+			if (cached) return cached;
+
 			const guardKey = `mood_synthesis_fired_${chatId}_${today}`;
-			// Set the guard FIRST. If the existing queue path also fires while
-			// we are computing, this prevents a double-send. Idempotent.
+			// Guard against double-send if any legacy path also tries to fire
+			// synthesis. Set first; idempotent.
 			await env.CHAT_KV.put(guardKey, '1', { expirationTtl: 26 * 3600 });
 
 			const { runSynthesisCascade } = await import('../services/moodSynthesis');
 			const { personas } = await import('../config/personas');
 
-			const synth = await runSynthesisCascade(env, userId, event.timestamp?.getTime() || Date.now(), personas.xaridotis.instruction);
+			const synth = await runSynthesisCascade(env, userId, startedAtMs, personas.xaridotis.instruction);
 
 			if (synth?.text) {
-				// Typing indicator before the synthesis message, matching the
-				// existing UX in index.js queue consumer.
+				// Typing indicator before the long synthesis text lands.
 				try {
 					const tPayload = { chat_id: chatId, action: 'typing' };
 					if (threadId && threadId !== 'default') tPayload.message_thread_id = Number(threadId);
 					await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendChatAction`, {
-						method: 'POST', headers: { 'Content-Type': 'application/json' },
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
 						body: JSON.stringify(tPayload),
 					});
 				} catch { /* non-fatal */ }
@@ -285,26 +577,35 @@ export class MoodEveningCheckinWorkflow extends WorkflowEntrypoint {
 				const payload = { chat_id: chatId, text: synth.text, parse_mode: 'HTML' };
 				if (threadId && threadId !== 'default') payload.message_thread_id = Number(threadId);
 				await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
-					method: 'POST', headers: { 'Content-Type': 'application/json' },
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify(payload),
 				});
 			}
 
-			// End the KV-side flow tracker too, since the check-in is fully
-			// complete now.
+			// End the KV-side flow tracker and clear the active check-in flag.
 			const moodFlow = await import('../lib/moodFlow');
 			await moodFlow.endFlow(env, chatId).catch(() => {});
 			await env.CHAT_KV.delete(`health_checkin_active_${chatId}`).catch(() => {});
 
-			return { source: synth.source, ms: synth.ms, textLen: synth.text?.length || 0 };
+			const result = {
+				source: synth?.source,
+				ms: synth?.ms,
+				textLen: synth?.text?.length || 0,
+			};
+			await idemSet('fire-synthesis', result);
+			return result;
 		});
 
 		return {
-			status: 'completed',
+			status: aborted ? 'partial' : 'completed',
+			instanceId,
 			score,
 			emotionCount: emotions.length,
-			synthesisSource: synthResult.source,
-			synthesisMs: synthResult.ms,
+			sleepHours,
+			sleepSkipped,
+			synthesisSource: synthResult?.source,
+			synthesisMs: synthResult?.ms,
 		};
 	}
 }

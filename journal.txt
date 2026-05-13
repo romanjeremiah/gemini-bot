@@ -4,6 +4,120 @@ A log of significant engineering sessions on Xaridotis (gemini-bot). Most recent
 
 ================================================================================
 
+## 2026-05-13 — Layer 3: workflow as single source of truth for evening check-in
+
+### What
+
+Rewrote the evening mood check-in flow around the Cloudflare Workflow as the
+sole orchestrator. Retired the dual-system competition between the workflow
+and the KV-based cron safety-net that was causing duplicate keyboards. The
+workflow now owns step ordering, timeout handling, message cleanup, and
+synthesis. Callbacks and the AI tool path commit to D1 as before (Issue B);
+they now also dispatch events to the workflow so it can progress whether the
+user taps a keyboard or types.
+
+### Six locked decisions
+
+1. Auto-terminate any existing workflow instance when a new /mood or cron
+   evening fires. No dual instances per day.
+2. Same workflow class serves both cron evening and manual /mood, gated by a
+   `source` payload field and a `respect_quiet_hours` flag.
+3. `waitForEvent` calls are wrapped in try/catch. On 4h timeout the workflow
+   deletes the active sent message, marks itself aborted, and jumps to the
+   synthesis step. No errored workflow corpses.
+4. The extreme-score exception is gone. All scores 0–10 now get emotion
+   buttons. Clinical concern handling moves into the synthesis text itself.
+5. Quiet-hours check sits as the workflow's first step. Manual /mood passes
+   `respect_quiet_hours: false`; cron passes `true`.
+6. Side effects move into workflow steps where the workflow owns them. Two
+   carve-outs (Issue B): the activities keyboard's intermediate toggle UI
+   stays in the callback handler, and the D1 commits for activities (Done
+   press), photo upload, and AI-tool typed input remain outside the workflow.
+
+### Workflow bridge (B1)
+
+When the user types data instead of tapping keyboards, the AI tool
+`log_mood_entry` now dispatches matching workflow events for score,
+emotions, activities, and sleep. Without this bridge, the workflow would sit
+at `waitForEvent` for the full 4h timeout on any typed input. The bridge
+falls through to the legacy `maybeFireSynthesis` queue path only when no
+workflow is active for the day (e.g. workflow create failed at cron time).
+
+### Files changed
+
+- `src/workflows/moodEveningCheckin.js` — full rewrite (~611 lines). 13 steps
+  with idempotency markers + step.do caching. Every `waitForEvent` wrapped in
+  try/catch. Step 13 (`fire-synthesis`) always runs, even after timeout abort.
+- `src/bot/handlers.js` — /mood handler auto-terminates old instance and
+  creates a new one with `respect_quiet_hours: false`. `mood_emo_done`,
+  `handleSleepCallback`, photo upload, and photo skip handlers dispatch events
+  to the workflow when active and skip legacy side effects.
+- `src/index.js` — `handleMoodPollAnswer` dispatches `score_received` event
+  when workflow active. `enqueueHealthTasks` evening branch creates a workflow
+  instance instead of enqueueing a `mood_poll` task. The entire
+  `mood_flow_safety_net` enqueue block is removed. Morning/midday branches
+  get a separate 10-min in-flight lock + 24h done flag (with `today` in task
+  body for cross-midnight safety). The queue consumer's `mood_synthesis_final`
+  and `mood_flow_safety_net` branches collapse to a single drain branch that
+  logs and acks any pre-deploy queued tasks.
+- `src/tools/mood.js` — Layer 3 workflow bridge in `log_mood_entry`. When a
+  workflow is active for today, dispatch matching events for whichever fields
+  were typed (score / emotions / activities / sleep). Skip the legacy
+  `maybeFireSynthesis` path on the workflow branch.
+- `src/lib/moodFlow.js` — demoted to a write-through cache. Header comment
+  updated to document Layer 3 status.
+
+### New log lines to watch in `wrangler tail`
+
+- `workflow_evening_created` — cron or /mood created an instance
+- `workflow_terminated_old` — auto-terminate of previous instance
+- `workflow_timeout_cleanup` — waitForEvent hit 4h timeout, cleaned up and
+  jumped to synthesis
+- `workflow_quiet_skip` — cron suppressed by quiet hours
+- `mood_workflow_event_sent` — callback dispatched an event to the workflow
+- `mood_workflow_send_event_failed` — dispatch failed, fell back to legacy
+- `queue_legacy_mood_task_dropped` — pre-deploy queued task drained silently
+- `📨 Workflow bridge: <event>` — AI tool path dispatched a typed-input event
+
+### Known deploy hazard
+
+In-flight workflow instances created before deploy are running the OLD
+workflow logic (thin coordinator pattern). New callbacks short-circuit and
+dispatch events instead of doing the side effects directly. Old workflow
+code expects callbacks to do the work, so events arriving at old instances
+will not trigger D1 save / ack / emotion buttons. Result: any check-in
+mid-stream at deploy time will stall until the user runs /mood to start a
+fresh instance.
+
+Mitigation options:
+- A) Manually terminate in-flight instances via
+  `wrangler workflows instances list xaridotis-mood-eve-checkin --status=running`
+  then `wrangler workflows instances terminate xaridotis-mood-eve-checkin <id>`.
+- B) Accept risk: typically 0–1 in-flight instances; max 4h timeout; user
+  /mood restart is a clean recovery.
+
+Picked B with a quick check via option A pre-deploy.
+
+### How to deploy
+
+```
+npx wrangler deploy --minify
+git add -A && git commit -m "layer-3: workflow as single source of truth for evening flow" && git push
+```
+
+Then tail for `workflow_evening_created` at the next cron evening or after
+running /mood.
+
+### Rollback path
+
+Revert the commit and redeploy. The workflow class binding stays bound;
+legacy callbacks still handle their D1 commits correctly without the bridge.
+The queue branches we removed (`mood_synthesis_final`, `mood_flow_safety_net`)
+would need to come back from git history if we want the safety-net behaviour
+restored.
+
+================================================================================
+
 ## 2026-05-11 (later) — Production hygiene batch: 8 fixes, 1 revert, 1 already-done
 
 ### What

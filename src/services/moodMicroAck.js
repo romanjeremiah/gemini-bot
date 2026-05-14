@@ -4,17 +4,16 @@
 //   1. After the user picks a score on the poll  -> runScoreAck()
 //   2. After the user finishes selecting emotions -> runEmotionsAck()
 //
-// Both calls run a 2-tier Cloudflare-only cascade for speed. Mid-flow latency
-// budget is tight: a friend's "ok, that's a lot" should land in 2-3 seconds,
-// not 8-15. We deliberately do NOT fall through to Gemini here — if Workers
-// AI fails twice in a row, we send static text instead. The end-of-flow
-// synthesis (moodSynthesis.js) carries the heavy clinical observation and
-// has a longer 6-tier cascade.
+// Both calls run a 2-tier cascade for speed. Mid-flow latency budget is tight:
+// a friend's "ok, that's a lot" should land in 2-3 seconds, not 8-15. We
+// deliberately do NOT fall through to Gemini Pro here — if both tiers fail
+// we send static text. The end-of-flow synthesis (moodSynthesis.js) carries
+// the heavy clinical observation and has a longer cascade.
 //
-// Cascade per call:
-//   Tier 1: @cf/meta/llama-3.3-70b-instruct-fp8-fast  (15s budget)
-//   Tier 2: @cf/google/gemma-3-12b-it                 (15s budget)
-//   Tier 3: static fallback text                      (instant)
+// Architecture B+ cascade (2026-05-14):
+//   Tier 1: gemini-2.5-flash-lite, thinkingBudget=-1  (15s budget)
+//   Tier 2: @cf/google/gemma-4-26b-a4b-it             (15s budget)
+//   Tier 3: static fallback text                       (instant)
 //
 // Each tier uses error-feedback first (clean errors fall through immediately),
 // timeout second (silent-hang safety net). Worst case before static: ~30s.
@@ -25,12 +24,13 @@
 
 import * as moodStore from './moodStore';
 import { runCfAi } from '../lib/ai-gateway';
+import { geminiBackgroundGenerate } from '../lib/ai/gemini';
 import { getCheckinTiming } from '../lib/moodFlow';
 import { MOOD_POLL_OPTIONS } from '../config/moodScale';
 import { log } from '../lib/logger';
 
-const TIER1_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
-const TIER2_MODEL = '@cf/google/gemma-3-12b-it';
+const TIER1_MODEL = 'gemini-2.5-flash-lite';            // Architecture B+ primary (73.0/108 dynamic)
+const TIER2_MODEL = '@cf/google/gemma-4-26b-a4b-it';    // Vendor-diversified fallback via CF
 const TIER1_TIMEOUT_MS = 15000;
 const TIER2_TIMEOUT_MS = 15000;
 
@@ -138,37 +138,75 @@ Briefly respond as a supportive and understanding friend who notices patterns.`;
 // ---- Cascade machinery ----
 
 /**
- * Run the 2-tier Cloudflare-only cascade. Returns { text, source } where
- * source is 'llama-3.3-70b' | 'gemma-3-12b' | 'static'. Empty text falls
- * through to the next tier (no minimum-length guard, but we treat
- * whitespace-only as empty).
+ * Run the 2-tier cascade. Returns { text, source } where source identifies
+ * the winning tier. Empty text falls through to the next tier (no minimum-
+ * length guard, but we treat whitespace-only as empty).
  */
 async function runCascade(env, prompt, systemPrompt, kind) {
-	if (!env.AI) return { text: '', source: 'static' };
+	// Tier 1: Gemini 2.5 FL dynamic
+	const tier1 = await tryGeminiTier(env, TIER1_MODEL, prompt, systemPrompt, TIER1_TIMEOUT_MS, kind);
+	if (tier1) return { text: tier1, source: 'gemini-2.5-flash-lite-dyn' };
 
-	const messages = [];
-	if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
-	messages.push({ role: 'user', content: prompt });
+	// Tier 2: Gemma 4 via CF (vendor diversification)
+	if (env.AI) {
+		const tier2 = await tryCfTier(env, TIER2_MODEL, systemPrompt, prompt, TIER2_TIMEOUT_MS, kind, 'gemma-4');
+		if (tier2) return { text: tier2, source: 'gemma-4' };
+	}
 
-	// Tier 1: Llama 3.3 70B fp8-fast
-	const tier1 = await tryTier(env, TIER1_MODEL, messages, TIER1_TIMEOUT_MS, kind, 'llama-3.3-70b');
-	if (tier1) return { text: tier1, source: 'llama-3.3-70b' };
-
-	// Tier 2: Gemma 3 12B
-	const tier2 = await tryTier(env, TIER2_MODEL, messages, TIER2_TIMEOUT_MS, kind, 'gemma-3-12b');
-	if (tier2) return { text: tier2, source: 'gemma-3-12b' };
-
-	// Both Workers AI tiers exhausted. Return empty so caller substitutes static.
+	// Both tiers exhausted. Return empty so caller substitutes static.
 	log.warn('mood_micro_ack_cascade_exhausted', { kind });
 	return { text: '', source: 'static' };
 }
 
 /**
- * Run one tier with mixed error-feedback + timeout. Returns the response
- * text on success, null on any failure (timeout, network, overload,
- * empty response). Never throws.
+ * Run the Gemini tier with wall-clock timeout. Returns response text on
+ * success, null on any failure (timeout, network, overload, empty response).
+ * Never throws.
  */
-async function tryTier(env, model, messages, timeoutMs, kind, tierLabel) {
+async function tryGeminiTier(env, model, prompt, systemPrompt, timeoutMs, kind) {
+	if (!env.GEMINI_API_KEY) return null;
+	const t0 = Date.now();
+	let didTimeout = false;
+	try {
+		const result = await Promise.race([
+			geminiBackgroundGenerate(env, model, prompt, systemPrompt, { thinkingBudget: -1, maxOutputTokens: 1000 }),
+			new Promise((resolve) => setTimeout(() => {
+				didTimeout = true;
+				resolve(null);
+			}, timeoutMs)),
+		]);
+		const elapsed = Date.now() - t0;
+		if (didTimeout) {
+			log.warn('mood_micro_ack_tier_timeout', { kind, tier: 'gemini-2.5-flash-lite', ms: elapsed, capMs: timeoutMs });
+			return null;
+		}
+		if (!result || !result.trim()) {
+			log.warn('mood_micro_ack_tier_empty', { kind, tier: 'gemini-2.5-flash-lite', ms: elapsed });
+			return null;
+		}
+		log.info('mood_micro_ack_tier_ok', { kind, tier: 'gemini-2.5-flash-lite', ms: elapsed });
+		return result.trim();
+	} catch (err) {
+		const elapsed = Date.now() - t0;
+		log.warn('mood_micro_ack_tier_error', {
+			kind,
+			tier: 'gemini-2.5-flash-lite',
+			ms: elapsed,
+			msg: (err?.message || '').slice(0, 200),
+		});
+		return null;
+	}
+}
+
+/**
+ * Run a Cloudflare-AI tier with mixed error-feedback + timeout. Returns the
+ * response text on success, null on any failure. Never throws.
+ */
+async function tryCfTier(env, model, systemPrompt, prompt, timeoutMs, kind, tierLabel) {
+	const messages = [];
+	if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+	messages.push({ role: 'user', content: prompt });
+
 	const t0 = Date.now();
 	let didTimeout = false;
 	try {

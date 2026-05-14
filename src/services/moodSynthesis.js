@@ -5,17 +5,22 @@
 // AI call per check-in that earns Pro-tier resilience: it produces the
 // therapeutic observation that connects today's data to past patterns.
 //
-// Cascade (Cloudflare-first, Gemini fallback):
-//   Tier 1: @cf/meta/llama-3.3-70b-instruct-fp8-fast  (15s)
-//   Tier 2: @cf/google/gemma-3-12b-it                 (15s)
-//   Tier 3: gemini-3.1-flash-lite-preview             (20s)
-//   Tier 4: gemini-3-flash-preview                    (25s)
-//   Tier 5: gemini-3.1-pro-preview                    (30s)
-//   Tier 6: fixed warm fallback text                  (instant)
+// Architecture B+ cascade (2026-05-14):
+//   Tier 1: gemini-2.5-pro, thinkingBudget=128       (15s) — best at synthesis (68/108, 11.5/15 on Cat C)
+//   Tier 2: gemini-2.5-flash-lite, thinkingBudget=512 (15s) — best mental health quality (73.5/108, 12/15 on Cat C)
+//   Tier 3: gemini-2.5-flash, thinkingBudget=8192    (15s) — alternative summariser, faster
+//   Tier 4: @cf/zai-org/glm-4.7-flash via CF         (15s) — vendor diversification (resilience hedge)
+//   Tier 5: fixed warm fallback text                  (instant)
 //
-// Worst case before fixed text: 105s. Realistic case: Tier 1 succeeds in
-// 5-8s. Each tier uses error-feedback first, timeout as silent-hang safety
+// Worst case before fixed text: 60s. Realistic case: Tier 1 succeeds in
+// 4-10s. Each tier uses error-feedback first, timeout as silent-hang safety
 // net.
+//
+// Why this ordering: bundle data shows 2.5 Pro b128 is best at therapeutic
+// synthesis (highest on Cat C inside the Pro tier with the lowest latency),
+// 2.5 Flash-Lite b512 is the best non-Pro on Cat C in the entire family, and
+// 2.5 Flash b8192 is faster than both while still capable. GLM is kept as
+// the final non-Google fallback so a Google-wide outage doesn't kill synthesis.
 //
 // Synthesis-readiness check: maybeFireSynthesis() only checks whether sleep
 // has been logged today (across any entry_type). Score/emotions/activities/
@@ -27,18 +32,17 @@ import * as moodStore from './moodStore';
 import * as episodeStore from './episodeStore';
 import * as vectorStore from './vectorStore';
 import { runCfAi } from '../lib/ai-gateway';
-import { generateDeepResponse } from '../lib/ai/gemini';
+import { geminiBackgroundGenerate } from '../lib/ai/gemini';
 import { getCheckinTiming } from '../lib/moodFlow';
 import { MOOD_POLL_OPTIONS } from '../config/moodScale';
 import { log } from '../lib/logger';
 
 // Cascade configuration. Tuples of [tier label, runner function, timeout ms].
 const CASCADE = [
-	['llama-3.3-70b', runLlamaTier, 15000],
-	['gemma-3-12b',   runGemmaTier, 15000],
-	['gemini-flash-lite', runGeminiTier.bind(null, 'gemini-3.1-flash-lite-preview'), 20000],
-	['gemini-flash',  runGeminiTier.bind(null, 'gemini-3-flash-preview'), 25000],
-	['gemini-pro',    runGeminiProTier, 30000],
+	['gemini-2.5-pro-b128',          runGemini25ProTier,        15000],
+	['gemini-2.5-flash-lite-b512',   runGemini25FlashLiteTier,  15000],
+	['gemini-2.5-flash-b8192',       runGemini25FlashTier,      15000],
+	['glm-4.7-flash',                runGlmTier,                15000],
 ];
 
 const FIXED_FALLBACK_TEXT = 'Logged for tonight. We can talk through it whenever you are ready.';
@@ -363,66 +367,53 @@ async function runTier(runner, env, prompt, systemPrompt, timeoutMs, label) {
 	}
 }
 
-async function runLlamaTier(env, prompt, systemPrompt) {
-	if (!env.AI) return '';
-	const messages = [];
-	if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
-	messages.push({ role: 'user', content: prompt });
-	const result = await runCfAi(env.AI, '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-		{ messages, max_tokens: 1024 },
-		{ headers: { 'x-session-affinity': 'xaridotis-mood-synth' } }
-	);
-	return extractWorkersAiText(result);
-}
-
-async function runGemmaTier(env, prompt, systemPrompt) {
-	if (!env.AI) return '';
-	const messages = [];
-	if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
-	messages.push({ role: 'user', content: prompt });
-	const result = await runCfAi(env.AI, '@cf/google/gemma-3-12b-it',
-		{ messages, max_tokens: 1024 },
-		{ headers: { 'x-session-affinity': 'xaridotis-mood-synth' } }
-	);
-	return extractWorkersAiText(result);
-}
-
-async function runGeminiTier(modelId, env, prompt, systemPrompt) {
-	if (!env.GEMINI_API_KEY) return '';
-	const { GoogleGenAI } = await import('@google/genai');
-	const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
-	const response = await ai.models.generateContent({
-		model: modelId,
-		contents: [{ role: 'user', parts: [{ text: prompt }] }],
-		config: {
-			systemInstruction: systemPrompt,
-			temperature: 1.0,
-			maxOutputTokens: 1500,
-		},
-	});
-	let text = '';
-	if (typeof response?.text === 'string') text = response.text;
-	else if (typeof response?.text === 'function') {
-		try { text = response.text() || ''; } catch { /* skip */ }
-	}
-	if (!text) {
-		text = response?.candidates?.[0]?.content?.parts
-			?.filter((p) => p.text && !p.thought)
-			?.map((p) => p.text)
-			?.join('') || '';
-	}
-	return text;
-}
-
-async function runGeminiProTier(env, prompt, systemPrompt) {
-	// Reuse the existing generateDeepResponse helper for Pro to keep the
-	// thinking-budget and gateway settings consistent with the rest of
-	// the codebase. medium thinking is enough for synthesis.
-	const text = await generateDeepResponse(prompt, systemPrompt, env, {
-		thinkingLevel: 'medium',
+async function runGemini25ProTier(env, prompt, systemPrompt) {
+	// Tier 1: Gemini 2.5 Pro, thinkingBudget 128.
+	// Bundle data: 68/108 overall, 11.5/15 on Cat C, 3.7s avg — the best Pro
+	// variant on this workload. Higher budgets (8192, 24576) underperformed.
+	const text = await geminiBackgroundGenerate(env, 'gemini-2.5-pro', prompt, systemPrompt, {
+		thinkingBudget: 128,
 		maxOutputTokens: 1500,
 	});
 	return text || '';
+}
+
+async function runGemini25FlashLiteTier(env, prompt, systemPrompt) {
+	// Tier 2: Gemini 2.5 Flash-Lite, thinkingBudget 512.
+	// Bundle data: 73.5/108 overall (best in Gemini family), 12/15 on Cat C
+	// (highest mental-health score across all tested variants).
+	const text = await geminiBackgroundGenerate(env, 'gemini-2.5-flash-lite', prompt, systemPrompt, {
+		thinkingBudget: 512,
+		maxOutputTokens: 1500,
+	});
+	return text || '';
+}
+
+async function runGemini25FlashTier(env, prompt, systemPrompt) {
+	// Tier 3: Gemini 2.5 Flash, thinkingBudget 8192.
+	// Bundle data: 59.5/108, 2883ms avg, 9/12 on Cat D. Faster than Pro b128
+	// when latency matters more than absolute synthesis quality.
+	const text = await geminiBackgroundGenerate(env, 'gemini-2.5-flash', prompt, systemPrompt, {
+		thinkingBudget: 8192,
+		maxOutputTokens: 1500,
+	});
+	return text || '';
+}
+
+async function runGlmTier(env, prompt, systemPrompt) {
+	// Tier 4: GLM-4.7-Flash via Cloudflare AI.
+	// Vendor diversification fallback per Gap 3 in the Architecture B+ analysis.
+	// If Google has an outage, GLM runs on Cloudflare's infrastructure and keeps
+	// synthesis available. 131K context, ~25 neurons/call.
+	if (!env.AI) return '';
+	const messages = [];
+	if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+	messages.push({ role: 'user', content: prompt });
+	const result = await runCfAi(env.AI, '@cf/zai-org/glm-4.7-flash',
+		{ messages, max_tokens: 1500 },
+		{ headers: { 'x-session-affinity': 'xaridotis-mood-synth' } }
+	);
+	return extractWorkersAiText(result);
 }
 
 function extractWorkersAiText(result) {

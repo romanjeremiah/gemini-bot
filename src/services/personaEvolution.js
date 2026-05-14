@@ -4,8 +4,11 @@
 // evolved_traits + communication_notes columns with observations. Runs as part
 // of the daily 04:00 cron alongside style card consolidation.
 //
-// Uses cheap Cloudflare AI (Llama 3.1 8B) for extraction — background quality
-// job, not user-facing, so latency and cost matter more than peak quality.
+// Architecture B+ (2026-05-14): uses Gemini 2.5 Flash-Lite (dynamic) for the
+// extraction. Llama 3.1 8B (the previous model) struggled with the structured
+// COMMUNICATION_NOTES + EVOLVED_TRAITS output, frequently mis-parsing. The
+// 2.5 GA Flash-Lite handles structured-output discipline cleanly and the
+// dynamic budget keeps latency reasonable for a daily cron job.
 //
 // SIGNAL SOURCES (in order of priority):
 //   1. Recent feedback memories (RLHF reactions — strongest signal)
@@ -17,9 +20,11 @@
 // NULL evolved_traits forever. Now reads from data sources that actually exist.
 
 import { runCfAi } from '../lib/ai-gateway';
+import { geminiBackgroundGenerate } from '../lib/ai/gemini';
 import { getPersonaConfig, updatePersonaConfig } from './persona';
 
-const OBSERVATION_MODEL = '@cf/meta/llama-3.1-8b-instruct';
+const OBSERVATION_MODEL = 'gemini-2.5-flash-lite';
+const OBSERVATION_FALLBACK_MODEL = '@cf/meta/llama-3.1-8b-instruct'; // resilience fallback
 
 const EVOLUTION_PROMPT = `You are analysing recent interactions between a user and their AI companion to extract DURABLE observations.
 
@@ -130,22 +135,39 @@ export async function evolvePersona(env, userId) {
 
 	const inputBlob = `Recent signals (${signals.length} total):\n\n${signals.join('\n\n')}\n\n=== CURRENT STATE ===\nExisting evolved_traits: ${existingTraits}\nExisting communication_notes: ${existingNotes}\n\nProduce updated COMMUNICATION_NOTES and EVOLVED_TRAITS based on the signals. Preserve existing observations that are still supported; refine or add based on new evidence.`;
 
-	let result;
+	let text = null;
 	try {
-		result = await runCfAi(env.AI, OBSERVATION_MODEL, {
-			messages: [
-				{ role: 'system', content: EVOLUTION_PROMPT },
-				{ role: 'user', content: inputBlob },
-			],
-			temperature: 0.5,
-			max_tokens: 700,
+		// Primary: Gemini 2.5 Flash-Lite dynamic. Architecture B+ — best Gemini-
+		// family variant for structured-output discipline (73.0/108 overall,
+		// 11/12 on tagger Cat D).
+		text = await geminiBackgroundGenerate(env, OBSERVATION_MODEL, inputBlob, EVOLUTION_PROMPT, {
+			thinkingBudget: -1,
+			maxOutputTokens: 700,
 		});
 	} catch (err) {
-		console.warn('persona evolution: CF AI call failed:', err.message);
-		return;
+		console.warn('persona evolution: Gemini call failed:', err.message);
 	}
 
-	const text = (result?.choices?.[0]?.message?.content || result?.response || '').trim();
+	// Fallback: Llama 3.1 8B via CF (resilience anchor if Gemini errors).
+	if (!text && env.AI) {
+		try {
+			const result = await runCfAi(env.AI, OBSERVATION_FALLBACK_MODEL, {
+				messages: [
+					{ role: 'system', content: EVOLUTION_PROMPT },
+					{ role: 'user', content: inputBlob },
+				],
+				temperature: 0.5,
+				max_tokens: 700,
+			});
+			text = (result?.choices?.[0]?.message?.content || result?.response || '').trim();
+		} catch (err) {
+			console.warn('persona evolution: Llama fallback also failed:', err.message);
+			return;
+		}
+	}
+
+	if (!text) return;
+	text = text.trim();
 	if (!text || text === 'NONE' || text.toUpperCase().startsWith('NONE')) {
 		console.log('🌱 Persona evolution: no high-confidence updates');
 		return;

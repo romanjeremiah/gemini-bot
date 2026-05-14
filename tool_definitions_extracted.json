@@ -1,0 +1,849 @@
+[
+  {
+    "name": "create_checklist",
+    "description": "Create a checklist with toggleable tasks. Use for step-by-step plans, shopping lists, to-do lists, or task breakdowns. Tasks can be marked as done by tapping them.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "title": {
+          "type": "STRING",
+          "description": "The title of the checklist (e.g., 'Morning Routine'). Max 255 characters."
+        },
+        "items": {
+          "type": "ARRAY",
+          "items": {
+            "type": "STRING"
+          },
+          "description": "List of tasks (1-30 items). PERSPECTIVE: tasks are presented BACK to the user, so use imperative or noun phrases — NEVER first person. Good: 'Take meds', 'Email Sarah', 'Buy milk', 'Morning shower'. Bad: 'I take my meds', 'I email Sarah'. If the user describes their routine in first person ('I take meds, I shower'), convert each item to imperative ('Take meds', 'Shower')."
+        }
+      },
+      "required": [
+        "title",
+        "items"
+      ]
+    }
+  },
+  {
+    "name": "manage_cloudflare",
+    "description": "Inspect Cloudflare resource state for diagnostics. READ-ONLY: SELECT/PRAGMA queries on D1, list/get on KV. No mutations, no deletes. For changes, use purpose-built tools (memoryTool, etc). DO NOT USE for reminders — use list_reminders/update_reminder instead. DO NOT USE for memory/episode/mood lookups — use the dedicated tools. This tool is for low-level state inspection (table schemas, row counts, KV key existence), not for normal product queries.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "service": {
+          "type": "STRING",
+          "enum": [
+            "D1",
+            "KV"
+          ]
+        },
+        "action": {
+          "type": "STRING",
+          "description": "For D1: 'query' (SELECT/PRAGMA only). For KV: 'list' (lists keys by prefix) or 'get' (reads one key)."
+        },
+        "details": {
+          "type": "STRING",
+          "description": "For D1 query: the SELECT or PRAGMA SQL. For KV list: the key prefix. For KV get: the exact key name."
+        }
+      },
+      "required": [
+        "service",
+        "action"
+      ]
+    }
+  },
+  {
+    "name": "send_draft",
+    "description": "Provide the user with a pre-filled message they can tap to share or send. Opens a share dialog with the text already filled in. Useful for providing templates, suggested replies, or messages the user can forward.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "text": {
+          "type": "STRING",
+          "description": "The text to pre-fill for the user."
+        }
+      },
+      "required": [
+        "text"
+      ]
+    }
+  },
+  {
+    "name": "send_with_effect",
+    "description": "Send a message with a full-screen animated Telegram effect. Use sparingly for genuinely impactful moments. Built-in effects: hearts (❤️ emotional breakthroughs, love), like (👍 approval, encouragement), dislike (👎 playful disapproval), fire (🔥 hype, excitement), confetti (🎉 celebrations, achievements, milestones), poop (💩 playful teasing). Additional premium effects can be discovered dynamically. Do NOT overuse. Reserve for moments that truly deserve emphasis.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "text": {
+          "type": "STRING",
+          "description": "The message text to send with the effect."
+        },
+        "effect": {
+          "type": "STRING",
+          "description": "Effect name (hearts, like, dislike, fire, confetti, poop), an emoji, or an effect ID."
+        }
+      },
+      "required": [
+        "text",
+        "effect"
+      ]
+    }
+  },
+  {
+    "name": "save_episode",
+    "description": "Record a significant interaction as a structured episode in memory. Use this AFTER meaningful conversations to capture what happened and what was learned. Episode types:\n- 'crisis': User expressed severe distress, suicidal thoughts, or danger signals\n- 'breakthrough': User had an insight, shifted perspective, or experienced emotional release\n- 'pattern': A recurring emotional or behavioural pattern was identified\n- 'checkin': A mood check-in with notable clinical observations\n- 'conversation': Any other significant exchange worth remembering\n\nWHEN TO USE: After emotional conversations, therapy-like exchanges, significant personal revelations, or when you notice a pattern. Do NOT log trivial exchanges.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "episode_type": {
+          "type": "STRING",
+          "enum": [
+            "crisis",
+            "breakthrough",
+            "pattern",
+            "checkin",
+            "conversation"
+          ],
+          "description": "The type of episode"
+        },
+        "trigger": {
+          "type": "STRING",
+          "description": "What prompted this episode? Write in SECOND PERSON: 'You were struggling with job application paralysis after the 14:00 check-in'. NEVER use third person ('Roman was...', 'He struggled with...'). ALL times in 24-hour format. 1-2 sentences."
+        },
+        "emotions": {
+          "type": "ARRAY",
+          "items": {
+            "type": "STRING"
+          },
+          "description": "Emotions present during the episode (e.g. ['anxious', 'lonely', 'hopeful'])"
+        },
+        "intervention": {
+          "type": "STRING",
+          "description": "What did you do or suggest? Write in SECOND PERSON from your perspective: 'I suggested a 15-minute timer and one application at 20:00'. NEVER narrate in third person about yourself or the user. ALL times in 24-hour format. 1-2 sentences."
+        },
+        "outcome": {
+          "type": "STRING",
+          "enum": [
+            "positive",
+            "negative",
+            "neutral",
+            "pending"
+          ],
+          "description": "How did it resolve? Did the user feel better, worse, or unchanged?"
+        },
+        "lesson": {
+          "type": "STRING",
+          "description": "What was learned for future reference? Write naturally — no third-person narration of either party. ALL times in 24-hour format. 1 sentence. Example: 'Short timers with one task work when overwhelmed; broader open-ended prompts stall them.'"
+        },
+        "mood_score": {
+          "type": "NUMBER",
+          "description": "Mood score at time of episode (0-10) if available"
+        }
+      },
+      "required": [
+        "episode_type",
+        "trigger"
+      ]
+    }
+  },
+  {
+    "name": "update_episode_outcome",
+    "description": "Update the outcome of a previous episode. Use this when following up on something you previously suggested or discussed, and now know whether it helped. For example, if you suggested a coping strategy last week and the user reports it worked, update the episode outcome to 'positive' with a lesson learned.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "episode_id": {
+          "type": "NUMBER",
+          "description": "The ID of the episode to update (from episode search results)"
+        },
+        "outcome": {
+          "type": "STRING",
+          "enum": [
+            "positive",
+            "negative",
+            "neutral"
+          ],
+          "description": "Did the intervention help? positive = it worked, negative = it didn't, neutral = unclear"
+        },
+        "lesson": {
+          "type": "STRING",
+          "description": "What was learned from this outcome? Write naturally — no third-person narration. ALL times in 24-hour format. 1 sentence."
+        }
+      },
+      "required": [
+        "episode_id",
+        "outcome"
+      ]
+    }
+  },
+  {
+    "name": "read_webpage",
+    "description": "Fetch and read the plain text content of a webpage URL. Use this to read full articles, API documentation, or scientific papers after finding their URL via googleSearch. Returns stripped text content.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "url": {
+          "type": "STRING",
+          "description": "The full URL to read."
+        }
+      },
+      "required": [
+        "url"
+      ]
+    }
+  },
+  {
+    "name": "web_search_tavily",
+    "description": "Search the web for current, accurate information using Tavily's AI-optimised search. Returns clean, structured text with citations. Use this for any factual question, current events, latest developments, or research. Much better than raw Google Search for getting LLM-ready content.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "query": {
+          "type": "STRING",
+          "description": "The search query"
+        },
+        "topic": {
+          "type": "STRING",
+          "enum": [
+            "general",
+            "news"
+          ],
+          "description": "Type of search. Use 'news' for current events."
+        },
+        "max_results": {
+          "type": "NUMBER",
+          "description": "Number of results (default 5, max 10)"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "read_repo_file",
+    "description": "Read the raw content of a specific file from the bot's GitHub repository. Use this to inspect current code before suggesting changes. Common paths: src/index.js, src/bot/handlers.js, src/config/personas.js, src/lib/ai/gemini.js, src/tools/index.js, package.json, wrangler.jsonc",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "file_path": {
+          "type": "STRING",
+          "description": "Path to the file, e.g., 'src/index.js'"
+        }
+      },
+      "required": [
+        "file_path"
+      ]
+    }
+  },
+  {
+    "name": "patch_repo_file",
+    "description": "Apply targeted edits to a file in the bot's GitHub repository by opening a Pull Request. Use ONLY after reading the file with read_repo_file, proposing the change, and getting explicit permission. Supports single edit (old_text/new_text) or multiple edits (replacements array). Each edit must match exactly once in the file.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "file_path": {
+          "type": "STRING",
+          "description": "Path to the file to edit, e.g., 'src/bot/handlers.js'"
+        },
+        "old_text": {
+          "type": "STRING",
+          "description": "For single edit: exact text to find (must match once)."
+        },
+        "new_text": {
+          "type": "STRING",
+          "description": "For single edit: the replacement text."
+        },
+        "replacements": {
+          "type": "ARRAY",
+          "description": "For multiple edits in one PR. Each item has 'find' (exact text) and 'replace' (new text). Every find must be unique in the file.",
+          "items": {
+            "type": "OBJECT",
+            "properties": {
+              "find": {
+                "type": "STRING",
+                "description": "Exact existing text to find. Must match once."
+              },
+              "replace": {
+                "type": "STRING",
+                "description": "New text to replace it with."
+              }
+            }
+          }
+        },
+        "new_file_content": {
+          "type": "STRING",
+          "description": "For creating NEW files only. Complete file content."
+        },
+        "commit_message": {
+          "type": "STRING",
+          "description": "A concise commit message."
+        },
+        "pr_title": {
+          "type": "STRING",
+          "description": "Title for the Pull Request."
+        },
+        "pr_body": {
+          "type": "STRING",
+          "description": "Explanation of what this PR does."
+        }
+      },
+      "required": [
+        "file_path",
+        "commit_message",
+        "pr_title",
+        "pr_body"
+      ]
+    }
+  },
+  {
+    "name": "explore_github",
+    "description": "Search GitHub for open-source projects, code patterns, or documentation. Use this to discover how other developers build chatbots, AI companions, or Cloudflare Workers projects. Returns repository names, descriptions, stars, and README snippets.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "query": {
+          "type": "STRING",
+          "description": "Search query, e.g., 'telegram bot cloudflare workers', 'therapeutic AI chatbot', 'gemini api advanced tools'"
+        },
+        "search_type": {
+          "type": "STRING",
+          "description": "'repositories' to find projects, 'code' to find specific code patterns."
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "generate_image",
+    "description": "Generate or edit an image using AI. Use when the user asks to create, draw, generate, or make any image, picture, photo, diagram, illustration, logo, icon, meme, or wallpaper. Also use when the user uploads an image and asks to edit, modify, change, or transform it. Pass the full creative request as the prompt. Set edit_mode to true if the user uploaded an image and wants it edited.\n\nSTICKER CREATION: If the user asks you to create a 'sticker', append this to your prompt: 'die-cut sticker style, flat vector illustration, thick white border, isolated on a solid white background, no shadows'. This produces sticker-ready images that can be added to Telegram sticker packs.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "prompt": {
+          "type": "STRING",
+          "description": "Detailed description of the image to generate or the edit to apply."
+        },
+        "edit_mode": {
+          "type": "BOOLEAN",
+          "description": "Set to true if editing an uploaded image, false or omit for new generation."
+        }
+      },
+      "required": [
+        "prompt"
+      ]
+    }
+  },
+  {
+    "name": "send_location",
+    "description": "Pin a geographical location on a map for the user. Use this when recommending places, restaurants, or meeting points.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "latitude": {
+          "type": "NUMBER"
+        },
+        "longitude": {
+          "type": "NUMBER"
+        }
+      },
+      "required": [
+        "latitude",
+        "longitude"
+      ]
+    }
+  },
+  {
+    "name": "save_memory",
+    "description": "Save an important fact, observation, idea, or thought dump about the person you're talking to. Write facts in SECOND PERSON using 'you/your' (e.g. 'You go to the gym on weekday mornings', 'You are allergic to peanuts'). Do NOT narrate in third person ('Roman goes to...', 'He is allergic...'). ALL times in 24-hour format (20:00, NOT '8 PM'). Categories: preference, personal, work, hobby, identity, relationship, health, habit, pattern (recurring behaviour/emotional pattern), trigger (emotional/situational trigger), avoidance (things they avoid), schema (core belief or narrative), growth (positive change or breakthrough), coping (coping strategy, healthy or unhealthy), insight (self-awareness moment), idea (a creative idea, project concept, or plan worth preserving), brain_dump (raw unstructured thoughts that you should synthesise into a clean, logical note before saving), discovery (interesting news, research findings, or tech developments), architecture_spec (technical architecture maps or code structure summaries for the bot itself). Set importance to 2 or 3 for therapeutic observations that represent significant patterns or breakthroughs.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "category": {
+          "type": "STRING",
+          "description": "One of: preference, personal, work, hobby, identity, relationship, health, habit, pattern, trigger, avoidance, schema, growth, coping, insight, idea, brain_dump"
+        },
+        "fact": {
+          "type": "STRING",
+          "description": "The fact or observation to remember. Write in SECOND PERSON: 'You are allergic to peanuts', 'You prefer 24h time formats', 'You went rollerblading in Richmond Park on 15 Apr'. NEVER use third person ('Roman is...', 'He prefers...'). NEVER use generic 'User'. ALL times in 24-hour format (13:00, NOT '1 PM'). For therapeutic categories, be specific and include context."
+        },
+        "importance": {
+          "type": "INTEGER",
+          "description": "1 = normal fact, 2 = notable therapeutic observation, 3 = significant pattern or breakthrough. Default 1."
+        }
+      },
+      "required": [
+        "category",
+        "fact"
+      ]
+    }
+  },
+  {
+    "name": "get_mood_history",
+    "description": "Retrieve mood journal history for analysis. Use this when:\n- The user asks about their mood trends, patterns, or history\n- You need to analyse mood vs sleep, medication adherence, or activity correlations\n- Before an evening check-in, to summarise the day\n- When the user asks \"how have I been doing?\"\n\nReturns structured data you can analyse. For deeper statistical analysis, combine with code_execution to compute correlations.\nWhen presenting analysis, cite relevant clinical frameworks:\n- Bipolar: NICE CG185/NG193, BAP guidelines\n- ADHD: NICE NG87\n- General: WHO, APA practice guidelines",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "days": {
+          "type": "INTEGER",
+          "description": "Number of days of history to retrieve. Default 14."
+        },
+        "entry_type": {
+          "type": "STRING",
+          "enum": [
+            "morning",
+            "midday",
+            "evening"
+          ],
+          "description": "Filter by check-in type. Omit for all types."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "send_activities_keyboard",
+    "description": "Send an inline keyboard so the user can multi-select today's activities. Use this DURING an evening check-in (after mood score and emotions have been collected) instead of asking about activities in prose.\n\nThe keyboard has two modes the user can flip between:\n- New mode (default): shows activities not yet logged today; tapping selects them to add\n- Completed mode: shows activities already logged today; tapping selects them to remove\n\nA single ✓ Done button commits both adds and removes at once. The user sees a summary like \"Added: gym, reading. Removed: work.\"\n\nOnly call this once per check-in. After Done is pressed, control returns to you with the result. If you call this and an evening check-in is not active, it returns an error with next_step.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "preamble": {
+          "type": "STRING",
+          "description": "Short, warm 1-sentence message shown above the keyboard. E.g. 'What did you get up to today?' or 'Anything new from this morning?'. Match the tone of the conversation. If empty, a default is used."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "send_photo_request",
+    "description": "Ask the user for a photo of the day during an evening check-in. Sends a brief prompt with a [Skip photo] inline button.\n\nUse this near the end of an evening check-in, AFTER activities and sleep have been handled, IF no photo has been attached to today's mood entry yet. Calling this when a photo is already attached will noop.\n\nThe user can either send any photo within 30 minutes (auto-linked to today's evening entry) or tap Skip. After either action, control returns to you to wrap up the journal.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "preamble": {
+          "type": "STRING",
+          "description": "Short 1-sentence prompt shown above the Skip button. E.g. 'Got a photo from today?'. If empty, a default is used."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "commit_journal_entry",
+    "description": "Signal that you consider today's evening journal complete. Use this ONLY at the end of an evening check-in, after you have:\n1. Captured a mood score (collected via the poll)\n2. Captured emotions (collected via the inline buttons)\n3. Either: collected activities via send_activities_keyboard, OR confirmed activities are already logged today\n4. Either: collected sleep_hours (if not already logged today), OR confirmed sleep is already logged\n5. Either: called send_photo_request (if no photo today), OR confirmed a photo is already attached\n\nIf any of those critical pieces are missing, this tool will REFUSE to commit and return an instruction telling you what to address. It acts as the safety gate.\n\nAfter successful commit, the active flow is cleared. You should send a warm wrap-up message after this returns success.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "wrap_up": {
+          "type": "STRING",
+          "description": "Optional brief observation about the day to save as ai_observation on the entry. Second-person prose. Keep under 300 chars."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "pin_message",
+    "description": "Pin a message in the chat. Can pin the user's message (default) or the bot's most recent message if specified.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "reason": {
+          "type": "STRING",
+          "description": "Why this message should be pinned"
+        },
+        "pin_bot_message": {
+          "type": "BOOLEAN",
+          "description": "If true, pin the bot's last sent message. If false or omitted, pin the user's message."
+        }
+      },
+      "required": [
+        "reason"
+      ]
+    }
+  },
+  {
+    "name": "send_poll",
+    "description": "Send an interactive poll or quiz to the user. Use for decisions, voting, or knowledge quizzes. For quizzes, set type to 'quiz' and provide correct_option_ids (array of correct answer indices).",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "question": {
+          "type": "STRING",
+          "description": "The poll question (max 300 characters)"
+        },
+        "options": {
+          "type": "ARRAY",
+          "items": {
+            "type": "STRING"
+          },
+          "description": "List of options (2 to 10 items)"
+        },
+        "is_anonymous": {
+          "type": "BOOLEAN",
+          "description": "Set to false if you want to see who voted. Default true."
+        },
+        "allows_multiple_answers": {
+          "type": "BOOLEAN",
+          "description": "True if user can select multiple options"
+        },
+        "type": {
+          "type": "STRING",
+          "description": "Poll type: 'regular' (default) or 'quiz'"
+        },
+        "correct_option_ids": {
+          "type": "ARRAY",
+          "items": {
+            "type": "INTEGER"
+          },
+          "description": "For quizzes: array of 0-based indices of the correct option(s). Required when type is 'quiz'."
+        },
+        "explanation": {
+          "type": "STRING",
+          "description": "For quizzes: text shown when user picks wrong answer (max 200 chars)"
+        }
+      },
+      "required": [
+        "question",
+        "options"
+      ]
+    }
+  },
+  {
+    "name": "set_quiet_hours",
+    "description": "Silence proactive outreach (spontaneous messages, daily study shares, weekly digest) for a specified window. Call this when the user says 'don't disturb me', 'I'm busy', 'leave me alone', 'shut up', 'I'm in deep work', or similar natural requests for quiet time. Does NOT silence medication check-ins — those run regardless to protect the user's clinical care. For vague requests without a specific duration ('a bit', 'leave me alone'), default to 2 hours. For 'today', set until 23:59 London time. For 'until Xpm', parse to today's Xpm in London time. If the user later says 'you can talk again' or 'never mind', call with end_unix=0 to clear.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "end_unix": {
+          "type": "INTEGER",
+          "description": "Unix timestamp (seconds) when quiet hours should end. Use 0 to clear quiet hours immediately. For '2 hours from now', pass (current_unix + 7200). For 'today', use end-of-day London time."
+        },
+        "reason": {
+          "type": "STRING",
+          "description": "Optional short reason the user gave (e.g. 'deep work', 'meeting', 'rest'). Used only for logging."
+        }
+      },
+      "required": [
+        "end_unix"
+      ]
+    }
+  },
+  {
+    "name": "clear_quiet_hours",
+    "description": "Cancel any active quiet hours window and resume normal proactive outreach. Call this when the user says 'you can talk again', 'never mind', 'I'm free now', or similar.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {}
+    }
+  },
+  {
+    "name": "reply_with_quote",
+    "description": "Reply to a specific quoted portion of the user's message. Use this to address a specific point or question inside a long message.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "quote": {
+          "type": "STRING",
+          "description": "The exact text from the user's message you are quoting."
+        },
+        "reply_text": {
+          "type": "STRING",
+          "description": "Your response to this specific quote."
+        }
+      },
+      "required": [
+        "quote",
+        "reply_text"
+      ]
+    }
+  },
+  {
+    "name": "react_to_message",
+    "description": "Add an emoji reaction to a message. React contextually and naturally to match the conversation tone. You MUST use ONE of these exact supported emojis: 👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 ⛄ 💅 🤪 🗿 🆒 💘 🙉 🦄 😽 💊 🙊 🕶 👾 🤷‍♂️ 🤷 🤷‍♀️ 😡. Do NOT use any other emoji.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "emoji": {
+          "type": "STRING",
+          "description": "Must be ONE of the exact 73 supported emojis listed above. Choose based on the emotional context of the message."
+        },
+        "react_to_replied": {
+          "type": "BOOLEAN",
+          "description": "If true, react to the message the user replied to. Use when the user says 'react to this' while replying."
+        }
+      },
+      "required": [
+        "emoji"
+      ]
+    }
+  },
+  {
+    "name": "set_reminder",
+    "description": "Schedule a reminder for the user. Calculate 'due_at_timestamp' as a Unix timestamp in UTC. The system prompt provides the current Unix time as an anchor. All times must be in UTC. SMART TIMING: If the user explicitly states a time, use it. If the user says 'remind me later' or gives a casual task without specifying a time (e.g., 'remind me to check the oven', 'remind me about this'), use your intelligence to assign a reasonable short delay (+5, +15, +30, or +60 minutes) based on the task's urgency. Do not pester for an exact time unless the task is clearly a major future event (flight, meeting, appointment). Set it and confirm the time you chose.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "task_message": {
+          "type": "STRING",
+          "description": "The reminder text delivered BACK to the user as a notification. Any times in the text MUST use 24-hour format (e.g. '20:00', NOT '8 PM'; '09:30', NOT '9:30 AM'). PERSPECTIVE: this text is READ BY the user, so use SECOND PERSON or imperative — NEVER first person, NEVER third person. If the user says 'remind me that I am beautiful', the reminder MUST say 'You are beautiful'. If the user says 'remind me to take my meds', say 'Take your meds'. Bad: 'I am beautiful' (first-person, breaks the affirmation when the user reads it); 'Roman should take his meds' (third-person, sounds clinical). Good: 'You are beautiful'; 'Take your meds'."
+        },
+        "context": {
+          "type": "STRING",
+          "description": "The 'why' behind this reminder, phrased as the user would say it to themselves. Use SECOND PERSON ('you', 'your') or neutral verb phrases. NEVER use third person ('Roman', 'he', 'his', 'Roman promised...'). ALL times in 24-hour format (13:00, NOT '1 PM'; 20:30, NOT '8:30 PM'). Good: 'You said you would take it 30 min after the 13:00 check-in', 'Promised to text Mum about the weekend'. Bad: 'Roman promised to take his medication', 'after our 1 PM check-in'. Keep it brief — one sentence maximum."
+        },
+        "due_at_timestamp": {
+          "type": "INTEGER",
+          "description": "Unix timestamp (UTC) when the reminder should fire"
+        },
+        "recurrence_type": {
+          "type": "STRING",
+          "enum": [
+            "none",
+            "daily",
+            "weekly",
+            "monthly"
+          ]
+        },
+        "original_user_request": {
+          "type": "STRING",
+          "description": "The user's original message that triggered this reminder, for context"
+        }
+      },
+      "required": [
+        "task_message",
+        "context",
+        "due_at_timestamp",
+        "recurrence_type"
+      ]
+    }
+  },
+  {
+    "name": "list_reminders",
+    "description": "THE ONLY tool for reading reminders/scheduled tasks. ALWAYS call this when the user asks anything about their reminders, scheduled items, pending tasks, what they have planned, what's coming up, or wants to find/show/list/check their reminders. Examples that MUST use this tool: 'show me my reminders', 'what do I have scheduled', 'what's coming up', 'list my pending tasks', 'do I have any reminders for X'. NEVER use manage_cloudflare or any SQL tool for reminders — reminders live in a dedicated table with user-specific filtering and timezone formatting that this tool handles correctly. Returns id, text preview, due time (in user's local timezone), recurrence type, and context. Always call this first when the user asks to change, move, cancel, or otherwise modify an existing reminder — you need the reminder_id from the returned list to call update_reminder.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "update_reminder",
+    "description": "Modify or cancel an existing reminder by id. Call list_reminders first to find the reminder_id. All fields except reminder_id are optional — pass only what you want to change. To cancel/delete a reminder, set cancel=true. Times must be in 24-hour UTC unix timestamp format. Examples: rewrite text → {reminder_id, new_text}; move time → {reminder_id, new_due_at_timestamp}; change frequency → {reminder_id, new_recurrence_type}; cancel → {reminder_id, cancel: true}.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "reminder_id": {
+          "type": "INTEGER",
+          "description": "The numeric id of the reminder to update. Get this from list_reminders. NEVER guess or invent an id."
+        },
+        "new_text": {
+          "type": "STRING",
+          "description": "Replacement reminder text. Same rules as set_reminder.task_message — 24-hour times AND second-person/imperative perspective ('You are beautiful', 'Take your meds', NOT 'I am beautiful' and NOT 'Roman should take his meds'). Omit to leave unchanged."
+        },
+        "new_due_at_timestamp": {
+          "type": "INTEGER",
+          "description": "New due time as Unix timestamp (UTC). For recurring reminders this becomes the next fire time; the recurrence rule continues from there. Omit to leave unchanged."
+        },
+        "new_recurrence_type": {
+          "type": "STRING",
+          "enum": [
+            "none",
+            "daily",
+            "weekly",
+            "monthly"
+          ],
+          "description": "New recurrence pattern. Use 'none' to convert a recurring reminder to a one-off. Omit to leave unchanged."
+        },
+        "new_context": {
+          "type": "STRING",
+          "description": "New 'why' context for the reminder. Same second-person rules as set_reminder. Omit to leave unchanged."
+        },
+        "cancel": {
+          "type": "BOOLEAN",
+          "description": "Set to true to delete the reminder entirely. When true, all other 'new_*' fields are ignored."
+        }
+      },
+      "required": [
+        "reminder_id"
+      ]
+    }
+  },
+  {
+    "name": "search_research",
+    "description": "Search and retrieve past deep research results. Use this when the user asks about previous research, recent discoveries, past learnings, what you have studied, your findings, what you have learned recently, or anything related to viewing research history. Actions: 'list' shows an interactive list with buttons, 'full' retrieves a complete report, 'audio' sends a report as a voice message.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "action": {
+          "type": "STRING",
+          "enum": [
+            "list",
+            "full",
+            "audio"
+          ],
+          "description": "'list' to show interactive research list with buttons. 'full' to get the complete text report. 'audio' to send the report as a voice message."
+        },
+        "topic": {
+          "type": "STRING",
+          "description": "Search term to filter or retrieve a specific research topic. For 'full' and 'audio' actions, this selects which report to retrieve."
+        },
+        "index": {
+          "type": "NUMBER",
+          "description": "1-based index from the research list. Use this when the user says 'number 2' or 'the second one' after seeing the list."
+        }
+      },
+      "required": [
+        "action"
+      ]
+    }
+  },
+  {
+    "name": "start_deep_research",
+    "description": "Start a deep research task on any topic. Use this when the user asks you to research something, investigate a topic, look into something, or find out about something in depth. The research runs in the background for 2-5 minutes and results are sent when ready.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "topic": {
+          "type": "STRING",
+          "description": "The topic to research thoroughly"
+        }
+      },
+      "required": [
+        "topic"
+      ]
+    }
+  },
+  {
+    "name": "update_schedule",
+    "description": "Update the timing of a scheduled bot feature. Use this when the user asks to change when check-ins, reports, or other scheduled events occur. Valid schedule keys: morning_checkin, midday_checkin, evening_checkin, weekly_report, accountability_nudge, curiosity_digest, autonomous_research_1, autonomous_research_2, self_improvement, memory_consolidation, architecture_evolution.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "schedule_key": {
+          "type": "STRING",
+          "description": "The schedule to update (e.g., 'morning_checkin', 'evening_checkin', 'weekly_report')."
+        },
+        "hour": {
+          "type": "INTEGER",
+          "description": "New hour (0-23) in London time."
+        },
+        "minute": {
+          "type": "INTEGER",
+          "description": "New minute (0-59). Defaults to 0."
+        },
+        "day": {
+          "type": "INTEGER",
+          "description": "New day of week (0=Sun, 1=Mon, ..., 6=Sat). Only for weekly schedules."
+        },
+        "action": {
+          "type": "STRING",
+          "enum": [
+            "update",
+            "reset",
+            "list"
+          ],
+          "description": "'update' to change, 'reset' to restore default, 'list' to show all schedules."
+        }
+      },
+      "required": [
+        "schedule_key",
+        "action"
+      ]
+    }
+  },
+  {
+    "name": "save_therapeutic_note",
+    "description": "Save a therapeutic observation, pattern, or session note for long-term tracking. Use this proactively during conversations to record:\n- PATTERN: Recurring emotional, behavioural, or relationship patterns you notice\n- SCHEMA: Core schema activations (abandonment, defectiveness, emotional deprivation, etc.)\n- AVOIDANCE: Topics or emotions the user deflects from or moves past quickly\n- HOMEWORK: Exercises or reflections you have suggested, so you can follow up later\n- SESSION: Key themes, breakthroughs, or shifts from a conversation\n- TRIGGER: Identified emotional triggers and their context\n- GROWTH: Moments of vulnerability, insight, or positive change worth reinforcing",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "note_type": {
+          "type": "STRING",
+          "enum": [
+            "pattern",
+            "schema",
+            "avoidance",
+            "homework",
+            "session",
+            "trigger",
+            "growth"
+          ],
+          "description": "The category of therapeutic observation"
+        },
+        "content": {
+          "type": "STRING",
+          "description": "The observation itself. Write in SECOND PERSON: 'You deflect to humour when grief surfaces', 'You avoid opening the laptop at 20:00 despite the pattern holding'. NEVER use third person ('Roman deflects...', 'He avoids...'). ALL times in 24-hour format (13:00, NOT '1 PM'). Be specific and include context."
+        },
+        "importance": {
+          "type": "INTEGER",
+          "description": "1 = routine observation, 2 = notable pattern, 3 = significant breakthrough. Default 2."
+        }
+      },
+      "required": [
+        "note_type",
+        "content"
+      ]
+    }
+  },
+  {
+    "name": "get_therapeutic_notes",
+    "description": "Retrieve previous therapeutic observations and session notes. Use at the start of conversations to refresh your understanding of ongoing patterns, active schemas, pending homework, and recent session themes. Also use mid-conversation when you sense a connection to a previously noted pattern.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "note_type": {
+          "type": "STRING",
+          "enum": [
+            "pattern",
+            "schema",
+            "avoidance",
+            "homework",
+            "session",
+            "trigger",
+            "growth"
+          ],
+          "description": "Filter by type. Omit to retrieve all therapeutic types."
+        },
+        "limit": {
+          "type": "INTEGER",
+          "description": "Number of notes to retrieve. Default 15."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "update_timezone",
+    "description": "Update the user's timezone. Use this when the user mentions they are travelling, moved, or asks to change their timezone. Valid timezone strings are IANA format like 'Europe/London', 'America/New_York', 'Asia/Tokyo', etc.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "timezone": {
+          "type": "STRING",
+          "description": "IANA timezone string (e.g. 'Europe/London', 'America/New_York', 'Asia/Dubai')"
+        }
+      },
+      "required": [
+        "timezone"
+      ]
+    }
+  },
+  {
+    "name": "send_voice_note",
+    "description": "Reply with a voice message. Use when user requests voice or the response benefits from spoken delivery.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "text_to_speak": {
+          "type": "STRING"
+        }
+      },
+      "required": [
+        "text_to_speak"
+      ]
+    }
+  }
+]

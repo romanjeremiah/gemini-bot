@@ -12,17 +12,19 @@
 //            'recall_request', 'project_continuity', etc)
 //   - reasoning: 1-2 sentence summary the main model can read to ground itself
 //
-// Provider chain (changed 2026-05-04):
+// Provider chain (Architecture B+ — 2026-05-14):
 //   Tier 1: Hermes 2 Pro Mistral 7B on Cloudflare AI — free, JSON-mode trained,
 //           independent of Gemini infrastructure (immune to preview overloads).
 //           Wall-clock cap: 5s. Beta model on CF, treated defensively.
-//   Tier 2: Gemini Flash-Lite — proven baseline. Fires when Hermes returns null,
-//           errors, times out, or produces unparseable garbage.
+//   Tier 2: Gemini 2.5 Flash-Lite GA (dynamic) — proven quality baseline.
+//           Fires when Hermes returns null, errors, times out, or produces
+//           unparseable garbage. Migrated from 3.1 Flash-Lite preview which
+//           was scoring 64/108 to 2.5 GA at 73/108 with no latency regression.
 //
-// Why a CF model first: we observed Flash-Lite curator latency spike to 27s
+// Why Tier 1 is a CF model: we observed Flash-Lite curator latency spike to 27s
 // during Gemini preview overload, blowing the entire handler budget. Hermes
 // runs on different infrastructure so a Gemini outage no longer affects the
-// curator. If Hermes itself fails, Flash-Lite still works.
+// curator. If Hermes itself fails, Gemini 2.5 FL GA still works.
 //
 // When NOT to curate (early-exit):
 //   - userText < 30 chars (no signal worth analysing)
@@ -30,21 +32,21 @@
 //   - no memCtx and no semanticCtx (nothing to curate)
 //
 // Latency budget: ~200-800ms typical via Hermes, ~400-1000ms typical via
-// Flash-Lite. Caller should still treat curator as best-effort — a null
+// Gemini 2.5 FL GA. Caller should still treat curator as best-effort — a null
 // return must never break the main path.
 
-import { FLASH_LITE_TEXT_MODEL } from '../lib/ai/gemini';
+import { PRIMARY_TEXT_MODEL } from '../lib/ai/gemini';
 import { GoogleGenAI } from '@google/genai';
 import { log } from '../lib/logger';
 
 const HERMES_MODEL = '@hf/nousresearch/hermes-2-pro-mistral-7b';
 const HERMES_TIMEOUT_MS = 5000; // wall-clock cap on the Hermes path alone
 
-// Direct Flash-Lite call for curator. We DO NOT use generateShortResponse
+// Direct Gemini 2.5 FL GA call for curator. We DO NOT use generateShortResponse
 // because it appends SHORT_RESPONSE_GUIDE ("2-4 complete sentences, no
 // markdown") which conflicts with our JSON-only instruction. Gemma in
 // particular tends to honour the natural-language guide and produce
-// truncated/contaminated JSON. A direct Flash-Lite call with explicit
+// truncated/contaminated JSON. A direct Gemini 2.5 FL GA call with explicit
 // JSON instruction and no contamination is more reliable.
 let _curatorAi = null;
 function getCuratorAi(env) {
@@ -158,14 +160,19 @@ async function runCuratorOnHermes(env, input) {
 }
 
 /**
- * Run curator on Gemini Flash-Lite. Returns the raw response string, or null
- * on error. This is the proven-quality fallback.
+ * Run curator on Gemini 2.5 Flash-Lite GA (dynamic). Returns the raw response
+ * string, or null on error. This is the proven-quality fallback when Hermes
+ * is unavailable or returns unparseable output.
+ *
+ * Architecture B+: migrated from gemini-3.1-flash-lite-preview (which scored
+ * 64/108 on the combined-eval bundle) to gemini-2.5-flash-lite GA dynamic
+ * (73.0/108, similar latency, more reliable structured output).
  */
 async function runCuratorOnFlashLite(env, input) {
 	try {
 		const ai = getCuratorAi(env);
 		const response = await ai.models.generateContent({
-			model: FLASH_LITE_TEXT_MODEL,
+			model: PRIMARY_TEXT_MODEL,
 			contents: [{ role: 'user', parts: [{ text: input }] }],
 			config: {
 				systemInstruction: CURATOR_PROMPT,
@@ -173,6 +180,7 @@ async function runCuratorOnFlashLite(env, input) {
 				// No maxOutputTokens cap (Roma's rule: never cap output). The truncation
 				// recovery in the parser below handles any cut-off responses.
 				responseMimeType: 'application/json',
+				thinkingConfig: { thinkingBudget: -1 },
 			},
 		});
 		return response.candidates?.[0]?.content?.parts

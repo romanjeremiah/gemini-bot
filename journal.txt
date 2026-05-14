@@ -4,6 +4,210 @@ A log of significant engineering sessions on Xaridotis (gemini-bot). Most recent
 
 ================================================================================
 
+## 2026-05-14 — Architecture B+: full Gemini-family rebuild with two-model crisis race
+
+### What
+
+Rebuilt every AI call in the codebase around the combined-evaluation bundle
+run on 2026-05-14. The bundle was a 108-scenario, 23-variant test (1188 calls
+for the combined run + 2484 calls for the Gemini-thinking variants) covering
+tool-calling, multi-turn continuity, mental-health response quality, tagger
+accuracy, routing classifier behaviour, complex synthesis, and code. Headline
+findings that drove the redesign:
+
+- **Gemini 3.1 Pro preview is unusable** for text generation (108/108 errors
+  in the combined run, 92-97% errors on the thinking-variants run). It stays
+  in the codebase only as the primary transcription model (audio API path
+  differs from text), per Roma's explicit instruction.
+- **Gemini 2.5 Flash-Lite GA with thinkingBudget 512 was the highest scorer
+  in the entire Gemini family** — 73.5/108 overall, 12/15 on mental-health
+  scenarios (Cat C), 8.5/9 on complex synthesis (Cat F), 8/9 on code (Cat G).
+- **Gemini 2.5 Pro with thinkingBudget 128 was the best Pro variant** on this
+  workload (68/108) and is 2.3× faster than Flash-Lite b512. Higher budgets
+  (8192, 24576) underperformed b128 on Pro — Pro over-thinks simple decisions
+  when given headroom. Counter-intuitive but data-confirmed.
+- **Llama 3.3 70B scored 22.5/108 overall** under the Xaridotis persona size
+  (~22KB system context). The previous mood-flow tier-1 model was effectively
+  broken under our prompts.
+- **gpt-oss-120b is excellent on tool-calling but poor on mental health**
+  (6/15 Cat C, leaks "crisis line" and reaches for save_episode reflexively).
+  Architecture B+ does not use gpt-oss; the persona's tool-discipline rules
+  already cover the lane gpt-oss would have helped on.
+
+### Architecture B+ — routing summary
+
+User-facing conversational lanes:
+- Main chat:           gemini-2.5-flash-lite, thinkingBudget=-1 (dynamic)
+- Crisis turns:        gemini-2.5-pro b128 RACED against gemini-2.5-flash-lite b512
+                       via Promise.race — first non-error response wins. Token
+                       cost ×2 on flagged turns only (estimated <50/day).
+- Deep / cron synth:   gemini-2.5-pro b128 → gemini-2.5-flash-lite b512
+- Short responses:     unchanged — Gemma 4 via Cloudflare, then Gemini fallbacks
+- Image gen / edit:    unchanged (3 Pro Image → 3.1 Flash Image)
+
+Background tasks (all migrated to Gemini 2.5 GA family):
+- Conversation tagger: gemini-3.1-flash-lite-preview, thinkingLevel='minimal'
+                       (new Tier 1 — 2571ms avg, 7.5/12 on Cat E)
+                       → Llama 3.1 8B (resilience anchor)
+                       → Gemma 4 26B (reasoning fallback)
+                       → gemini-3-flash-preview
+                       → heuristic floor
+- Observation extract: gemini-2.5-flash-lite dynamic, Llama 8B fallback
+- Mood entry tagger:   gemini-2.5-flash-lite dynamic, Llama 1B fallback
+- Reaction interpret:  gemini-2.5-flash-lite dynamic, Llama 8B fallback
+- Memory dedup:        gemini-2.5-flash b8192, GLM-4.7 fallback
+- Style card consol:   gemini-2.5-flash b8192, GLM-4.7 fallback
+- Persona evolution:   gemini-2.5-flash-lite dynamic, Llama 8B fallback
+- Mood micro-ack:      gemini-2.5-flash-lite dynamic, Gemma 4 fallback
+- Mood synthesis:      4-tier cascade — 2.5 Pro b128 → 2.5 FL b512 → 2.5 Flash b8192 → GLM 4.7
+- Response curator:    Hermes 2 Pro (CF) → gemini-2.5-flash-lite dynamic
+- Transcription:       gemini-3.1-pro-preview → gemini-3.1-flash-lite-preview
+
+### Two-model crisis race
+
+New function `generateCrisisResponse` in `src/lib/ai/gemini.js` fires 2.5 Pro
+b128 AND 2.5 FL b512 in parallel via `Promise.race` (technically
+`Promise.any`-style — first to resolve to non-empty text wins). If the first
+to return failed, awaits the other arm. If both arms fail, last-resort
+fallback is a single 2.5 Pro dynamic call.
+
+The function is exported but **not yet wired into handlers.js**. Wiring is
+the explicit next step: the `tagConversationMode` classifier already returns
+`mode: 'crisis'` when appropriate, but the current router consumes that
+output for routing-tier selection rather than for dispatching to the
+dedicated crisis function. That wiring is a separate follow-up patch.
+
+### Gemini-routed background helper
+
+New export `geminiBackgroundGenerate(env, model, prompt, systemPrompt, opts)`
+in `src/lib/ai/gemini.js` mirrors `cfAiGenerate`'s shape (returns trimmed
+text or null) so background tasks can swap providers without restructuring.
+Supports both `opts.thinkingBudget` (number, for 2.5 GA) and
+`opts.thinkingLevel` (minimal/low/medium/high, for 3.x preview).
+
+### Files changed
+
+- `src/lib/ai/gemini.js` — added `geminiBackgroundGenerate`,
+  `generateCrisisResponse`, `DEEP_RESPONSE_MODEL`, new thinking-config
+  helpers. `PRIMARY_TEXT_MODEL` now `gemini-2.5-flash-lite`. `FALLBACK_TEXT_MODEL`
+  now `gemini-2.5-flash`. `FLASH_LITE_TEXT_MODEL` retained as preview alias
+  for transcription fallback only.
+- `src/services/transcription.js` — split into primary/fallback tiers.
+  Primary `gemini-3.1-pro-preview`, fallback `gemini-3.1-flash-lite-preview`.
+  Each capped at 8s. New log lines `transcribe_primary_ok`,
+  `transcribe_primary_failed_falling_back`, `transcribe_fallback_ok`,
+  `transcribe_both_tiers_failed`.
+- `src/services/cfAi.js` — migrated `extractObservation`, `tagMoodEntry`,
+  `deduplicateMemories`, `consolidateStyleCard`, `interpretReaction` to
+  Gemini primary with CF fallback. `tagConversationMode` cascade reordered:
+  new Tier 1 is `_classifyWithGemini31FLMinimal` (gemini-3.1-flash-lite-preview
+  with thinkingLevel='minimal'); previous tiers slide down one rank. Removed
+  old Tier 4 (`gemini-flash-lite` without thinking level — redundant with
+  new Tier 1).
+- `src/services/moodMicroAck.js` — cascade switched to Gemini 2.5 FL
+  dynamic → Gemma 4 (CF). Old runner `tryTier` split into `tryGeminiTier`
+  and `tryCfTier`.
+- `src/services/moodSynthesis.js` — CASCADE array rebuilt with four Gemini-
+  family runners. Removed `runLlamaTier`, `runGemmaTier`, `runGeminiTier`
+  (generic), `runGeminiProTier`. Added `runGemini25ProTier`,
+  `runGemini25FlashLiteTier`, `runGemini25FlashTier`, `runGlmTier`. Worst-
+  case latency before fixed text down from 105s to 60s.
+- `src/services/personaEvolution.js` — `OBSERVATION_MODEL` switched to
+  `gemini-2.5-flash-lite`. Llama 3.1 8B retained as resilience fallback.
+- `src/services/responseCurator.js` — Tier 2 switched from
+  `gemini-3.1-flash-lite-preview` to `gemini-2.5-flash-lite` GA dynamic.
+  Tier 1 (Hermes 2 Pro) unchanged.
+
+### Risks worth watching after deploy
+
+1. **`googleSearch` + `functionDeclarations` combination on 2.5 GA.** The
+   existing `buildConfig` in gemini.js still registers both. The 3.x preview
+   docs explicitly note this combination is unsupported, but the 2.5 GA models
+   have a different behaviour and Roma's existing production code has this
+   already. Watch tail logs for `INVALID_ARGUMENT` errors mentioning tools
+   after deploy. If they appear, split into either-or per call.
+2. **3.1 Pro transcription error rate.** Audio path may behave differently
+   to text, but if Pro errors at the 92-97% rate we saw for text, the FL
+   preview fallback would fire on most transcription requests — returning
+   to current behaviour with extra 8s latency on every call. Instrument the
+   first 48-72 hours via `transcribe_primary_failed_falling_back` counts.
+3. **`generateCrisisResponse` is exported but not wired.** Crisis turns
+   currently still route through the regular conversational lane. Wiring is
+   the next deliberate step; do not deploy expecting crisis routing yet.
+4. **Gemini API quota.** Background tasks (mood micro-ack, observation,
+   tagger, dedup) now hit Gemini instead of Cloudflare for the happy path.
+   Net cost change is roughly neutral (Pro 3.1 was expensive when it worked,
+   removing it offsets the upgraded background tier) but quota usage shifts.
+   Worth monitoring `429` rates on Gemini for the first week.
+
+### What is NOT done in this patch
+
+- **handlers.js wiring of generateCrisisResponse.** The function is exported
+  and ready, but no call site dispatches to it. The next step is one of:
+  (a) extend the router rules in `src/ai/router.js` to detect crisis output
+  from `tagConversationMode` and route to crisis lane, or (b) wrap
+  `createChat`/`sendChatMessageStream` so they detect mode='crisis' from
+  context and switch path. Roma to decide which.
+- **No env-var toggle for safe rollback.** All files are changed in place.
+  Rolling back requires `git revert` of this commit, then redeploy.
+- **Cache compatibility audit.** `setupCache` still creates caches with the
+  primary model (`gemini-2.5-flash-lite`). Persona+tools size (~14k tokens)
+  is above the 4096-token cache minimum so caching should continue to work,
+  but the 2.5 GA + cache + googleSearch + functionDeclarations combination
+  is new and has not been verified end-to-end.
+- **Background-task evaluation bundle.** Some background changes (memory
+  dedup, style card consolidation) are inferred from Cat A/F/D performance
+  rather than directly tested. A dedicated bundle covering
+  summarisation/triple-extraction would tighten confidence before the next
+  refactor.
+
+### How to deploy
+
+```
+npx wrangler deploy --minify
+git add -A && git commit -m "feat(arch-b+): migrate to Gemini 2.5 GA family with two-model crisis race" && git push
+```
+
+Then tail for the following log signals across the first hour of traffic:
+
+- `transcribe_primary_ok` (Pro 3.1 transcription working) vs
+  `transcribe_primary_failed_falling_back` (Pro 3.1 audio is also flaky)
+- `mood_micro_ack_tier_ok` with `tier: gemini-2.5-flash-lite` (Gemini
+  primary picking up mood acks)
+- `tagger_resolved` with `source: gemini-3.1-fl-minimal` (new Tier 1 hit)
+- `curator_complete` with `curator_provider: hermes` or `flash_lite`
+  (curator working; Tier 2 now 2.5 FL GA dynamic)
+- `mood_synthesis_tier_ok` with `tier: gemini-2.5-pro-b128` (new synthesis
+  primary winning)
+- Any `Gemini bg error` warnings (background helper failures)
+- Any `INVALID_ARGUMENT` errors on `tools` field (googleSearch+functionDeclarations
+  combination risk)
+
+### Lessons worth carrying forward
+
+1. **The model-family ranking changed.** 2.5 GA is now the workhorse, not the
+   3.x preview. Counter to the obvious instinct that "newer = better". The
+   bundle data was specific to Xaridotis prompts (22KB persona, 34 tools) —
+   it should not be assumed to generalise without re-running on the target
+   prompts.
+2. **Higher thinking budget is often worse.** Pro b128 outperformed b8192 and
+   b24576 on this workload. When a model can decide to think more, it tends
+   to over-think. Explicit low budgets often beat dynamic.
+3. **Two-model race is a defensible architecture for high-stakes lanes.** On
+   crisis turns, the latency floor of "first non-error response wins" is
+   bounded by the faster model (Pro at 3.7s) while quality is bounded by
+   the better model (FL b512 at 12/15 Cat C). The 2× cost penalty applies
+   only to flagged turns, which are <50/day. Watch for over-flagging by
+   the classifier inflating that count.
+4. **Background tasks were silently expensive.** The previous setup was running
+   Llama 3.3 70B on every mood entry (broken under persona), and gemini-3.1-pro
+   on every cron tick for evolution-related work. The combined cost of
+   "cheap CF" tasks was higher than expected because the persona size made
+   Llama unreliable enough to fall through to Gemini. Quality and cost both
+   improved by going straight to Gemini 2.5 FL where it works.
+
+================================================================================
+
 ## 2026-05-13 — Layer 3: workflow as single source of truth for evening check-in
 
 ### What

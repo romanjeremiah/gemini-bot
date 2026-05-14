@@ -1,11 +1,24 @@
 import { GoogleGenAI } from '@google/genai';
 import { toolDefinitions } from '../../tools/index.js';
 
-export const PRIMARY_TEXT_MODEL   = 'gemini-3.1-pro-preview';
-export const FALLBACK_TEXT_MODEL  = 'gemini-3-flash-preview';
-export const FLASH_LITE_TEXT_MODEL = 'gemini-3.1-flash-lite-preview';
+// Architecture B+ (2026-05-14) — model selection after combined-evaluation
+// bundle showed 2.5 Flash-Lite GA at the top of the Gemini family (73.5/108)
+// and 3.1 Pro preview unusable (0/108). Primary conversational lane now
+// runs on 2.5 Flash-Lite GA dynamic for routine turns; crisis turns race
+// 2.5 Pro budget 128 against 2.5 Flash-Lite budget 512 via
+// generateCrisisResponse. Cron/deep work uses 2.5 Pro budget 128.
+export const PRIMARY_TEXT_MODEL    = 'gemini-2.5-flash-lite';
+export const FALLBACK_TEXT_MODEL   = 'gemini-2.5-flash';
+export const DEEP_RESPONSE_MODEL   = 'gemini-2.5-pro';
+export const FLASH_LITE_TEXT_MODEL = 'gemini-3.1-flash-lite-preview'; // preview tier — used as transcription fallback, NOT for text generation
 const PRIMARY_IMAGE_MODEL  = 'gemini-3-pro-image-preview';     // Nano Banana Pro — best quality gen + edit
 const FALLBACK_IMAGE_MODEL = 'gemini-3.1-flash-image-preview'; // Nano Banana 2 — fast fallback
+
+// Default thinking configurations per lane. -1 means dynamic on 2.5 GA.
+const DEFAULT_THINKING_BUDGET   = -1;  // main conversational path: 2.5 FL dynamic (73.0/108 in bundle)
+const CRISIS_PRO_BUDGET         = 128; // 2.5 Pro at budget 128 scored 11.5/15 on Cat C, 3.7s avg
+const CRISIS_FL_BUDGET          = 512; // 2.5 Flash-Lite at budget 512 scored 12/15 on Cat C, best in family
+const DEEP_RESPONSE_BUDGET      = 128; // cron / weekly synthesis — quality matters more than latency
 
 const CACHE_TTL = '3600s';
 const MIN_CACHE_TOKENS_GEMINI3 = 4096;
@@ -97,22 +110,28 @@ function parseRetryAfter(err) {
 }
 
 /**
- * Generate content with automatic Pro → Flash fallback.
+ * Generate content with automatic Primary → Fallback chain.
  * Use this for cron jobs and background tasks instead of direct ai.models.generateContent.
+ *
+ * Architecture B+ chain:
+ *   1. 2.5 Flash-Lite GA · dynamic budget   (PRIMARY_TEXT_MODEL)
+ *   2. 2.5 Flash GA · budget 8192 fallback   (FALLBACK_TEXT_MODEL)
  */
 export async function generateWithFallback(env, contents, config = {}) {
   const ai = getAI(env);
-  const proConfig = { ...config };
-  const flashConfig = { ...config };
 
-  const doGenerate = (model) => ai.models.generateContent({
-    model, contents, config: proConfig
+  // Ensure thinking config is present. Caller may override via config.thinkingConfig.
+  const primaryConfig = withThinkingDefaults(config, { thinkingBudget: DEFAULT_THINKING_BUDGET });
+  const fallbackConfig = withThinkingDefaults(config, { thinkingBudget: 8192 });
+
+  const doGenerate = (model, cfg) => ai.models.generateContent({
+    model, contents, config: cfg
   });
 
   const response = await withRetry(
-    () => doGenerate(PRIMARY_TEXT_MODEL),
+    () => doGenerate(PRIMARY_TEXT_MODEL, primaryConfig),
     2,
-    () => doGenerate(FALLBACK_TEXT_MODEL)
+    () => doGenerate(FALLBACK_TEXT_MODEL, fallbackConfig)
   );
 
   const text = response.candidates?.[0]?.content?.parts
@@ -121,6 +140,19 @@ export async function generateWithFallback(env, contents, config = {}) {
     ?.join('') || '';
 
   return { text: text.trim(), response };
+}
+
+// Helper: merge a thinkingConfig into a request config if one isn't already set.
+// Defaults to thinkingBudget unless thinkingLevel is explicitly passed.
+function withThinkingDefaults(baseConfig, defaults) {
+  const out = { ...baseConfig };
+  if (out.thinkingConfig) return out; // caller already specified
+  if (typeof defaults.thinkingBudget === 'number') {
+    out.thinkingConfig = { thinkingBudget: defaults.thinkingBudget };
+  } else if (defaults.thinkingLevel) {
+    out.thinkingConfig = { thinkingLevel: defaults.thinkingLevel };
+  }
+  return out;
 }
 
 // ---- Context Caching ----
@@ -218,12 +250,13 @@ function buildConfig(systemInstruction, opts = {}) {
     temperature: 1.0,
   };
 
-  // Gemini 3.1 Pro supports 'low', 'medium', 'high' thinking levels.
-  // Thinking cannot be disabled on Pro. Default to 'low' for speed;
-  // callers can pass opts.thinkingLevel to override for therapeutic/complex tasks.
-  if (opts.thinkingLevel) {
-    config.thinkingConfig = { thinkingLevel: opts.thinkingLevel };
-  }
+  // Thinking config: 2.5 GA models use thinkingBudget (number, -1=dynamic, 0=off,
+  // up to 24576). 3.x preview models use thinkingLevel ('minimal'|'low'|'medium'|
+  // 'high'). Both cannot be set in the same call. Default to dynamic budget for
+  // the 2.5 GA primary; callers can pass opts.thinkingBudget or opts.thinkingLevel
+  // to override. Combined-evaluation bundle showed dynamic at 73.0/108 and budget
+  // 512 at 73.5/108 — essentially tied — and dynamic was 2.3s faster on average.
+  config.thinkingConfig = resolveThinkingConfig(opts, { thinkingBudget: DEFAULT_THINKING_BUDGET });
 
   return config;
 }
@@ -234,11 +267,28 @@ function buildCachedConfig(cacheName, opts = {}) {
     temperature: 1.0,
   };
 
-  if (opts.thinkingLevel) {
-    config.thinkingConfig = { thinkingLevel: opts.thinkingLevel };
-  }
+  config.thinkingConfig = resolveThinkingConfig(opts, { thinkingBudget: DEFAULT_THINKING_BUDGET });
 
   return config;
+}
+
+// Resolve which thinking config to use for a call. Precedence: explicit
+// opts.thinkingBudget > opts.thinkingLevel > the supplied default. Returns
+// an object suitable for spreading into the request config.
+function resolveThinkingConfig(opts, fallback) {
+  if (typeof opts.thinkingBudget === 'number') {
+    return { thinkingBudget: opts.thinkingBudget };
+  }
+  if (opts.thinkingLevel) {
+    return { thinkingLevel: opts.thinkingLevel };
+  }
+  if (typeof fallback.thinkingBudget === 'number') {
+    return { thinkingBudget: fallback.thinkingBudget };
+  }
+  if (fallback.thinkingLevel) {
+    return { thinkingLevel: fallback.thinkingLevel };
+  }
+  return undefined;
 }
 
 export async function createChat(history, systemInstruction, env, cacheContext = null, model = null, opts = {}) {
@@ -471,37 +521,181 @@ function _trimTrailing(text) {
 }
 
 
-// ---- Deep Response Generation (Pro model, high thinking) ----
-// Used for therapeutic synthesis where quality matters more than speed.
-// No "brief message" override — the caller controls the length via prompt.
-// Pro model with configurable thinkingLevel ('low' | 'medium' | 'high').
+// ---- Deep Response Generation (Pro model, low budget) ----
+// Used for therapeutic synthesis, weekly reports, and other cron-tolerant work
+// where quality matters more than latency. No "brief message" override — the
+// caller controls length via prompt.
+//
+// Primary: 2.5 Pro budget 128 (68/108 in bundle, 11.5/15 on Cat C — best Pro tier)
+// Fallback: 2.5 Flash-Lite budget 512 (73.5/108, 12/15 on Cat C — best in family)
+//
+// Counter-intuitive but data-confirmed: 2.5 Pro budget 128 outperforms budget
+// 8192 and 24576 on this workload. Higher budget often causes Pro to overthink
+// simple tool decisions. Callers can still pass opts.thinkingBudget to override.
 export async function generateDeepResponse(prompt, systemInstruction, env, opts = {}) {
-  const thinkingLevel = opts.thinkingLevel || 'medium';
   const maxOutputTokens = opts.maxOutputTokens || 2000;
+  // Translate legacy thinkingLevel ('low'|'medium'|'high') to a 2.5 Pro budget,
+  // so older callers still work without code changes.
+  const legacyLevelToBudget = { minimal: 0, low: 128, medium: 8192, high: 24576 };
+  let budget = DEEP_RESPONSE_BUDGET;
+  if (typeof opts.thinkingBudget === 'number') budget = opts.thinkingBudget;
+  else if (opts.thinkingLevel && legacyLevelToBudget[opts.thinkingLevel] !== undefined) {
+    budget = legacyLevelToBudget[opts.thinkingLevel];
+  }
 
-  const config = {
+  const primaryConfig = {
     systemInstruction,
     temperature: 1.0,
     maxOutputTokens,
-    thinkingConfig: { thinkingLevel },
+    thinkingConfig: { thinkingBudget: budget },
+  };
+  const fallbackConfig = {
+    systemInstruction,
+    temperature: 1.0,
+    maxOutputTokens,
+    thinkingConfig: { thinkingBudget: CRISIS_FL_BUDGET },
   };
 
   const response = await withRetry(
     () => getAI(env).models.generateContent({
-      model: PRIMARY_TEXT_MODEL,
+      model: DEEP_RESPONSE_MODEL,
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config,
+      config: primaryConfig,
     }),
     2,
-    // Fallback: retry with Flash if Pro is unavailable
+    // Fallback: 2.5 Flash-Lite budget 512 — best non-Pro on mental health work.
     () => getAI(env).models.generateContent({
-      model: FALLBACK_TEXT_MODEL,
+      model: PRIMARY_TEXT_MODEL,
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: { systemInstruction, temperature: 1.0, maxOutputTokens },
+      config: fallbackConfig,
     })
   );
 
   const text = response.candidates?.[0]?.content?.parts
+    ?.filter(p => p.text && !p.thought)
+    ?.map(p => p.text)
+    ?.join('') || '';
+  return text.trim();
+}
+
+// ---- Background-task Gemini helper ----
+// Used by cfAi.js, personaEvolution.js, etc. for non-user-facing background work
+// (tagging, observation extraction, summarisation). Returns trimmed text or
+// null on failure — mirrors the cfAiGenerate shape so call sites can swap
+// providers without restructuring.
+//
+// Defaults: thinkingBudget -1 (dynamic) on 2.5 GA models. Pass opts.thinkingBudget
+// to override (0=off, 128=low, 512=balanced, 8192=high). Pass opts.thinkingLevel
+// for 3.x preview models (minimal | low | medium | high).
+export async function geminiBackgroundGenerate(env, model, prompt, systemPrompt = '', opts = {}) {
+  if (!env.GEMINI_API_KEY) return null;
+  try {
+    const ai = getAI(env);
+    const thinking = resolveThinkingConfig(opts, { thinkingBudget: DEFAULT_THINKING_BUDGET });
+    const response = await ai.models.generateContent({
+      model,
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config: {
+        systemInstruction: systemPrompt || undefined,
+        temperature: 1.0,
+        maxOutputTokens: opts.maxOutputTokens ?? 2000,
+        thinkingConfig: thinking,
+      },
+    });
+    let text = '';
+    if (typeof response?.text === 'string') text = response.text;
+    else if (typeof response?.text === 'function') {
+      try { text = response.text() || ''; } catch { /* skip */ }
+    }
+    if (!text) {
+      text = response?.candidates?.[0]?.content?.parts
+        ?.filter((p) => p.text && !p.thought)
+        ?.map((p) => p.text)
+        ?.join('') || '';
+    }
+    const trimmed = (text || '').trim();
+    return trimmed || null;
+  } catch (err) {
+    console.error(`Gemini bg error (${model}):`, err.message?.slice(0, 200));
+    return null;
+  }
+}
+
+
+// ---- Crisis-lane Two-Model Parallel Race ----
+// Used when the conversation classifier flags the turn as 'crisis' (or any
+// other lane where mental-health quality dominates). Fires 2.5 Pro budget 128
+// AND 2.5 Flash-Lite budget 512 in parallel and returns whichever succeeds
+// first. Token cost roughly doubles on crisis turns; absolute volume is small
+// (estimated <50/day) so the safety net is worth the spend.
+//
+// Combined-evaluation bundle scores on Cat C (mental health):
+//   2.5 Pro · budget 128       — 11.5/15, 3.7s avg
+//   2.5 Flash-Lite · budget 512 — 12.0/15, 8.6s avg (best in Gemini family)
+//
+// If both fail (both reject or both error), falls through to a single 2.5 Pro
+// dynamic call as last resort. Returns trimmed text.
+export async function generateCrisisResponse(prompt, systemInstruction, env, opts = {}) {
+  const maxOutputTokens = opts.maxOutputTokens || 2000;
+  const baseConfig = {
+    systemInstruction,
+    temperature: 1.0,
+    maxOutputTokens,
+  };
+
+  const proCall = () => getAI(env).models.generateContent({
+    model: DEEP_RESPONSE_MODEL,
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    config: { ...baseConfig, thinkingConfig: { thinkingBudget: CRISIS_PRO_BUDGET } },
+  });
+  const flCall = () => getAI(env).models.generateContent({
+    model: PRIMARY_TEXT_MODEL,
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    config: { ...baseConfig, thinkingConfig: { thinkingBudget: CRISIS_FL_BUDGET } },
+  });
+
+  // Wrap each call so a failure resolves to a sentinel instead of rejecting.
+  // Then race for the first non-sentinel result.
+  const tagged = async (label, fn) => {
+    try {
+      const response = await fn();
+      const text = response.candidates?.[0]?.content?.parts
+        ?.filter(p => p.text && !p.thought)
+        ?.map(p => p.text)
+        ?.join('') || '';
+      if (!text.trim()) return { label, ok: false, error: 'empty_response' };
+      return { label, ok: true, text: text.trim() };
+    } catch (err) {
+      return { label, ok: false, error: err?.message || String(err) };
+    }
+  };
+
+  const proPromise = tagged('pro_b128', proCall);
+  const flPromise = tagged('fl_b512', flCall);
+
+  // First-past-the-post: whoever returns a successful payload wins.
+  // If the first to finish failed, await the other before declaring failure.
+  const first = await Promise.race([proPromise, flPromise]);
+  if (first.ok) {
+    console.log(`🚨 Crisis lane winner: ${first.label}`);
+    return first.text;
+  }
+
+  console.warn(`🚨 Crisis lane ${first.label} failed (${first.error?.slice(0, 100)}), awaiting other arm`);
+  const second = first.label === 'pro_b128' ? await flPromise : await proPromise;
+  if (second.ok) {
+    console.log(`🚨 Crisis lane second arm winner: ${second.label}`);
+    return second.text;
+  }
+
+  // Both raced arms failed. Last-resort fallback: 2.5 Pro dynamic, single call.
+  console.warn(`🚨 Crisis lane both arms failed (${second.label}: ${second.error?.slice(0, 100)}), falling through to Pro dynamic`);
+  const fallback = await getAI(env).models.generateContent({
+    model: DEEP_RESPONSE_MODEL,
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    config: { ...baseConfig, thinkingConfig: { thinkingBudget: -1 } },
+  });
+  const text = fallback.candidates?.[0]?.content?.parts
     ?.filter(p => p.text && !p.thought)
     ?.map(p => p.text)
     ?.join('') || '';

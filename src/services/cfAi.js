@@ -13,23 +13,11 @@
 import {
 	geminiBackgroundGenerate,
 	runCascade,
-	FLASH_3_MODEL,
 	FLASH_LITE_31_MODEL,
 	FLASH_LITE_25_MODEL,
-	PRO_31_MODEL,
-	PRO_25_MODEL,
-	KIMI_MODEL,
-	GEMMA_MODEL,
 	QWEN_CODER_32B_MODEL,
 	LLAMA_4_SCOUT_MODEL,
 } from '../lib/ai/gemini';
-
-const MODELS = {
-	tiny: '@cf/meta/llama-3.2-1b-instruct',                // legacy reference
-	balanced: '@cf/meta/llama-3.1-8b-instruct-fp8-fast',   // legacy reference; retained for tagger fallback
-	context: '@cf/zai-org/glm-4.7-flash',                  // legacy reference
-	tools: '@cf/google/gemma-4-26b-a4b-it',                // legacy reference
-};
 
 // Data-driven cascade definitions (post-bench 2026-05-15).
 const SUMMARISATION_TIERS = [
@@ -304,23 +292,9 @@ async function _tryProvider(fn, timeoutMs) {
 	}
 }
 
-async function _classifyWithGemma(env, prompt, systemPrompt) {
-	const { runCfAi } = await import('../lib/ai-gateway.js');
-	const result = await runCfAi(env.AI, '@cf/google/gemma-4-26b-a4b-it', {
-		messages: [
-			{ role: 'system', content: systemPrompt },
-			{ role: 'user', content: prompt },
-		],
-		temperature: 0.2,
-		max_tokens: 2000,
-	});
-	const text = result?.choices?.[0]?.message?.content || result?.response;
-	return text || result;
-}
-
 // Generic CF model classifier — used by Tier 1 (qwen-coder) and Tier 2 (scout)
-// in tagConversationMode. Replaces the model-specific _classifyWithGemma /
-// _classifyWithLlama8B helpers (those are now dead code, kept for compat).
+// in tagConversationMode. Single classifier supersedes the older
+// _classifyWithGemma / _classifyWithLlama8B helpers (removed 2026-05-15).
 async function _classifyWithCfModel(env, modelBinding, prompt, systemPrompt) {
 	const { runCfAi } = await import('../lib/ai-gateway.js');
 	const result = await runCfAi(env.AI, modelBinding, {
@@ -335,49 +309,6 @@ async function _classifyWithCfModel(env, modelBinding, prompt, systemPrompt) {
 	});
 	const text = result?.choices?.[0]?.message?.content || result?.response;
 	return text || result;
-}
-
-async function _classifyWithGemini(env, prompt, systemPrompt, modelTag) {
-	const { GoogleGenAI } = await import('@google/genai');
-	const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
-	const model = modelTag === '@gemini-flash'
-		? FLASH_3_MODEL
-		: FLASH_LITE_31_MODEL;
-	const response = await ai.models.generateContent({
-		model,
-		contents: [{ role: 'user', parts: [{ text: prompt }] }],
-		config: {
-			systemInstruction: systemPrompt,
-			temperature: 0.2,
-			maxOutputTokens: 2000,
-		},
-	});
-	let text = '';
-	if (typeof response?.text === 'string') {
-		text = response.text;
-	} else if (typeof response?.text === 'function') {
-		try { text = response.text() || ''; } catch { /* fall through */ }
-	}
-	if (!text) {
-		text = response?.candidates?.[0]?.content?.parts
-			?.filter(p => p.text && !p.thought)
-			?.map(p => p.text)
-			?.join('') || '';
-	}
-	return text || response;
-}
-
-async function _classifyWithLlama8B(env, prompt, systemPrompt) {
-	const result = await env.AI.run(MODELS.balanced, {
-		messages: [
-			{ role: 'system', content: systemPrompt },
-			{ role: 'user', content: prompt },
-		],
-		max_tokens: 64,
-	}, {
-		headers: { 'x-session-affinity': 'xaridotis-tag' },
-	});
-	return result?.response || result;
 }
 
 async function _classifyWithGemini31FLMinimal(env, prompt, systemPrompt) {
@@ -558,4 +489,4 @@ RULES:
 	return result.replace(/^```[\s\S]*?\n/, '').replace(/\n```\s*$/, '').trim();
 }
 
-export { MODELS };
+

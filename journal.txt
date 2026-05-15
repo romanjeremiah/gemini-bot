@@ -4,6 +4,216 @@ A log of significant engineering sessions on Xaridotis (gemini-bot). Most recent
 
 ================================================================================
 
+## 2026-05-15 — Cascade rebuild from conv_bench + Option C 2.5 Pro promotion
+
+### What
+
+Rebuilt every conversational model cascade in the codebase from the 2026-05-15
+conv_bench data (322 trials across 18 model variants, 300 with judge coverage
+after rerun_judge.mjs and rerun_failed.mjs recovery passes). Also closed two
+latent issues surfaced by the bench:
+
+1. `GEMINI_MODELS.pro` was `gemini-3.1-pro-preview`. The bench showed Pro 3.1
+   returns empty 100% on the no-tools cached-content shape. Production
+   stayed working because every emotional/crisis turn attaches tools at
+   send time, but it's been one failure mode away from broken.
+2. `PRIMARY_TEXT_MODEL` was `FLASH_3_MODEL` (Flash 3). The constant is read
+   by `/model pro` overrides to mean "the quality tier". Flash 3 was the
+   slowest reliable model in the bench (composite 3.30 at 7.7s P50) —
+   bottom half of the leaderboard. So `/model pro` was silently giving
+   users the worst option.
+
+### Bench-driven cascade order
+
+Gemini-only swap. No Anthropic/OpenAI Unified API tier integration in this
+commit (deferred to a separate Option B follow-up).
+
+Main conversational cascade in `src/bot/handlers.js` (line ~1957):
+
+    3.1 FL → 2.5 FL b128 → 3.1 FL med → 2.5 Pro low → Pro 3.1
+
+- Tier 0 (3.1 FL no opts): scored 4.58 composite on transactional, 3.92 on
+  greeting, 4.08 on processing at P50 ~1.1s. Best-match Tier 1 for the
+  router-picked traffic in MAIN_CASCADE (simple_message, mode_transactional,
+  Path B fall-through).
+- Tier 1 (2.5 FL with thinkingBudget 128): composite 3.75 at P50 1.6s, 100%
+  reliable in bench. Different model family from 3.1 FL so handles upstream
+  3.1 outages.
+- Tier 2 (3.1 FL thinkingLevel medium): composite 3.89 at P50 2.6s. Same
+  family as Tier 0 but with extra thinking budget; useful as retry against
+  transient stream errors.
+- Tier 3 (2.5 Pro thinkingBudget 128): composite 3.85 at P50 4.2s, 100%
+  reliable. The quality tier.
+- Tier 4 (Pro 3.1 no opts): resilience anchor. Bench showed it returns
+  empty on no-tools cached-content shape — production has tools attached
+  on the streaming path so it works there. Placed last so `/model pro`
+  has a fallback if Tier 3 (2.5 Pro) fails.
+
+Crisis cascade in handlers.js:
+
+    2.5 Pro low → 3.1 FL med → 2.5 FL b128 → Pro 3.1
+
+- Tier 0 (2.5 Pro thinkingBudget 128): 3.75 composite on crisis at 100%
+  reliability — best reliable option for emotional/crisis turns.
+- Tier 1 (3.1 FL medium): 3.50 composite on crisis.
+- Tier 2 (2.5 FL b128): 3.25 composite on crisis.
+- Tier 3 (Pro 3.1): resilience anchor.
+
+Removed entirely: Flash 3 (`gemini-3-flash-preview`). Bench showed it as
+the worst combo of latency and quality across both lanes — composite 3.30
+at 7.7s P50 vs Flash-Lite 3.1's 3.58 at 1.1s. No path in the new cascades
+uses Flash 3.
+
+Non-streaming generation cascades in `src/lib/ai/gemini.js` rebuilt to match:
+
+- SHORT_RESPONSE_TIERS: Gemma → 3.1 FL minimal → 2.5 FL b128. Gemma stays
+  Tier 1 because the standalone gap test (`test_gemma_xaridotis.mjs`)
+  showed it scored 4.58 composite on greeting at ~1.1s P50, matching Haiku
+  4.5 quality at Workers AI prices. Excluded from emotional content per
+  the same test (Gemma forced a structured "Pattern Observation" template
+  on venting/processing scenarios — instruction-following failure).
+- DEEP_RESPONSE_TIERS: 2.5 Pro low → 3.1 FL med → Pro 3.1 → 2.5 FL b512.
+  Five tiers reduced to four (dropped Flash 3).
+- CRISIS_TIERS: 2.5 Pro low → 3.1 FL med → 2.5 FL b128 → Pro 3.1 → Kimi.
+  Five tiers preserved (Kimi as ultimate Workers AI floor).
+
+### Option C: 2.5 Pro promotion + thinking config defaults
+
+Two coordinated changes so the router picking 2.5 Pro doesn't accidentally
+get the unreliable dynamic-thinking variant.
+
+In `src/config/models.js`:
+
+    pro: 'gemini-3.1-pro-preview' → 'gemini-2.5-pro'
+
+In `src/lib/ai/gemini.js`, new MODEL_DEFAULT_OPTS + withModelDefaults helper
+applied inside createChat:
+
+    const MODEL_DEFAULT_OPTS = {
+      [PRO_25_MODEL]: { thinkingBudget: 128 },
+    };
+
+    function withModelDefaults(model, opts) {
+      const defaults = MODEL_DEFAULT_OPTS[model];
+      if (!defaults) return opts;
+      // Caller-provided thinking config wins — cascade tiers explicitly set theirs.
+      if (opts && (opts.thinkingBudget !== undefined || opts.thinkingLevel !== undefined)) return opts;
+      return { ...defaults, ...(opts || {}) };
+    }
+
+Reason: the bench showed 2.5 Pro at thinkingBudget=128 was 100% reliable,
+but at dynamic / medium (8192) / high (24576) budgets only 22-33% reliable
+(returned empty most of the time). Without these defaults, every router-
+picked Pro turn would have used dynamic thinking and produced empty
+responses 80% of the time. Cascade tiers carry their own opts and override
+the defaults, so resilience walks aren't affected.
+
+Also updated PRIMARY_TEXT_MODEL = PRO_25_MODEL so `/model pro` overrides
+finally give users the actual Pro tier (was Flash 3).
+
+### Files changed
+
+- `src/config/models.js`: `pro` field swapped to gemini-2.5-pro. Added
+  comment block explaining the 2026-05-15 swap and the MODEL_DEFAULT_OPTS
+  reference for thinking config.
+- `src/lib/ai/gemini.js`:
+  - PRIMARY_TEXT_MODEL = PRO_25_MODEL (was FLASH_3_MODEL)
+  - Added MODEL_DEFAULT_OPTS lookup and withModelDefaults helper
+  - createChat applies withModelDefaults(useModel, opts) before buildConfig
+  - SHORT_RESPONSE_TIERS rebuilt (Gemma → 3.1 FL min → 2.5 FL b128)
+  - DEEP_RESPONSE_TIERS rebuilt (2.5 Pro low → 3.1 FL med → Pro 3.1 →
+    2.5 FL b512); dropped Flash 3 tier
+  - CRISIS_TIERS rebuilt (2.5 Pro low → 3.1 FL med → 2.5 FL b128 →
+    Pro 3.1 → Kimi); dropped Flash 3 and 2.5 Pro dynamic
+  - Comment blocks above each cascade updated with bench rationale
+- `src/bot/handlers.js` (line ~1957):
+  - MAIN_CASCADE rebuilt (3.1 FL → 2.5 FL b128 → 3.1 FL med → 2.5 Pro low
+    → Pro 3.1); five tiers, Pro 3.1 as resilience anchor
+  - CRISIS_CASCADE rebuilt (2.5 Pro low → 3.1 FL med → 2.5 FL b128 →
+    Pro 3.1); four tiers
+  - Comment block rewritten with bench rationale
+
+### Router boundary unchanged
+
+Decided against widening Gemma's share via router rule 8/9 reordering. The
+production tail audit showed three real messages, all caught by rule 8
+(`simple_message` / `mode_transactional` → Flash-Lite) before reaching
+rule 9 (`default_casual` → Gemma). Roma chose minimum-risk: cascade fix
+only, router boundary preserved. Gemma is still the default for genuinely
+conversational messages that aren't tagged transactional/simple, just a
+narrower slice than the bench suggested optimal.
+
+### Deferred
+
+- Anthropic/OpenAI Unified API tier integration in runCascade. The bench
+  showed Claude Opus 4.7 at composite 4.21 (best overall, wins crisis 4.50
+  and processing 5.00) and GPT-5.4-mini at 3.99 with the best
+  speed/quality ratio (P50 1522ms). Adding them as resilience tiers behind
+  the existing CF Gateway BYOK setup is the obvious next move — separate
+  commit, separate session, because it requires a new tier `kind` in
+  runCascade plus testing both providers' Unified API behaviour.
+- `cfAi.js` cleanup (488 lines down from 561) ready to deploy as a
+  separate commit.
+- `KIMI_MODEL` fix from `kimi-k2-instruct` → `kimi-k2.6` is already in this
+  branch but deserves its own line in the next commit message.
+
+### Pre-deploy state
+
+All three modified files pass `node --check`. Roma deploys with:
+
+    npx wrangler deploy --minify
+    git add -A && git commit -m "feat(cascade): rebuild from conv_bench data + Option C 2.5 Pro promotion" && git push
+
+### Verification after deploy
+
+Watch `wrangler tail` for the first hour of normal traffic and a deliberate
+/model pro test:
+
+- `🤖 Model: gemini-2.5-pro` on the first emotional/crisis turn (proves
+  router → 2.5 Pro path is live)
+- `cascade_fallback` events showing the new tier transitions if any
+  upstream model hiccups (look for `from: gemini-3.1-flash-lite-preview
+  to: gemini-2.5-flash-lite` for MAIN cascade Tier 0 → Tier 1)
+- Absence of Pro 3.1 "empty response" failures on user-facing turns
+- `/model pro` followed by a normal message should log
+  `🤖 Model: gemini-2.5-pro` with `thinkingBudget: 128` baked in via the
+  new MODEL_DEFAULT_OPTS path
+- No `INVALID_ARGUMENT` errors mentioning `thinkingBudget` or `thinkingLevel`
+  on Pro 3.1 fallback (that model uses a different thinking API; opts is
+  empty so we should be safe, but worth confirming)
+
+If the cascade reaches Pro 3.1 and that returns empty, we'll see the
+streaming path throw and handleMessage's outer catch fires. That's a
+resilience-tier-of-last-resort scenario; if it happens often we'll need
+to either fix Pro 3.1's no-tools behaviour upstream or remove it entirely
+and backfill with Anthropic/OpenAI tiers.
+
+### Lessons worth carrying forward
+
+1. **The constant name lied about behaviour.** PRIMARY_TEXT_MODEL has been
+   `FLASH_3_MODEL` since the Architecture B+ migration on 2026-05-14, and
+   nobody noticed it was making `/model pro` return Flash 3 because nobody
+   uses `/model pro`. Constants should match their semantic meaning, not
+   their initial implementation choice.
+2. **Per-model defaults belong at createChat, not at every call site.**
+   Without MODEL_DEFAULT_OPTS, every caller that wanted reliable 2.5 Pro
+   behaviour would have had to remember to pass thinkingBudget=128. With
+   it, the cascade tiers can still override explicitly when they want a
+   different budget. Reduces footgun surface area.
+3. **Bench data beats intuition on Pro variants.** Dynamic-thinking Pro
+   sounds like it should be smart enough to figure out how much thinking
+   to do. The bench showed it returns empty 80% of the time on our prompt
+   shape. Pinning to budget=128 is counter-intuitive but data-confirmed,
+   matching the same lesson from the 2026-05-14 Architecture B+ entry
+   below.
+4. **Resilience tier at the end of the cascade matters even for broken
+   models.** Pro 3.1 looks 100% broken in the bench, but production runs
+   include tool definitions and that changes behaviour. Keeping Pro 3.1
+   as the final resilience tier costs nothing if the earlier tiers
+   succeed, and catches the case where 2.5 Pro's API is down entirely.
+
+================================================================================
+
 ## 2026-05-14 (later) — Mood workflow: fixed duplicate-emotions-keyboard via idem-marker ordering
 
 ### What

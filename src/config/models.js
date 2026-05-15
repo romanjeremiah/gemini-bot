@@ -23,9 +23,16 @@ export const CF_MODELS = Object.freeze({
 	reranker:    '@cf/baai/bge-reranker-base',        // already wired in vectorStore.js
 });
 
-/** Gemini models — reserved for emotional, multimodal, and complex paths */
+/** Gemini models — reserved for emotional, multimodal, and complex paths.
+ *
+ * 2026-05-15: pro switched from gemini-3.1-pro-preview to gemini-2.5-pro after
+ * the conv_bench showed 3.1 Pro returns 100% empty on the no-tools cached-content
+ * shape. 2.5 Pro at thinkingBudget=128 was 100% reliable in the bench with
+ * composite 3.85. The thinkingBudget is applied via MODEL_DEFAULT_OPTS in
+ * src/lib/ai/gemini.js so router-picked invocations get the bench-validated
+ * variant by default. */
 export const GEMINI_MODELS = Object.freeze({
-	pro:        'gemini-3.1-pro-preview',
+	pro:        'gemini-2.5-pro',
 	flash:      'gemini-3-flash-preview',
 	flashLite:  'gemini-3.1-flash-lite-preview',
 	imagePro:   'gemini-3-pro-image-preview',         // Nano Banana Pro

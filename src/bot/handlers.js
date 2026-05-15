@@ -1947,23 +1947,31 @@ export async function handleMessage(msg, env) {
 				err_msg: errMsg.slice(0, 200),
 			});
 
-			// Roma cascade (2026-05-14): walk the appropriate model cascade on retryable failure.
-			// Main convo lane:  Flash 3 → 3.1 FL → 2.5 FL dyn → Pro 3.1 medium → Kimi(*) → Gemma(*)
-			// Crisis lane:      Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro dyn → Kimi(*)
+			// Roma cascade (2026-05-15 conv_bench rebuild): walk the appropriate model
+			// cascade on retryable failure.
+			// Main convo lane:  3.1 FL → 2.5 FL b128 → 3.1 FL med → 2.5 Pro low → Pro 3.1
+			//                   (Pro 3.1 at the end is a resilience tier so /model pro starts
+			//                    have a fallback when 2.5 Pro low itself fails)
+			// Crisis lane:      2.5 Pro low → 3.1 FL med → 2.5 FL b128 → Pro 3.1
+			//                   (2.5 Pro low scored 3.75 on crisis at 100% reliability;
+			//                    Pro 3.1 only at end since bench shows it returns empty
+			//                    100% on no-tools cached-content shape)
+			// Removed entirely: Flash 3 — bench composite 3.30 at 7.7s P50, worst combo.
 			// (*) CF tiers — skipped here because handlers.js streaming is Gemini-only;
 			//     if all Gemini tiers exhausted we fall through to throw.
 			const isCrisisLane = !!(route && /^(mode_crisis|multimodal_input|checkin_with_emotion|emotional_content|complex_task)$/.test(route.reason || ''));
 			const MAIN_CASCADE = [
-				{ model: FLASH_3_MODEL,       opts: {} },
 				{ model: FLASH_LITE_31_MODEL, opts: {} },
-				{ model: FLASH_LITE_25_MODEL, opts: { thinkingBudget: -1 } },
-				{ model: PRO_31_MODEL,        opts: { thinkingLevel: 'medium' } },
+				{ model: FLASH_LITE_25_MODEL, opts: { thinkingBudget: 128 } },
+				{ model: FLASH_LITE_31_MODEL, opts: { thinkingLevel: 'medium' } },
+				{ model: PRO_25_MODEL,        opts: { thinkingBudget: 128 } },
+				{ model: PRO_31_MODEL,        opts: {} },
 			];
 			const CRISIS_CASCADE = [
+				{ model: PRO_25_MODEL,        opts: { thinkingBudget: 128 } },
+				{ model: FLASH_LITE_31_MODEL, opts: { thinkingLevel: 'medium' } },
+				{ model: FLASH_LITE_25_MODEL, opts: { thinkingBudget: 128 } },
 				{ model: PRO_31_MODEL,        opts: {} },
-				{ model: FLASH_3_MODEL,       opts: {} },
-				{ model: FLASH_LITE_31_MODEL, opts: {} },
-				{ model: PRO_25_MODEL,        opts: { thinkingBudget: -1 } },
 			];
 			const cascade = isCrisisLane ? CRISIS_CASCADE : MAIN_CASCADE;
 			const currentIdx = cascade.findIndex(t => t.model === textModel);

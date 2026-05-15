@@ -41,9 +41,13 @@ export const LLAMA_33_70B_MODEL   = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 
 // Legacy aliases kept so existing callers in handlers.js / responseCurator /
 // transcription / mood files continue to compile without restructuring.
-// PRIMARY = main convo Tier 1 (Flash 3). FALLBACK = main convo Tier 2 (3.1 FL).
+//
+// 2026-05-15 (Option C cascade rebuild): PRIMARY_TEXT_MODEL now points at
+// PRO_25_MODEL so /model pro gives the bench-validated quality tier (was
+// FLASH_3_MODEL — which scored 3.30 composite at 7.7s P50, bottom half).
+// FALLBACK_TEXT_MODEL stays as 3.1 FL since that's MAIN_CASCADE Tier 0.
 // FLASH_LITE_TEXT_MODEL = 3.1 FL (used by transcription fallback + curator + handlers.js model menu).
-export const PRIMARY_TEXT_MODEL    = FLASH_3_MODEL;
+export const PRIMARY_TEXT_MODEL    = PRO_25_MODEL;
 export const FALLBACK_TEXT_MODEL   = FLASH_LITE_31_MODEL;
 export const FLASH_LITE_TEXT_MODEL = FLASH_LITE_31_MODEL;
 export const DEEP_RESPONSE_MODEL   = PRO_31_MODEL; // deep cron synthesis Tier 1
@@ -290,11 +294,33 @@ function resolveThinkingConfig(opts, fallback) {
   return undefined;
 }
 
+// Per-model default options applied at createChat time when callers don't
+// specify thinking config. Keeps router-picked invocations aligned with the
+// bench-validated reliable variant. Cascade tiers carry their own opts and
+// take precedence over these defaults.
+//
+// 2026-05-15: 2.5 Pro with thinkingBudget=128 was 100% reliable in the bench
+// (composite 3.85). 2.5 Pro at dynamic / medium / high budgets was 22-33%
+// reliable (returned empty most of the time). So when the router picks Pro
+// and doesn't specify thinking, force budget=128.
+const MODEL_DEFAULT_OPTS = {
+  [PRO_25_MODEL]: { thinkingBudget: 128 },
+};
+
+function withModelDefaults(model, opts) {
+  const defaults = MODEL_DEFAULT_OPTS[model];
+  if (!defaults) return opts;
+  // Caller-provided thinking config wins — cascade tiers explicitly set theirs.
+  if (opts && (opts.thinkingBudget !== undefined || opts.thinkingLevel !== undefined)) return opts;
+  return { ...defaults, ...(opts || {}) };
+}
+
 export async function createChat(history, systemInstruction, env, cacheContext = null, model = null, opts = {}) {
   const useModel = model || PRIMARY_TEXT_MODEL;
+  const finalOpts = withModelDefaults(useModel, opts);
   const config = cacheContext?.cacheName
-    ? buildCachedConfig(cacheContext.cacheName, opts)
-    : buildConfig(systemInstruction, opts);
+    ? buildCachedConfig(cacheContext.cacheName, finalOpts)
+    : buildConfig(systemInstruction, finalOpts);
 
   console.log(`🤖 Model: ${useModel}`);
   return getAI(env).chats.create({
@@ -527,14 +553,18 @@ export async function runCascade(env, prompt, systemPrompt, tiers) {
 // ============================================================================
 //  SHORT-RESPONSE CASCADE — greetings, listen-mode, observations
 // ============================================================================
-// Chain (Roma 2026-05-14): Gemma → Flash 3 → 3.1 FL.
+// Chain (2026-05-15 conv_bench rebuild): Gemma → 3.1 FL minimal → 2.5 FL b128.
+// Gemma stays Tier 1 — bench gap test (test_gemma_xaridotis.mjs) showed it
+// scored 4.58 composite on greeting at ~1.1s P50, matching Haiku quality at
+// Workers AI prices. Dropped Flash 3 — bench showed 3.30 composite at 7.7s P50,
+// worse on both axes than the 3.1 FL alternatives.
 
 const SHORT_RESPONSE_GUIDE = '\n\nYou are generating a brief message for a Telegram bot. Keep it to 2-4 complete sentences. Be fully in character. No asterisks, no markdown, no HTML tags. You MUST finish every sentence completely. Never stop mid-sentence or mid-thought.';
 
 const SHORT_RESPONSE_TIERS = [
-  { kind: 'cf', model: GEMMA_MODEL, opts: { maxOutputTokens: 1000 }, label: 'short:gemma' },
-  { kind: 'gemini', model: FLASH_3_MODEL, opts: { maxOutputTokens: 1000 }, label: 'short:flash-3' },
-  { kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 1000, thinkingLevel: 'minimal' }, label: 'short:3.1-fl' },
+  { kind: 'cf',     model: GEMMA_MODEL,         opts: { maxOutputTokens: 1000 },                                  label: 'short:gemma' },
+  { kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 1000, thinkingLevel: 'minimal' },         label: 'short:3.1-fl' },
+  { kind: 'gemini', model: FLASH_LITE_25_MODEL, opts: { maxOutputTokens: 1000, thinkingBudget: 128 },              label: 'short:2.5-fl-b128' },
 ];
 
 export async function generateShortResponse(prompt, systemInstruction, env) {
@@ -557,14 +587,16 @@ function _trimTrailing(text) {
 // ============================================================================
 //  DEEP-RESPONSE CASCADE — cron synthesis, weekly reports, therapeutic notes
 // ============================================================================
-// Chain (Roma 2026-05-14): Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro b128 → 2.5 FL b512.
+// Chain (2026-05-15 conv_bench rebuild): 2.5 Pro low → 3.1 FL med → Pro 3.1 → 2.5 FL b512.
+// 2.5 Pro low (budget=128) was the only reliable Pro variant in the bench (100% coverage,
+// 3.85 composite). Pro 3.1 demoted to Tier 3 as resilience anchor — returns empty on
+// no-tools shapes but works in many production contexts.
 
 const DEEP_RESPONSE_TIERS = [
-  { kind: 'gemini', model: PRO_31_MODEL,        opts: { maxOutputTokens: 2000 },                            label: 'deep:pro-3.1' },
-  { kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 2000 },                            label: 'deep:flash-3' },
-  { kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 2000, thinkingLevel: 'medium' },   label: 'deep:3.1-fl' },
-  { kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 2000, thinkingBudget: 128 },       label: 'deep:2.5-pro-b128' },
-  { kind: 'gemini', model: FLASH_LITE_25_MODEL, opts: { maxOutputTokens: 2000, thinkingBudget: 512 },       label: 'deep:2.5-fl-b512' },
+  { kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 2000, thinkingBudget: 128 },              label: 'deep:2.5-pro-low' },
+  { kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 2000, thinkingLevel: 'medium' },          label: 'deep:3.1-fl-med' },
+  { kind: 'gemini', model: PRO_31_MODEL,        opts: { maxOutputTokens: 2000 },                                  label: 'deep:pro-3.1' },
+  { kind: 'gemini', model: FLASH_LITE_25_MODEL, opts: { maxOutputTokens: 2000, thinkingBudget: 512 },              label: 'deep:2.5-fl-b512' },
 ];
 
 export async function generateDeepResponse(prompt, systemInstruction, env, opts = {}) {
@@ -582,14 +614,17 @@ export async function generateDeepResponse(prompt, systemInstruction, env, opts 
 // ============================================================================
 //  CRISIS CASCADE — emotional / mental health conversational replies
 // ============================================================================
-// Chain (Roma 2026-05-14): Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro dyn → Kimi.
+// Chain (2026-05-15 conv_bench rebuild): 2.5 Pro low → 3.1 FL med → 2.5 FL b128 → Pro 3.1 → Kimi.
+// 2.5 Pro low scored 3.75 composite on crisis with 100% reliability — best reliable option.
+// Pro 3.1 demoted to Tier 4 as resilience anchor (returns empty on no-tools shapes but
+// works in production with tools attached).
 
 const CRISIS_TIERS = [
-  { kind: 'gemini', model: PRO_31_MODEL,        opts: { maxOutputTokens: 2000 },                          label: 'crisis:pro-3.1' },
-  { kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 2000 },                          label: 'crisis:flash-3' },
-  { kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 2000 },                          label: 'crisis:3.1-fl' },
-  { kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 2000, thinkingBudget: -1 },      label: 'crisis:2.5-pro-dyn' },
-  { kind: 'cf',     model: KIMI_MODEL,          opts: { maxOutputTokens: 2000 },                          label: 'crisis:kimi' },
+  { kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 2000, thinkingBudget: 128 },              label: 'crisis:2.5-pro-low' },
+  { kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 2000, thinkingLevel: 'medium' },          label: 'crisis:3.1-fl-med' },
+  { kind: 'gemini', model: FLASH_LITE_25_MODEL, opts: { maxOutputTokens: 2000, thinkingBudget: 128 },              label: 'crisis:2.5-fl-b128' },
+  { kind: 'gemini', model: PRO_31_MODEL,        opts: { maxOutputTokens: 2000 },                                  label: 'crisis:pro-3.1' },
+  { kind: 'cf',     model: KIMI_MODEL,          opts: { maxOutputTokens: 2000 },                                  label: 'crisis:kimi' },
 ];
 
 export async function generateCrisisResponse(prompt, systemInstruction, env, opts = {}) {

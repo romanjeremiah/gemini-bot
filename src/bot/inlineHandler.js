@@ -3,10 +3,8 @@
  * Allows users to type @BotUsername <query> in any chat
  * and get AI-generated responses they can send inline.
  *
- * Persona routing via prefix:
- *   @BotName write a witty reply        → Tenon (default)
- *   @BotName n: write a witty reply     → Nightfall
- *   @BotName t: write a witty reply     → Tribore
+ * Single persona: Xaridotis. (Legacy aliases tenon/nightfall/tribore
+ * were removed when the persona system was unified.)
  *
  * Uses Flash model for speed (inline results need to be fast).
  */
@@ -17,24 +15,6 @@ import { FALLBACK_TEXT_MODEL } from '../lib/ai/gemini';
 import * as telegram from '../lib/telegram';
 
 const INLINE_MODEL = FALLBACK_TEXT_MODEL;
-
-/**
- * Parse persona prefix from query.
- * Returns { personaKey, promptText }
- */
-function parsePersonaPrefix(query) {
-	const lower = query.toLowerCase();
-	if (lower.startsWith('t: ') || lower.startsWith('tribore: ')) {
-		return { personaKey: 'tribore', promptText: query.replace(/^(tribore|t):\s*/i, '') };
-	}
-	if (lower.startsWith('n: ') || lower.startsWith('nightfall: ')) {
-		return { personaKey: 'nightfall', promptText: query.replace(/^(nightfall|n):\s*/i, '') };
-	}
-	if (lower.startsWith('te: ') || lower.startsWith('tenon: ')) {
-		return { personaKey: 'tenon', promptText: query.replace(/^(tenon|te):\s*/i, '') };
-	}
-	return { personaKey: 'tenon', promptText: query };
-}
 
 /**
  * Handle an incoming inline_query update.
@@ -49,9 +29,9 @@ export async function handleInlineQuery(inlineQuery, env) {
 			type: 'article',
 			id: 'help',
 			title: 'Type a prompt to get a response...',
-			description: 'Prefixes: n: for Nightfall, t: for Tribore, or just type for Tenon',
+			description: 'Xaridotis will reply inline.',
 			input_message_content: {
-				message_text: '💡 Type your prompt after my username. Use n: or t: to switch persona.',
+				message_text: '💡 Type your prompt after my username.',
 			},
 		}], env, { cacheTime: 300 });
 		return;
@@ -59,10 +39,8 @@ export async function handleInlineQuery(inlineQuery, env) {
 
 	if (rawQuery.length < 3) return;
 
-	const { personaKey, promptText } = parsePersonaPrefix(rawQuery);
-	if (!promptText || !personas[personaKey]) return;
-
-	const persona = personas[personaKey];
+	const persona = personas.xaridotis;
+	if (!persona) return;
 
 	try {
 		// Direct API call (no gateway) for maximum speed
@@ -70,7 +48,7 @@ export async function handleInlineQuery(inlineQuery, env) {
 
 		const response = await ai.models.generateContent({
 			model: INLINE_MODEL,
-			contents: [{ role: 'user', parts: [{ text: promptText }] }],
+			contents: [{ role: 'user', parts: [{ text: rawQuery }] }],
 			config: {
 				systemInstruction: `${persona.instruction}\n\nYou are responding to an inline query in a Telegram chat. Keep your response concise (1-3 sentences max). Be witty, helpful, and on-point. Do not use HTML formatting. Do not use asterisks for emphasis.`,
 				temperature: 1.0,
@@ -96,7 +74,7 @@ export async function handleInlineQuery(inlineQuery, env) {
 
 		const results = [{
 			type: 'article',
-			id: `${personaKey}_${Date.now()}`,
+			id: `xaridotis_${Date.now()}`,
 			title: `${persona.name}'s Take`,
 			description: text.trim().slice(0, 100) + (text.length > 100 ? '...' : ''),
 			input_message_content: { message_text: text.trim() },

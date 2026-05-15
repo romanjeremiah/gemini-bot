@@ -4,27 +4,32 @@
 // evolved_traits + communication_notes columns with observations. Runs as part
 // of the daily 04:00 cron alongside style card consolidation.
 //
-// Architecture B+ (2026-05-14): uses Gemini 2.5 Flash-Lite (dynamic) for the
-// extraction. Llama 3.1 8B (the previous model) struggled with the structured
-// COMMUNICATION_NOTES + EVOLVED_TRAITS output, frequently mis-parsing. The
-// 2.5 GA Flash-Lite handles structured-output discipline cleanly and the
-// dynamic budget keeps latency reasonable for a daily cron job.
+// Roma cascade (2026-05-14):
+//   Gemma → Flash 3 → 3.1 Flash-Lite → Pro 3.1 default → 2.5 Pro GA
 //
 // SIGNAL SOURCES (in order of priority):
 //   1. Recent feedback memories (RLHF reactions — strongest signal)
 //   2. Recent insight memories (silent observations — medium signal)
 //   3. Recent pattern memories (clinical observations — contextual)
 //   4. Recent KV chat history (last 30 user turns from default thread)
-//
-// Previously read from chat_summaries which is never populated — produced
-// NULL evolved_traits forever. Now reads from data sources that actually exist.
 
-import { runCfAi } from '../lib/ai-gateway';
-import { geminiBackgroundGenerate } from '../lib/ai/gemini';
+import {
+	runCascade,
+	FLASH_3_MODEL,
+	FLASH_LITE_31_MODEL,
+	PRO_31_MODEL,
+	PRO_25_MODEL,
+	GEMMA_MODEL,
+} from '../lib/ai/gemini';
 import { getPersonaConfig, updatePersonaConfig } from './persona';
 
-const OBSERVATION_MODEL = 'gemini-2.5-flash-lite';
-const OBSERVATION_FALLBACK_MODEL = '@cf/meta/llama-3.1-8b-instruct'; // resilience fallback
+const EVOLUTION_TIERS = [
+	{ kind: 'cf',     model: GEMMA_MODEL,         opts: { maxOutputTokens: 700 },                       label: 'persona:gemma' },
+	{ kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 700 },                       label: 'persona:flash-3' },
+	{ kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 700 },                       label: 'persona:3.1-fl' },
+	{ kind: 'gemini', model: PRO_31_MODEL,        opts: { maxOutputTokens: 700 },                       label: 'persona:pro-3.1' },
+	{ kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 700, thinkingBudget: -1 },   label: 'persona:2.5-pro-ga' },
+];
 
 const EVOLUTION_PROMPT = `You are analysing recent interactions between a user and their AI companion to extract DURABLE observations.
 
@@ -66,18 +71,14 @@ If one section has no high-confidence content, write "NONE" under that header. I
 /**
  * Refresh evolved_traits and communication_notes for a user based on recent
  * data. Called from handleStyleCardConsolidation in index.js (04:00 cron).
- *
- * Idempotent: if there's nothing useful to add, leaves existing values unchanged.
  */
 export async function evolvePersona(env, userId) {
 	if (!env.AI || !env.DB) return;
 
-	// Pull from sources that actually have data (NOT chat_summaries).
 	const sevenDaysAgo = new Date(Date.now() - 7 * 86400 * 1000).toISOString().slice(0, 19).replace('T', ' ');
 	const signals = [];
 
 	try {
-		// Strongest signal: feedback memories from RLHF reactions
 		const { results: feedbacks } = await env.DB.prepare(
 			"SELECT fact, importance_score, created_at FROM memories WHERE user_id = ? AND category = 'feedback' AND created_at > ? ORDER BY importance_score DESC, created_at DESC LIMIT 15"
 		).bind(userId, sevenDaysAgo).all();
@@ -85,7 +86,6 @@ export async function evolvePersona(env, userId) {
 			signals.push(`[FEEDBACK imp=${f.importance_score}] ${f.fact}`);
 		}
 
-		// Medium signal: silent observations
 		const { results: insights } = await env.DB.prepare(
 			"SELECT fact, created_at FROM memories WHERE user_id = ? AND category = 'insight' AND fact LIKE 'Implicit:%' AND created_at > ? ORDER BY created_at DESC LIMIT 10"
 		).bind(userId, sevenDaysAgo).all();
@@ -93,7 +93,6 @@ export async function evolvePersona(env, userId) {
 			signals.push(`[OBSERVATION] ${i.fact}`);
 		}
 
-		// Contextual signal: clinical patterns
 		const { results: patterns } = await env.DB.prepare(
 			"SELECT fact, created_at FROM memories WHERE user_id = ? AND category = 'pattern' AND created_at > ? ORDER BY created_at DESC LIMIT 5"
 		).bind(userId, sevenDaysAgo).all();
@@ -105,8 +104,6 @@ export async function evolvePersona(env, userId) {
 		return;
 	}
 
-	// KV chat history: last 30 user turns from the default thread.
-	// Key shape: chat_${chatId}_${threadId}. For owner self-chat, chatId === userId.
 	try {
 		const rawHistory = await env.CHAT_KV.get(`chat_${userId}_default`, { type: 'json' });
 		if (Array.isArray(rawHistory)) {
@@ -124,7 +121,6 @@ export async function evolvePersona(env, userId) {
 	}
 
 	if (signals.length < 5) {
-		// Not enough signal yet — wait for more data
 		console.log(`🌱 Persona evolution skipped: only ${signals.length} signals (need 5+)`);
 		return;
 	}
@@ -137,33 +133,10 @@ export async function evolvePersona(env, userId) {
 
 	let text = null;
 	try {
-		// Primary: Gemini 2.5 Flash-Lite dynamic. Architecture B+ — best Gemini-
-		// family variant for structured-output discipline (73.0/108 overall,
-		// 11/12 on tagger Cat D).
-		text = await geminiBackgroundGenerate(env, OBSERVATION_MODEL, inputBlob, EVOLUTION_PROMPT, {
-			thinkingBudget: -1,
-			maxOutputTokens: 700,
-		});
+		text = await runCascade(env, inputBlob, EVOLUTION_PROMPT, EVOLUTION_TIERS);
 	} catch (err) {
-		console.warn('persona evolution: Gemini call failed:', err.message);
-	}
-
-	// Fallback: Llama 3.1 8B via CF (resilience anchor if Gemini errors).
-	if (!text && env.AI) {
-		try {
-			const result = await runCfAi(env.AI, OBSERVATION_FALLBACK_MODEL, {
-				messages: [
-					{ role: 'system', content: EVOLUTION_PROMPT },
-					{ role: 'user', content: inputBlob },
-				],
-				temperature: 0.5,
-				max_tokens: 700,
-			});
-			text = (result?.choices?.[0]?.message?.content || result?.response || '').trim();
-		} catch (err) {
-			console.warn('persona evolution: Llama fallback also failed:', err.message);
-			return;
-		}
+		console.warn('persona evolution: cascade failed:', err.message);
+		return;
 	}
 
 	if (!text) return;
@@ -173,7 +146,6 @@ export async function evolvePersona(env, userId) {
 		return;
 	}
 
-	// Parse the structured output. Each section is either a NONE or a list of bullets.
 	const notesMatch = text.match(/COMMUNICATION_NOTES:\s*([\s\S]*?)(?:EVOLVED_TRAITS:|$)/i);
 	const traitsMatch = text.match(/EVOLVED_TRAITS:\s*([\s\S]*?)$/i);
 

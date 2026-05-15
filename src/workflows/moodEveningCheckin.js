@@ -215,16 +215,24 @@ export class MoodEveningCheckinWorkflow extends WorkflowEntrypoint {
 				const sendRes = await telegram.sendMessage(chatId, threadId, ackText, env, null, btns);
 				const msgId = sendRes?.result?.message_id;
 
-				// Persist in chat history for downstream context.
-				const threadKey = `chat_${chatId}_${threadId}`;
-				let hist = await env.CHAT_KV.get(threadKey, { type: 'json' }) || [];
-				hist.push({ role: 'user', parts: [{ text: `[I just logged my mood as ${score}/10]` }] });
-				hist.push({ role: 'model', parts: [{ text: ackText }] });
-				if (hist.length > 24) hist = hist.slice(-24);
-				await env.CHAT_KV.put(threadKey, JSON.stringify(hist), { expirationTtl: 604800 });
-
+				// Mark the step as done IMMEDIATELY after the user-visible send. If anything
+				// below throws, a retry will see this marker and skip the re-send.
 				const result = { msgId, ackText };
 				await idemSet('process-score', result);
+
+				// Best-effort history persistence. Failure here must NOT cause the
+				// workflow step to retry, because the Telegram message has already gone out.
+				try {
+					const threadKey = `chat_${chatId}_${threadId}`;
+					let hist = await env.CHAT_KV.get(threadKey, { type: 'json' }) || [];
+					hist.push({ role: 'user', parts: [{ text: `[I just logged my mood as ${score}/10]` }] });
+					hist.push({ role: 'model', parts: [{ text: ackText }] });
+					if (hist.length > 24) hist = hist.slice(-24);
+					await env.CHAT_KV.put(threadKey, JSON.stringify(hist), { expirationTtl: 604800 });
+				} catch (histErr) {
+					console.warn('process-score: history persist failed (non-fatal):', histErr.message);
+				}
+
 				return result;
 			});
 			messageIds.emotionButtons = processResult.msgId;
@@ -296,18 +304,26 @@ export class MoodEveningCheckinWorkflow extends WorkflowEntrypoint {
 				}
 				await telegram.sendMessage(chatId, threadId, ackText, env);
 
-				// History persistence
-				const threadKey = `chat_${chatId}_${threadId}`;
-				let hist = await env.CHAT_KV.get(threadKey, { type: 'json' }) || [];
-				const label = emotions.length
-					? `[I selected emotions: ${emotions.join(', ')}]`
-					: '[I finished emotion selection without picking any]';
-				hist.push({ role: 'user', parts: [{ text: label }] });
-				hist.push({ role: 'model', parts: [{ text: ackText }] });
-				if (hist.length > 24) hist = hist.slice(-24);
-				await env.CHAT_KV.put(threadKey, JSON.stringify(hist), { expirationTtl: 604800 });
-
+				// Mark step as done IMMEDIATELY after the user-visible send. Retries
+				// after this point will see the marker and skip the re-send.
 				await idemSet('process-emotions', {});
+
+				// Best-effort history persistence. Failure here must NOT cause the
+				// workflow step to retry, because the Telegram message has already gone out.
+				try {
+					const threadKey = `chat_${chatId}_${threadId}`;
+					let hist = await env.CHAT_KV.get(threadKey, { type: 'json' }) || [];
+					const label = emotions.length
+						? `[I selected emotions: ${emotions.join(', ')}]`
+						: '[I finished emotion selection without picking any]';
+					hist.push({ role: 'user', parts: [{ text: label }] });
+					hist.push({ role: 'model', parts: [{ text: ackText }] });
+					if (hist.length > 24) hist = hist.slice(-24);
+					await env.CHAT_KV.put(threadKey, JSON.stringify(hist), { expirationTtl: 604800 });
+				} catch (histErr) {
+					console.warn('process-emotions: history persist failed (non-fatal):', histErr.message);
+				}
+
 				return {};
 			});
 		}

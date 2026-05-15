@@ -1,34 +1,64 @@
 /**
- * Cloudflare AI Service — lightweight edge models for background processing.
+ * Cloudflare AI Service — background processing layer.
  *
- * Architecture B+ (2026-05-14): the combined-evaluation bundle showed Gemini
- * 2.5 GA Flash-Lite at the top of the family for accuracy on background tasks
- * (73.0/108 on dynamic budget, 11/12 on tagger Cat D). We migrate most
- * background-task calls from Workers AI Llama / Gemma to Gemini 2.5 GA for
- * quality, while keeping GLM-4.7 and Llama as diversification fallbacks so
- * a Gemini outage does not take down memory consolidation or the tagger.
+ * Roma cascade assignments (2026-05-14):
+ *   - Conversation tagging (mode classifier): 3.1 FL preview thinkingLevel minimal (Tier 1)
+ *   - Triple extraction (knowledge graph SPO):  3.1 FL preview thinkingLevel medium (single tier)
+ *   - Mood entry tagging (clinical categories): 3.1 FL preview thinkingLevel minimal (single tier)
+ *   - Long summarisation (memory dedup):        Flash 3 → 3.1 FL → Kimi → 2.5 Pro b128 → Gemma
+ *   - Style card consolidation (04:00 cron):    Gemma → Flash 3 → 3.1 FL → Kimi
+ *   - Reaction interpretation (persona signal): Gemma → Flash 3 → 3.1 FL → Pro 3.1 default → 2.5 Pro GA
  *
- * Models referenced in this file:
- * - gemini-2.5-flash-lite (dynamic):  observation extraction, mood tagging, reaction interpretation
- * - gemini-2.5-flash (budget 8192):   long-context summarisation, memory dedup, style card
- * - gemini-3.1-flash-lite-preview (minimal): primary conversation-mode classifier (lowest latency)
- * - @cf/zai-org/glm-4.7-flash:        deep fallback for summarisation (131K context, vendor diversification)
- * - @cf/meta/llama-3.1-8b-instruct-fp8-fast: fallback tagger tier (resilience anchor)
- * - @cf/google/gemma-4-26b-a4b-it:    fallback tagger tier
+ * tagConversationMode retains its multi-tier fallback chain (Tier 1 is 3.1 FL
+ * minimal per Roma's spec; Tiers 2–4 are kept as resilience anchors so the
+ * routing classifier never returns null on Gemini outage).
  */
 
-import { geminiBackgroundGenerate } from '../lib/ai/gemini';
+import {
+	geminiBackgroundGenerate,
+	runCascade,
+	FLASH_3_MODEL,
+	FLASH_LITE_31_MODEL,
+	PRO_31_MODEL,
+	PRO_25_MODEL,
+	KIMI_MODEL,
+	GEMMA_MODEL,
+} from '../lib/ai/gemini';
 
 const MODELS = {
-	tiny: '@cf/meta/llama-3.2-1b-instruct',        // legacy reference; tagger tier now Gemini 3.1 FL minimal
-	balanced: '@cf/meta/llama-3.1-8b-instruct-fp8-fast', // legacy reference; retained as tagger fallback tier
-	context: '@cf/zai-org/glm-4.7-flash',           // diversification fallback for summarisation
-	tools: '@cf/google/gemma-4-26b-a4b-it',         // function calling: low-stakes tools (Phase 2)
+	tiny: '@cf/meta/llama-3.2-1b-instruct',                // legacy reference
+	balanced: '@cf/meta/llama-3.1-8b-instruct-fp8-fast',   // legacy reference; retained for tagger fallback
+	context: '@cf/zai-org/glm-4.7-flash',                  // legacy reference
+	tools: '@cf/google/gemma-4-26b-a4b-it',                // legacy reference
 };
 
+// Cascade definitions per Roma's spec.
+const SUMMARISATION_TIERS = [
+	{ kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 3000 },                       label: 'summ:flash-3' },
+	{ kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 3000 },                       label: 'summ:3.1-fl' },
+	{ kind: 'cf',     model: KIMI_MODEL,          opts: { maxOutputTokens: 3000 },                       label: 'summ:kimi' },
+	{ kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 3000, thinkingBudget: 128 }, label: 'summ:2.5-pro-b128' },
+	{ kind: 'cf',     model: GEMMA_MODEL,         opts: { maxOutputTokens: 3000 },                       label: 'summ:gemma' },
+];
+
+const STYLE_CARD_TIERS = [
+	{ kind: 'cf',     model: GEMMA_MODEL,         opts: { maxOutputTokens: 3000 },                       label: 'style:gemma' },
+	{ kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 3000 },                       label: 'style:flash-3' },
+	{ kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 3000 },                       label: 'style:3.1-fl' },
+	{ kind: 'cf',     model: KIMI_MODEL,          opts: { maxOutputTokens: 3000 },                       label: 'style:kimi' },
+];
+
+const REACTION_TIERS = [
+	{ kind: 'cf',     model: GEMMA_MODEL,         opts: { maxOutputTokens: 200 },                       label: 'reaction:gemma' },
+	{ kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 200 },                       label: 'reaction:flash-3' },
+	{ kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 200 },                       label: 'reaction:3.1-fl' },
+	{ kind: 'gemini', model: PRO_31_MODEL,        opts: { maxOutputTokens: 200 },                       label: 'reaction:pro-3.1' },
+	{ kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 200, thinkingBudget: -1 },   label: 'reaction:2.5-pro-ga' },
+];
+
 /**
- * Run a simple text completion on a CF AI model.
- * Returns the generated text or null on failure.
+ * Run a simple text completion on a CF AI model. Legacy helper kept for
+ * tagConversationMode fallback tiers. Returns text or null.
  */
 export async function cfAiGenerate(env, model, prompt, systemPrompt = '') {
 	if (!env.AI) return null;
@@ -49,12 +79,9 @@ export async function cfAiGenerate(env, model, prompt, systemPrompt = '') {
 
 
 /**
- * Extract observations from a conversation.
+ * Extract observations + knowledge-graph triples from a conversation exchange.
  *
- * Architecture B+: uses Gemini 2.5 Flash-Lite (dynamic) for nuanced observation
- * extraction. Triples (subject/predicate/object) need light reasoning that
- * Llama 8B handled adequately but Gemini 2.5 FL handles cleanly with better
- * structured output discipline.
+ * Roma cascade: gemini-3.1-flash-lite-preview · thinkingLevel: medium (single tier).
  */
 export async function extractObservation(env, userText, botResponse) {
 	const prompt = `You observed this exchange:
@@ -76,19 +103,17 @@ Examples: TRIPLE: Roman | enjoys | Coffee, TRIPLE: Gym | reduces | Anxiety
 If nothing new, respond: NOTHING_NEW`;
 	const sys = 'You are a silent observer. Be concise. Only note genuinely new information.';
 
-	// Primary: Gemini 2.5 FL dynamic
-	const gem = await geminiBackgroundGenerate(env, 'gemini-2.5-flash-lite', prompt, sys, { thinkingBudget: -1 });
-	if (gem) return gem;
-	// Fallback: Llama 8B via CF (resilience). Keeps the observer pipeline alive when Gemini errors.
-	return cfAiGenerate(env, MODELS.balanced, prompt, sys);
+	return geminiBackgroundGenerate(env, FLASH_LITE_31_MODEL, prompt, sys, {
+		thinkingLevel: 'medium',
+		maxOutputTokens: 600,
+	});
 }
 
 /**
  * Tag a mood entry with clinical categories.
  *
- * Architecture B+: uses Gemini 2.5 Flash-Lite (dynamic). The 1B Llama tagger
- * was over-tagging benign mood entries with clinical labels; 2.5 FL discriminates
- * baseline / mixed state / stable more reliably.
+ * Roma cascade: gemini-3.1-flash-lite-preview · thinkingLevel: minimal (single tier).
+ * Aligned with the conversation tagging classifier — same model, same tier.
  */
 export async function tagMoodEntry(env, score, emotions, note) {
 	const prompt = `Mood score: ${score}/10. Emotions: ${(emotions || []).join(', ')}. Note: ${(note || 'none').slice(0, 200)}.
@@ -99,18 +124,16 @@ depressive_episode, anxiety_state, hypomanic_signs, stable_baseline, mixed_state
 Respond with ONLY the tags, comma-separated. Example: anxiety_state, sleep_disruption`;
 	const sys = 'You are a clinical tagger. Return only tags, no explanation.';
 
-	const gem = await geminiBackgroundGenerate(env, 'gemini-2.5-flash-lite', prompt, sys, { thinkingBudget: -1, maxOutputTokens: 200 });
-	if (gem) return gem;
-	return cfAiGenerate(env, MODELS.tiny, prompt, sys);
+	return geminiBackgroundGenerate(env, FLASH_LITE_31_MODEL, prompt, sys, {
+		thinkingLevel: 'minimal',
+		maxOutputTokens: 200,
+	});
 }
 
 /**
  * First-pass memory deduplication.
  *
- * Architecture B+: tries Gemini 2.5 Flash (budget 8192) first — the 1M context
- * window handles bigger memory batches, and thinking budget 8192 was the best
- * Flash variant on synthesis tasks in our bundle (59.5/108 with 9/12 on D).
- * Falls back to GLM-4.7 via CF on failure (vendor diversification, 131K context).
+ * Roma cascade (Long summarisation): Flash 3 → 3.1 FL → Kimi → 2.5 Pro b128 → Gemma.
  */
 export async function deduplicateMemories(env, memories) {
 	if (!memories.length) return { groups: [], duplicates: [] };
@@ -134,14 +157,8 @@ GROUP: Coffee preferences: [2,9]
 If none found, write: DUPLICATES: none / CONTRADICTIONS: none`;
 	const sys = 'You are a data organiser. Be precise with indices. For contradictions, always list the OLDER memory first in each pair.';
 
-	// Primary: Gemini 2.5 Flash, budget 8192 (heavy reasoning for dedup decisions)
-	let result = await geminiBackgroundGenerate(env, 'gemini-2.5-flash', prompt, sys, { thinkingBudget: 8192, maxOutputTokens: 3000 });
-	// Fallback: GLM-4.7 via CF (vendor diversification, kept for resilience per Gap 3)
-	if (!result) {
-		result = await cfAiGenerate(env, MODELS.context, prompt, sys);
-	}
+	const result = await runCascade(env, prompt, sys, SUMMARISATION_TIERS);
 
-	// Parse the response
 	const duplicates = [];
 	const contradictions = [];
 	const groups = [];
@@ -153,7 +170,6 @@ If none found, write: DUPLICATES: none / CONTRADICTIONS: none`;
 			for (const p of pairs) duplicates.push([parseInt(p[1]), parseInt(p[2])]);
 		}
 
-		// Contradictions: [older, newer] — the older one should be removed
 		const contraMatch = result.match(/CONTRADICTIONS:\s*(.+)/);
 		if (contraMatch && !contraMatch[1].includes('none')) {
 			const pairs = contraMatch[1].matchAll(/\[(\d+),\s*(\d+)\]/g);
@@ -174,29 +190,15 @@ If none found, write: DUPLICATES: none / CONTRADICTIONS: none`;
 
 /**
  * Classify the conversational mode of the user's most recent message.
- * Returns { mode, confidence, source } where mode is one of:
- *   'venting' | 'processing' | 'transactional' | 'crisis'
  *
- * - venting: emotional discharge, looking to be heard, not asking for solutions
- * - processing: actively trying to understand or work through something, open to questions
- * - transactional: practical request (reminder, code, lookup, info)
- * - crisis: severe distress, suicidal ideation, dissociation, mood 0-1 territory
- *
- * Provider chain (Architecture B+ — 2026-05-14):
+ * Roma cascade (Routing classifier, Arch B only): 3.1 FL minimal (Tier 1).
+ * Multi-tier fallback retained as resilience anchor so the classifier never
+ * returns null on Gemini outage.
  *   Tier 1: Gemini 3.1 Flash-Lite preview, thinkingLevel='minimal' (cap 2500ms)
- *           Best accuracy/latency tradeoff in bundle (2571ms avg, 7.5/12 on E)
- *   Tier 2: Llama 3.1 8B via CF                (cap 1500ms) — resilience anchor
- *   Tier 3: Gemma 4 26B via CF                 (cap 3500ms) — reasoning fallback
- *   Tier 4: Gemini 3-flash-preview             (cap 2500ms) — reliable text fallback
- *   Floor:  Heuristic regex                    (instant)    — never null
- *
- * Order optimises for speed of correct classification first. Gemini 3.1 FL
- * minimal handles the easy 80% in <3s with the best accuracy in the family.
- * Llama 8B is the resilience anchor if Gemini errors. Gemma reasons through
- * nuance. Gemini Flash is the production-grade safety net. Heuristic floor
- * means the conversation-state block always has a mode.
- *
- * Total chain capped at 8000ms.
+ *   Tier 2: Llama 3.1 8B via CF                (cap 1500ms)
+ *   Tier 3: Gemma 4 26B via CF                 (cap 3500ms)
+ *   Tier 4: Gemini 3-flash-preview             (cap 2500ms)
+ *   Floor:  Heuristic regex                    (instant)
  */
 export async function tagConversationMode(env, userText, recentHistory = []) {
 	if (!userText || userText.length < 2) {
@@ -225,19 +227,15 @@ Respond with ONLY one word: venting, processing, transactional, or crisis.`;
 
 	const systemPrompt = 'You classify conversational modes. Output only one word.';
 
-	// Per-tier timeouts vary by model latency profile. Total chain budget
-	// 8000ms. If we burn the total budget on a slow tier, skip remaining
-	// tiers and drop to the heuristic floor.
 	const chainStartedAt = Date.now();
 	const TOTAL_CHAIN_BUDGET_MS = 8000;
 	const budgetLeft = () => Math.max(0, TOTAL_CHAIN_BUDGET_MS - (Date.now() - chainStartedAt));
 	const tierTimeout = (preferredMs) => Math.min(preferredMs, budgetLeft());
 
-	// Stop on first valid label.
 	let mode = null;
 	let source = null;
 
-	// Tier 1: Gemini 3.1 Flash-Lite preview, minimal thinking (Architecture B+ primary)
+	// Tier 1: Gemini 3.1 Flash-Lite preview, minimal thinking
 	if (!mode && env.GEMINI_API_KEY && budgetLeft() > 100) {
 		mode = await _tryProvider(
 			() => _classifyWithGemini31FLMinimal(env, prompt, systemPrompt),
@@ -246,7 +244,7 @@ Respond with ONLY one word: venting, processing, transactional, or crisis.`;
 		if (mode) source = 'gemini-3.1-fl-minimal';
 	}
 
-	// Tier 2: Llama 3.1 8B (resilience anchor — fast, free, very reliable)
+	// Tier 2: Llama 3.1 8B
 	if (!mode && env.AI && budgetLeft() > 100) {
 		mode = await _tryProvider(
 			() => _classifyWithLlama8B(env, prompt, systemPrompt),
@@ -255,7 +253,7 @@ Respond with ONLY one word: venting, processing, transactional, or crisis.`;
 		if (mode) source = 'llama-8b';
 	}
 
-	// Tier 3: Gemma 4 26B (accuracy via reasoning, but slower)
+	// Tier 3: Gemma 4 26B
 	if (!mode && env.AI && budgetLeft() > 100) {
 		mode = await _tryProvider(
 			() => _classifyWithGemma(env, prompt, systemPrompt),
@@ -264,7 +262,7 @@ Respond with ONLY one word: venting, processing, transactional, or crisis.`;
 		if (mode) source = 'gemma-4';
 	}
 
-	// Tier 4: Gemini Flash preview (production-grade text fallback)
+	// Tier 4: Gemini Flash 3 preview
 	if (!mode && env.GEMINI_API_KEY && budgetLeft() > 100) {
 		mode = await _tryProvider(
 			() => _classifyWithGemini(env, prompt, systemPrompt, '@gemini-flash'),
@@ -273,9 +271,6 @@ Respond with ONLY one word: venting, processing, transactional, or crisis.`;
 		if (mode) source = 'gemini-flash';
 	}
 
-	// Last-resort floor: heuristic-only. Better than null because the
-	// conversation-state block ALWAYS gets a mode — Gemini Pro never sees
-	// 'mode: unknown', which would invite hallucination.
 	if (!mode) {
 		mode = _heuristicGuess(userText);
 		source = 'heuristic-only';
@@ -305,10 +300,6 @@ async function _tryProvider(fn, timeoutMs) {
 		}
 		const mode = _extractMode(result);
 		if (!mode) {
-			// Surface the FULL raw response (up to 500 chars) so we can tell the
-			// difference between: (a) genuinely empty model output, (b) response
-			// shape mismatch where the answer is in an unexpected field, and
-			// (c) thinking-tokens consuming the entire max_tokens budget.
 			const rawType = typeof result;
 			const rawPreview = result === null ? '(null)'
 				: result === undefined ? '(undefined)'
@@ -326,12 +317,6 @@ async function _tryProvider(fn, timeoutMs) {
 
 async function _classifyWithGemma(env, prompt, systemPrompt) {
 	const { runCfAi } = await import('../lib/ai-gateway.js');
-	// max_tokens: 2000 — Gemma 4 26B reasons before answering, and that reasoning
-	// counts against this ceiling. Both 16 and 128 truncated mid-reasoning before
-	// the model could produce its one-word answer (finish_reason: "length").
-	// 2000 is generous; the model will hit its natural EOS far before this.
-	// The 1500ms tier wall-clock cap is the real safety limit; this is just
-	// the token budget upper bound.
 	const result = await runCfAi(env.AI, '@cf/google/gemma-4-26b-a4b-it', {
 		messages: [
 			{ role: 'system', content: systemPrompt },
@@ -340,8 +325,6 @@ async function _classifyWithGemma(env, prompt, systemPrompt) {
 		temperature: 0.2,
 		max_tokens: 2000,
 	});
-	// Try the standard fields first; if both empty, return the raw object so
-	// _tryProvider's no-parse log can show what shape actually came back.
 	const text = result?.choices?.[0]?.message?.content || result?.response;
 	return text || result;
 }
@@ -350,12 +333,8 @@ async function _classifyWithGemini(env, prompt, systemPrompt, modelTag) {
 	const { GoogleGenAI } = await import('@google/genai');
 	const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
 	const model = modelTag === '@gemini-flash'
-		? 'gemini-3-flash-preview'
-		: 'gemini-3.1-flash-lite-preview';
-	// maxOutputTokens: 2000 — same reasoning as Gemma. Gemini 3.x preview
-	// models have internal thinking budgets that consume output tokens before
-	// the visible answer. 16 and 128 both hit length limit. The 1500ms tier
-	// wall-clock cap is the real safety limit; this is just the token budget.
+		? FLASH_3_MODEL
+		: FLASH_LITE_31_MODEL;
 	const response = await ai.models.generateContent({
 		model,
 		contents: [{ role: 'user', parts: [{ text: prompt }] }],
@@ -365,12 +344,6 @@ async function _classifyWithGemini(env, prompt, systemPrompt, modelTag) {
 			maxOutputTokens: 2000,
 		},
 	});
-	// Prefer the SDK's stable .text accessor (newer @google/genai versions
-	// expose this as a getter that aggregates all text parts and ignores
-	// thought/tool parts). Fall back to manual parts walking for older SDK
-	// versions. If both fail, return the raw response so _tryProvider's
-	// no-parse log can show what came back — e.g. blockReason, sdkHttpResponse
-	// wrapper, or all-thoughts content.
 	let text = '';
 	if (typeof response?.text === 'string') {
 		text = response.text;
@@ -387,10 +360,6 @@ async function _classifyWithGemini(env, prompt, systemPrompt, modelTag) {
 }
 
 async function _classifyWithLlama8B(env, prompt, systemPrompt) {
-	// Llama 3.1 8B is the resilience anchor: fast, reliable, accurate enough
-	// for nuanced classification without the reasoning overhead of Gemma 4.
-	// Direct env.AI.run (no gateway) keeps the call cheap and isolates this
-	// from gateway-side failures.
 	const result = await env.AI.run(MODELS.balanced, {
 		messages: [
 			{ role: 'system', content: systemPrompt },
@@ -404,18 +373,10 @@ async function _classifyWithLlama8B(env, prompt, systemPrompt) {
 }
 
 async function _classifyWithGemini31FLMinimal(env, prompt, systemPrompt) {
-	// Architecture B+ primary tagger: Gemini 3.1 Flash-Lite preview with
-	// thinkingLevel='minimal'. Bundle benchmarks showed 2571ms avg / 7.5/12
-	// on routing-class scenarios (Cat E) — the best speed/accuracy point in
-	// the entire Gemini family for one-word classifier output.
-	//
-	// minimal thinking still produces a small thinking budget; we keep
-	// maxOutputTokens generous (2000) because preview models occasionally
-	// burn the budget on thoughts before the visible answer.
 	const { GoogleGenAI } = await import('@google/genai');
 	const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
 	const response = await ai.models.generateContent({
-		model: 'gemini-3.1-flash-lite-preview',
+		model: FLASH_LITE_31_MODEL,
 		contents: [{ role: 'user', parts: [{ text: prompt }] }],
 		config: {
 			systemInstruction: systemPrompt,
@@ -447,9 +408,6 @@ function _extractMode(rawText) {
 
 // ---- Heuristic confidence layer ----
 
-// Rough features extracted from the message itself. These are the signals
-// any decent classifier would also use — they let us check whether the model
-// agrees with the obvious surface-level reading.
 function _messageFeatures(text) {
 	const t = (text || '').toLowerCase();
 	return {
@@ -464,7 +422,6 @@ function _messageFeatures(text) {
 	};
 }
 
-// Local heuristic-only mode guess. Used when every provider fails.
 function _heuristicGuess(text) {
 	const f = _messageFeatures(text);
 	if (f.hasCrisisKeyword) return 'crisis';
@@ -474,10 +431,6 @@ function _heuristicGuess(text) {
 	return 'transactional';
 }
 
-// Confidence reflects whether the heuristics AGREE with the model's pick.
-// 'high'   = strong corroborating signal (e.g. crisis label + crisis keyword)
-// 'medium' = no strong contradiction
-// 'low'    = surface features point a different direction OR floor was used
 function _computeConfidence(text, mode, source) {
 	if (source === 'heuristic-only') return 'low';
 
@@ -487,24 +440,24 @@ function _computeConfidence(text, mode, source) {
 		case 'crisis':
 			if (f.hasCrisisKeyword) return 'high';
 			if (f.hasEmotionalKeyword) return 'medium';
-			return 'low'; // crisis label without crisis keywords is suspicious
+			return 'low';
 
 		case 'venting':
 			if (f.hasEmotionalKeyword && !f.hasQuestion) return 'high';
 			if (f.hasRepeatedThought || f.hasEmotionalKeyword) return 'medium';
-			if (f.hasTransactionalKeyword) return 'low'; // probably wrong
+			if (f.hasTransactionalKeyword) return 'low';
 			return 'medium';
 
 		case 'processing':
 			if (f.hasProcessingKeyword && f.hasQuestion) return 'high';
 			if (f.hasQuestion || f.hasProcessingKeyword) return 'medium';
-			if (f.isShort && !f.hasQuestion) return 'low'; // short non-question rarely processing
+			if (f.isShort && !f.hasQuestion) return 'low';
 			return 'medium';
 
 		case 'transactional':
 			if (f.hasTransactionalKeyword) return 'high';
 			if (f.isShort && !f.hasEmotionalKeyword) return 'medium';
-			if (f.hasEmotionalKeyword || f.hasCrisisKeyword) return 'low'; // probably wrong
+			if (f.hasEmotionalKeyword || f.hasCrisisKeyword) return 'low';
 			return 'medium';
 
 		default:
@@ -514,18 +467,9 @@ function _computeConfidence(text, mode, source) {
 
 
 /**
- * Interpret a user's emoji reaction in the context of the bot message they reacted to.
- * Returns a short feedback insight or null if the reaction carries no useful signal.
+ * Interpret a user's emoji reaction in the context of the bot message.
  *
- * Architecture B+: uses Gemini 2.5 Flash-Lite (dynamic) for emoji-semantic
- * nuance. Falls back to Llama 8B via CF on failure. The 1B Llama tagger
- * struggled with emoji intent; 2.5 FL handles reaction-tone disambiguation
- * cleanly.
- *
- * @param {object} env - Worker env with AI binding
- * @param {string} emoji - The reaction emoji (e.g. '👍', '🤔', '💯')
- * @param {string} botMessageText - Plain text of the message that was reacted to
- * @returns {Promise<{insight: string, sentiment: 'positive'|'negative'|'neutral'} | null>}
+ * Roma cascade (Persona evolution observations): Gemma → Flash 3 → 3.1 FL → Pro 3.1 default → 2.5 Pro GA.
  */
 export async function interpretReaction(env, emoji, botMessageText) {
 	if (!emoji || !botMessageText) return null;
@@ -546,15 +490,10 @@ Example: "User found the lecturing repetitive"
 If the reaction is ambiguous or carries no useful signal, respond with exactly: SKIP`;
 	const sys = 'You extract communication preferences from user reactions. Be specific about HOW the user prefers the bot to communicate, not what the topic was. Return ONE line only.';
 
-	// Primary: Gemini 2.5 FL dynamic
-	let response = await geminiBackgroundGenerate(env, 'gemini-2.5-flash-lite', prompt, sys, { thinkingBudget: -1, maxOutputTokens: 200 });
-	if (!response) {
-		response = await cfAiGenerate(env, MODELS.balanced, prompt, sys);
-	}
+	const response = await runCascade(env, prompt, sys, REACTION_TIERS);
 
 	if (!response || response.trim() === 'SKIP') return null;
 
-	// Take the first non-empty line, clean it up
 	const insight = response
 		.split('\n')
 		.map(l => l.trim())
@@ -562,7 +501,6 @@ If the reaction is ambiguous or carries no useful signal, respond with exactly: 
 
 	if (!insight || !/^user\s/i.test(insight)) return null;
 
-	// Quick sentiment classification from the insight wording
 	const lower = insight.toLowerCase();
 	const negative = /(dislike|disliked|found.+(repetitive|annoying|robotic|clinical)|too\s(long|much|clinical)|complained|preferred\s(less|shorter)|criticised|criticized)/;
 	const positive = /(liked|appreciated|enjoyed|loved|found.+(helpful|natural|warm)|preferred\s(more|this)|welcomed)/;
@@ -577,18 +515,9 @@ If the reaction is ambiguous or carries no useful signal, respond with exactly: 
 
 /**
  * Consolidate feedback memories into an updated style card.
- * Takes the current style card + new feedback signals and produces
- * an updated style card that incorporates the learned preferences.
  *
- * Architecture B+: uses Gemini 2.5 Flash (budget 8192) for the consolidation
- * reasoning, with GLM-4.7 via CF as a vendor-diversification fallback. Style
- * card consolidation runs once nightly at 04:00 London — latency is not a
- * constraint, quality is.
- *
- * @param {object} env - Worker env with AI binding
- * @param {string} currentStyleCard - The current style card text
- * @param {string[]} feedbackInsights - Array of feedback insights from reactions
- * @returns {Promise<string|null>} Updated style card or null on failure
+ * Roma cascade (Style card consolidation, daily 04:00 cron):
+ *   Gemma → Flash 3 → 3.1 FL → Kimi.
  */
 export async function consolidateStyleCard(env, currentStyleCard, feedbackInsights) {
 	if (!feedbackInsights.length) return null;
@@ -614,16 +543,10 @@ RULES:
 - Return ONLY the updated style card text.`;
 	const sys = 'You update style cards by integrating user feedback. Return only the updated style card, no commentary.';
 
-	// Primary: Gemini 2.5 Flash, budget 8192 (heavy reasoning for integration decisions)
-	let result = await geminiBackgroundGenerate(env, 'gemini-2.5-flash', prompt, sys, { thinkingBudget: 8192, maxOutputTokens: 3000 });
-	// Fallback: GLM-4.7 via CF (vendor diversification)
-	if (!result && env.AI) {
-		result = await cfAiGenerate(env, MODELS.context, prompt, sys);
-	}
+	const result = await runCascade(env, prompt, sys, STYLE_CARD_TIERS);
 
 	if (!result || result.length < 100) return null;
 
-	// Clean any markdown wrapping the AI might add
 	return result.replace(/^```[\s\S]*?\n/, '').replace(/\n```\s*$/, '').trim();
 }
 

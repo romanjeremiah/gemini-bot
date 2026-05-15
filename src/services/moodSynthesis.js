@@ -2,47 +2,40 @@
 //
 // Fires once at the END of a mood check-in, after all data is collected
 // (score, emotions, activities, sleep, photo-or-skipped). This is the ONE
-// AI call per check-in that earns Pro-tier resilience: it produces the
-// therapeutic observation that connects today's data to past patterns.
+// AI call per check-in that produces the therapeutic observation that
+// connects today's data to past patterns.
 //
-// Architecture B+ cascade (2026-05-14):
-//   Tier 1: gemini-2.5-pro, thinkingBudget=128       (15s) — best at synthesis (68/108, 11.5/15 on Cat C)
-//   Tier 2: gemini-2.5-flash-lite, thinkingBudget=512 (15s) — best mental health quality (73.5/108, 12/15 on Cat C)
-//   Tier 3: gemini-2.5-flash, thinkingBudget=8192    (15s) — alternative summariser, faster
-//   Tier 4: @cf/zai-org/glm-4.7-flash via CF         (15s) — vendor diversification (resilience hedge)
-//   Tier 5: fixed warm fallback text                  (instant)
-//
-// Worst case before fixed text: 60s. Realistic case: Tier 1 succeeds in
-// 4-10s. Each tier uses error-feedback first, timeout as silent-hang safety
-// net.
-//
-// Why this ordering: bundle data shows 2.5 Pro b128 is best at therapeutic
-// synthesis (highest on Cat C inside the Pro tier with the lowest latency),
-// 2.5 Flash-Lite b512 is the best non-Pro on Cat C in the entire family, and
-// 2.5 Flash b8192 is faster than both while still capable. GLM is kept as
-// the final non-Google fallback so a Google-wide outage doesn't kill synthesis.
+// Roma cascade (2026-05-14):
+//   Gemma → Flash 3 → 3.1 Flash-Lite → Pro 3.1 default → 2.5 Pro GA
 //
 // Synthesis-readiness check: maybeFireSynthesis() only checks whether sleep
-// has been logged today (across any entry_type). Score/emotions/activities/
-// photo are guaranteed by the call-site invariant — the photo handler is
-// the synthesis trigger, and reaching the photo handler means the user has
-// already walked poll → emotions → activities Done → photo step in order.
+// has been logged today. Score/emotions/activities/photo are guaranteed by
+// the call-site invariant.
 
 import * as moodStore from './moodStore';
 import * as episodeStore from './episodeStore';
 import * as vectorStore from './vectorStore';
-import { runCfAi } from '../lib/ai-gateway';
-import { geminiBackgroundGenerate } from '../lib/ai/gemini';
+import {
+	runCascade,
+	FLASH_3_MODEL,
+	FLASH_LITE_31_MODEL,
+	PRO_31_MODEL,
+	PRO_25_MODEL,
+	GEMMA_MODEL,
+} from '../lib/ai/gemini';
 import { getCheckinTiming } from '../lib/moodFlow';
 import { MOOD_POLL_OPTIONS } from '../config/moodScale';
 import { log } from '../lib/logger';
 
-// Cascade configuration. Tuples of [tier label, runner function, timeout ms].
-const CASCADE = [
-	['gemini-2.5-pro-b128',          runGemini25ProTier,        15000],
-	['gemini-2.5-flash-lite-b512',   runGemini25FlashLiteTier,  15000],
-	['gemini-2.5-flash-b8192',       runGemini25FlashTier,      15000],
-	['glm-4.7-flash',                runGlmTier,                15000],
+// Roma cascade for end-of-flow synthesis.
+// Generous token budget (2000) so the synthesis can connect patterns properly.
+// Pro 3.1 default = no thinking config; 2.5 Pro GA = dynamic thinking budget.
+const SYNTHESIS_TIERS = [
+	{ kind: 'cf',     model: GEMMA_MODEL,         opts: { maxOutputTokens: 2000 },                       label: 'synth:gemma' },
+	{ kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 2000 },                       label: 'synth:flash-3' },
+	{ kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 2000 },                       label: 'synth:3.1-fl' },
+	{ kind: 'gemini', model: PRO_31_MODEL,        opts: { maxOutputTokens: 2000 },                       label: 'synth:pro-3.1' },
+	{ kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 2000, thinkingBudget: -1 },   label: 'synth:2.5-pro-ga' },
 ];
 
 const FIXED_FALLBACK_TEXT = 'Logged for tonight. We can talk through it whenever you are ready.';
@@ -50,18 +43,6 @@ const FIXED_FALLBACK_TEXT = 'Logged for tonight. We can talk through it whenever
 /**
  * Run the end-of-flow synthesis cascade.
  *
- * Pulls today's combined mood data (across all entry_types), 30 days of
- * history, episodes, therapeutic notes, and semantic context. Walks the
- * 6-tier cascade. Returns the synthesis text, or FIXED_FALLBACK_TEXT if
- * every AI tier fails.
- *
- * Never throws. Caller is expected to send the returned text directly
- * to Telegram.
- *
- * @param {object} env             Worker env
- * @param {number} userId          Telegram user id
- * @param {number} startedAtMs     Flow started_at timestamp (for period label)
- * @param {string} systemPrompt    Persona instruction
  * @returns {Promise<{text: string, source: string, ms: number}>}
  */
 export async function runSynthesisCascade(env, userId, startedAtMs, systemPrompt) {
@@ -73,53 +54,20 @@ export async function runSynthesisCascade(env, userId, startedAtMs, systemPrompt
 	const dataBlock = await buildSynthesisDataBlock(env, userId, today, period);
 	const prompt = composeSynthesisPrompt(period, dataBlock);
 
-	for (const [label, runner, timeoutMs] of CASCADE) {
-		const tierStart = Date.now();
-		const text = await runTier(runner, env, prompt, systemPrompt, timeoutMs, label);
-		if (text) {
-			const ms = Date.now() - t0;
-			log.info('mood_synthesis_tier_ok', { userId, tier: label, tierMs: Date.now() - tierStart, totalMs: ms });
-			return { text, source: label, ms };
-		}
+	const text = await runCascade(env, prompt, systemPrompt, SYNTHESIS_TIERS);
+	const ms = Date.now() - t0;
+	if (text) {
+		log.info('mood_synthesis_done', { userId, totalMs: ms, len: text.length });
+		return { text, source: 'cascade', ms };
 	}
 
-	const ms = Date.now() - t0;
 	log.warn('mood_synthesis_cascade_exhausted', { userId, totalMs: ms });
 	return { text: FIXED_FALLBACK_TEXT, source: 'static', ms };
 }
 
 /**
  * Check whether today's mood check-in can complete and, if so, enqueue the
- * final synthesis task. Idempotent — uses a KV guard
- * (`mood_synthesis_fired_${chatId}_${date}`) to ensure the task fires at most
- * once per chat per day.
- *
- * Called from exactly two places:
- *   1. Photo upload handler / photo skip handler — by the time we get here,
- *      score / emotions / activities / photo are guaranteed answered this
- *      run (the user walked poll → emotions Done → activities Done → photo
- *      step in order). The only thing left to check is whether sleep is
- *      already in today's data; if not, the caller sends a prose sleep ask
- *      instead of firing synthesis.
- *   2. logMoodEntryTool.execute — fires after the user replies with sleep
- *      hours in prose. By this point sleep IS in today's data, so this
- *      call always returns ready=true (assuming the user did walk the flow).
- *
- * The check that gates firing is therefore minimal: do today's rows contain
- * any sleep_hours? If yes, fire. If no, return false so the caller can ask
- * for sleep.
- *
- * NOTE on activities + photo: we deliberately do NOT day-level check those
- * pieces. The previous implementation did, which meant /mood would skip
- * activities and photo if today already had them. That was wrong — the user
- * may have new activities or another photo to add. The keyboards already
- * support add/remove against today's existing items.
- *
- * @param {object} env       Worker env
- * @param {number} chatId    Telegram chat id
- * @param {number} userId    Telegram user id (often equals chatId)
- * @param {number|string} threadId  Telegram message_thread_id
- * @returns {Promise<boolean>}  True if synthesis was enqueued, false otherwise
+ * final synthesis task. Idempotent via KV guard.
  */
 export async function maybeFireSynthesis(env, chatId, userId, threadId) {
 	if (!chatId || !userId) return false;
@@ -128,13 +76,10 @@ export async function maybeFireSynthesis(env, chatId, userId, threadId) {
 		const today = moodStore.todayLondon();
 		const guardKey = `mood_synthesis_fired_${chatId}_${today}`;
 
-		// Guard: only fire once per day per chat.
 		if (await env.CHAT_KV.get(guardKey)) {
 			return false;
 		}
 
-		// Sleep is the only piece we check day-level. Score/emotions/activities/
-		// photo are guaranteed by the call-site invariant (see docstring).
 		const hasSleep = await moodStore.hasSleepLoggedToday(env, userId, today);
 		if (!hasSleep) {
 			log.info('mood_synthesis_waiting_for_sleep', { chatId, userId });
@@ -149,9 +94,6 @@ export async function maybeFireSynthesis(env, chatId, userId, threadId) {
 		const moodFlow = await import('../lib/moodFlow');
 		const flow = await moodFlow.getFlow(env, chatId);
 
-		// Set the guard BEFORE enqueueing to avoid double-fire if two advance
-		// points race (e.g. activities-done and photo-skip happen in quick
-		// succession). 26h TTL covers any retry window.
 		await env.CHAT_KV.put(guardKey, '1', { expirationTtl: 26 * 3600 });
 
 		await env.TASK_QUEUE.send({
@@ -172,19 +114,10 @@ export async function maybeFireSynthesis(env, chatId, userId, threadId) {
 
 // ---- Data assembly ----
 
-/**
- * Build the data block injected into the synthesis prompt. Pulls today's
- * combined data, 7-day history, recent episodes, therapeutic notes, and
- * semantic context.
- *
- * Returns a single string ready to drop into the prompt template.
- */
 async function buildSynthesisDataBlock(env, userId, today, period) {
-	// Today's combined data (across all entry_types)
 	const dayEntries = await moodStore.getDayEntries(env, userId, today).catch(() => []);
 	const todayCombined = combineDayEntries(dayEntries);
 
-	// 7-day evening history
 	const recent = await moodStore.getHistory(env, userId, 7, 'evening').catch(() => []);
 	const recentBlock = recent.length
 		? recent.slice(0, 7).map((row) => {
@@ -199,14 +132,12 @@ async function buildSynthesisDataBlock(env, userId, today, period) {
 		}).join('\n')
 		: 'No prior history on file.';
 
-	// Episodes (filter by today's emotions if available)
 	const episodeQueryEmotions = todayCombined.emotions;
 	const episodes = episodeQueryEmotions.length
 		? await episodeStore.getEpisodesByEmotion(env, userId, episodeQueryEmotions, 5).catch(() => [])
 		: await episodeStore.getRecentEpisodes(env, userId, 5).catch(() => []);
 	const episodeCtx = episodeStore.formatEpisodesForContext(episodes) || 'No past episodes to reference.';
 
-	// Therapeutic notes
 	const therapeuticNotes = await env.DB.prepare(
 		`SELECT category, fact FROM memories
 		 WHERE user_id = ? AND category IN ('pattern','trigger','schema','insight','homework','growth')
@@ -216,7 +147,6 @@ async function buildSynthesisDataBlock(env, userId, today, period) {
 		? therapeuticNotes.map((n) => `- [${n.category}] ${n.fact}`).join('\n')
 		: 'No therapeutic notes on file yet.';
 
-	// Semantic context based on today's emotions
 	const semanticQuery = todayCombined.emotions.join(' ') || 'mood emotions feelings';
 	const semanticCtx = await vectorStore.getSemanticContext(env, userId, semanticQuery).catch(() => '');
 
@@ -234,14 +164,6 @@ async function buildSynthesisDataBlock(env, userId, today, period) {
 	};
 }
 
-/**
- * Combine all of today's rows into a single picture. Fields:
- *   - score:    first non-null mood_score found
- *   - emotions: union across all rows, deduped
- *   - activities: union across all rows, deduped
- *   - sleep:    first non-null sleep_hours found
- *   - photoNote: human-friendly photo description, or null
- */
 function combineDayEntries(dayEntries) {
 	const out = {
 		score: null,
@@ -294,10 +216,6 @@ function combineDayEntries(dayEntries) {
 	return out;
 }
 
-/**
- * Compose the final synthesis prompt from the assembled data block.
- * Minimal instructions; the data block + role description does the work.
- */
 function composeSynthesisPrompt(period, data) {
 	const todayLines = [
 		`- Mood score: ${data.todayScore !== null ? data.todayScore + '/10' : 'not recorded'}`,
@@ -319,110 +237,14 @@ function composeSynthesisPrompt(period, data) {
 		sections.push(`Related themes from past conversations:\n${data.semanticCtx}`);
 	}
 
-	sections.push('Respond as a supportive and understanding friend who notices patterns and helps him think.');
+	sections.push(
+		'Respond as a supportive and understanding friend who notices patterns and helps him think. ' +
+		'CRITICAL: only reference emotions Roman recorded TODAY. The 7-day history is for trend context, ' +
+		'not for naming today\'s state — do not invent or mix in emotions from other days.'
+	);
 	sections.push('If anything in the data suggests immediate safety concern, end your message with these helplines on a new line: Samaritans 116 123, SHOUT text 85258, NHS 111.');
 
 	return sections.join('\n\n');
-}
-
-// ---- Cascade machinery ----
-
-/**
- * Run one tier with mixed error-feedback + timeout. Returns response text
- * on success, null on any failure. Never throws.
- */
-async function runTier(runner, env, prompt, systemPrompt, timeoutMs, label) {
-	const t0 = Date.now();
-	let didTimeout = false;
-	try {
-		const result = await Promise.race([
-			runner(env, prompt, systemPrompt),
-			new Promise((resolve) => setTimeout(() => {
-				didTimeout = true;
-				resolve(null);
-			}, timeoutMs)),
-		]);
-
-		const elapsed = Date.now() - t0;
-		if (didTimeout) {
-			log.warn('mood_synthesis_tier_timeout', { tier: label, ms: elapsed, capMs: timeoutMs });
-			return null;
-		}
-
-		const text = (typeof result === 'string') ? result : '';
-		if (!text || !text.trim()) {
-			log.warn('mood_synthesis_tier_empty', { tier: label, ms: elapsed });
-			return null;
-		}
-
-		return text.trim();
-	} catch (err) {
-		const elapsed = Date.now() - t0;
-		log.warn('mood_synthesis_tier_error', {
-			tier: label,
-			ms: elapsed,
-			msg: (err?.message || '').slice(0, 200),
-		});
-		return null;
-	}
-}
-
-async function runGemini25ProTier(env, prompt, systemPrompt) {
-	// Tier 1: Gemini 2.5 Pro, thinkingBudget 128.
-	// Bundle data: 68/108 overall, 11.5/15 on Cat C, 3.7s avg — the best Pro
-	// variant on this workload. Higher budgets (8192, 24576) underperformed.
-	const text = await geminiBackgroundGenerate(env, 'gemini-2.5-pro', prompt, systemPrompt, {
-		thinkingBudget: 128,
-		maxOutputTokens: 1500,
-	});
-	return text || '';
-}
-
-async function runGemini25FlashLiteTier(env, prompt, systemPrompt) {
-	// Tier 2: Gemini 2.5 Flash-Lite, thinkingBudget 512.
-	// Bundle data: 73.5/108 overall (best in Gemini family), 12/15 on Cat C
-	// (highest mental-health score across all tested variants).
-	const text = await geminiBackgroundGenerate(env, 'gemini-2.5-flash-lite', prompt, systemPrompt, {
-		thinkingBudget: 512,
-		maxOutputTokens: 1500,
-	});
-	return text || '';
-}
-
-async function runGemini25FlashTier(env, prompt, systemPrompt) {
-	// Tier 3: Gemini 2.5 Flash, thinkingBudget 8192.
-	// Bundle data: 59.5/108, 2883ms avg, 9/12 on Cat D. Faster than Pro b128
-	// when latency matters more than absolute synthesis quality.
-	const text = await geminiBackgroundGenerate(env, 'gemini-2.5-flash', prompt, systemPrompt, {
-		thinkingBudget: 8192,
-		maxOutputTokens: 1500,
-	});
-	return text || '';
-}
-
-async function runGlmTier(env, prompt, systemPrompt) {
-	// Tier 4: GLM-4.7-Flash via Cloudflare AI.
-	// Vendor diversification fallback per Gap 3 in the Architecture B+ analysis.
-	// If Google has an outage, GLM runs on Cloudflare's infrastructure and keeps
-	// synthesis available. 131K context, ~25 neurons/call.
-	if (!env.AI) return '';
-	const messages = [];
-	if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
-	messages.push({ role: 'user', content: prompt });
-	const result = await runCfAi(env.AI, '@cf/zai-org/glm-4.7-flash',
-		{ messages, max_tokens: 1500 },
-		{ headers: { 'x-session-affinity': 'xaridotis-mood-synth' } }
-	);
-	return extractWorkersAiText(result);
-}
-
-function extractWorkersAiText(result) {
-	if (!result) return '';
-	if (typeof result === 'string') return result;
-	if (typeof result.response === 'string') return result.response;
-	const choice = result.choices?.[0]?.message?.content;
-	if (typeof choice === 'string') return choice;
-	return '';
 }
 
 export { FIXED_FALLBACK_TEXT };

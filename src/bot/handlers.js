@@ -1,7 +1,7 @@
 import { personas, FORMATTING_RULES, MENTAL_HEALTH_DIRECTIVE, SECOND_BRAIN_DIRECTIVE } from '../config/personas';
 import { stripLeakedThoughts } from '../lib/formatter';
 import { MOOD_POLL_OPTIONS } from '../config/moodScale';
-import { createChat, sendChatMessage, sendChatMessageStream, generateImage, setupCache, PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, FLASH_LITE_TEXT_MODEL, generateShortResponse, generateWithFallback, generateDeepResponse, StreamIdleError } from '../lib/ai/gemini';
+import { createChat, sendChatMessage, sendChatMessageStream, generateImage, setupCache, PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, FLASH_LITE_TEXT_MODEL, FLASH_3_MODEL, FLASH_LITE_31_MODEL, FLASH_LITE_25_MODEL, PRO_31_MODEL, PRO_25_MODEL, generateShortResponse, generateWithFallback, generateDeepResponse, StreamIdleError } from '../lib/ai/gemini';
 import { routeMessage, createProvider } from '../ai/router';
 import { detectComplexTask, isSimpleMessage } from '../ai/complexity';
 import { CF_MODELS, MAX_TOOL_ROUNDS } from '../config/models';
@@ -1947,13 +1947,44 @@ export async function handleMessage(msg, env) {
 				err_msg: errMsg.slice(0, 200),
 			});
 
-			if (isRetryable && (textModel === PRIMARY_TEXT_MODEL || textModel === FLASH_LITE_TEXT_MODEL)) {
-				const fromTier = textModel === PRIMARY_TEXT_MODEL ? 'pro' : 'flash_lite';
+			// Roma cascade (2026-05-14): walk the appropriate model cascade on retryable failure.
+			// Main convo lane:  Flash 3 → 3.1 FL → 2.5 FL dyn → Pro 3.1 medium → Kimi(*) → Gemma(*)
+			// Crisis lane:      Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro dyn → Kimi(*)
+			// (*) CF tiers — skipped here because handlers.js streaming is Gemini-only;
+			//     if all Gemini tiers exhausted we fall through to throw.
+			const isCrisisLane = !!(route && /^(mode_crisis|multimodal_input|checkin_with_emotion|emotional_content|complex_task)$/.test(route.reason || ''));
+			const MAIN_CASCADE = [
+				{ model: FLASH_3_MODEL,       opts: {} },
+				{ model: FLASH_LITE_31_MODEL, opts: {} },
+				{ model: FLASH_LITE_25_MODEL, opts: { thinkingBudget: -1 } },
+				{ model: PRO_31_MODEL,        opts: { thinkingLevel: 'medium' } },
+			];
+			const CRISIS_CASCADE = [
+				{ model: PRO_31_MODEL,        opts: {} },
+				{ model: FLASH_3_MODEL,       opts: {} },
+				{ model: FLASH_LITE_31_MODEL, opts: {} },
+				{ model: PRO_25_MODEL,        opts: { thinkingBudget: -1 } },
+			];
+			const cascade = isCrisisLane ? CRISIS_CASCADE : MAIN_CASCADE;
+			const currentIdx = cascade.findIndex(t => t.model === textModel);
+			const nextTier = currentIdx >= 0 && currentIdx < cascade.length - 1 ? cascade[currentIdx + 1] : null;
+
+			if (isRetryable && nextTier) {
 				const reasonLabel = isIdle ? 'stream_idle' : isStreamTruncated ? 'stream_truncated' : 'overload';
-				log.warn('fallback_to_flash', { error: errMsg.slice(0, 100), from: fromTier, to: 'flash', reason: reasonLabel });
+				log.warn('cascade_fallback', {
+					chatId,
+					cascade: isCrisisLane ? 'crisis' : 'main',
+					from: textModel,
+					fromIdx: currentIdx,
+					to: nextTier.model,
+					toIdx: currentIdx + 1,
+					reason: reasonLabel,
+					err_code: errCode,
+					error: errMsg.slice(0, 100),
+				});
 
 				// Delete the orphaned draft bubble from the failed attempt so Telegram
-				// doesn't show a ghost "..." message alongside the Flash reply.
+				// doesn't show a ghost "..." message alongside the new reply.
 				if (draftActive) {
 					try {
 						await telegram.clearMessageDraft(chatId, threadId, draftId, env);
@@ -1962,7 +1993,7 @@ export async function handleMessage(msg, env) {
 
 				// Reset state for retry — nextMessage keeps the ORIGINAL userParts
 				// so the user never has to resend.
-				textModel = FALLBACK_TEXT_MODEL;
+				textModel = nextTier.model;
 				isComplete = false;
 				fullText = "";
 				lastSentMsgId = null;
@@ -1972,8 +2003,8 @@ export async function handleMessage(msg, env) {
 				draftActive = false;
 				lastDraftTime = 0;
 
-				const flashCache = hasMedia ? null : await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, FALLBACK_TEXT_MODEL, MENTAL_HEALTH_DIRECTIVE);
-				chat = await createChat(hist, fullSysPrompt, env, flashCache, FALLBACK_TEXT_MODEL, { skipCodeExecution: hasMedia });
+				const tierCache = hasMedia ? null : await setupCache(personaInstruction, FORMATTING_RULES, dynamicContext, env, textModel, MENTAL_HEALTH_DIRECTIVE);
+				chat = await createChat(hist, fullSysPrompt, env, tierCache, textModel, { skipCodeExecution: hasMedia, ...nextTier.opts });
 				await runGenerateLoop();
 			} else if (isIdle && textModel === FALLBACK_TEXT_MODEL) {
 				// Flash streamed-and-stalled. Last-resort safety net: retry same model

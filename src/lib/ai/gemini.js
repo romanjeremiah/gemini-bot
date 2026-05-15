@@ -1,24 +1,54 @@
 import { GoogleGenAI } from '@google/genai';
 import { toolDefinitions } from '../../tools/index.js';
 
-// Architecture B+ (2026-05-14) — model selection after combined-evaluation
-// bundle showed 2.5 Flash-Lite GA at the top of the Gemini family (73.5/108)
-// and 3.1 Pro preview unusable (0/108). Primary conversational lane now
-// runs on 2.5 Flash-Lite GA dynamic for routine turns; crisis turns race
-// 2.5 Pro budget 128 against 2.5 Flash-Lite budget 512 via
-// generateCrisisResponse. Cron/deep work uses 2.5 Pro budget 128.
-export const PRIMARY_TEXT_MODEL    = 'gemini-2.5-flash-lite';
-export const FALLBACK_TEXT_MODEL   = 'gemini-2.5-flash';
-export const DEEP_RESPONSE_MODEL   = 'gemini-2.5-pro';
-export const FLASH_LITE_TEXT_MODEL = 'gemini-3.1-flash-lite-preview'; // preview tier — used as transcription fallback, NOT for text generation
-const PRIMARY_IMAGE_MODEL  = 'gemini-3-pro-image-preview';     // Nano Banana Pro — best quality gen + edit
-const FALLBACK_IMAGE_MODEL = 'gemini-3.1-flash-image-preview'; // Nano Banana 2 — fast fallback
+// Architecture B+ Revision (2026-05-14) — model selection rewritten per Roma's
+// explicit cascade spec after the live-test failures (524 crash on emotional
+// reply, short/hallucinating synthesis, slow short acks).
+//
+// Conversational lanes (driven by router → handlers.js):
+//   Main conversational chat: Flash 3 → 3.1 FL → 2.5 FL dyn → Pro 3.1 medium → Kimi → Gemma
+//   Single-turn utility:      Flash 3 → 3.1 FL → 2.5 FL dyn → Pro 3.1 medium → Kimi → Gemma
+//   Tagger / transactional:   Gemma → 3.1 FL → Flash 3 → Pro 3.1 medium
+//   Crisis / mental health:   Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro dyn → Kimi
+//   Multi-turn continuity:    Flash 3 → 3.1 FL → 2.5 Pro dyn → Kimi → Pro 3.1 default
+//   Complex synthesis:        Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro dyn → Kimi
+//   Code / analytical:        Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro dyn → Kimi
+//   Deep therapeutic (cron):  Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro b128 → 2.5 FL b512
+//   Short responses:          Gemma → Flash 3 → 3.1 FL
+//   Cron / background:        Flash 3 → 3.1 FL → Kimi → 2.5 Pro b128
+//   Routing classifier:       3.1 FL minimal (Arch B only)
+//   Images:                   unchanged (3 Pro Image → 3.1 Flash Image)
+//
+// Model constants below mirror these chains. Helpers `runConversationalCascade`,
+// `runCrisisCascade`, `runDeepCascade`, `runShortCascade`, `runBackgroundCascade`
+// implement the sequential fallback chains for non-streaming callers.
+// Streaming (handlers.js) walks the main-convo cascade tier-by-tier on its own.
 
-// Default thinking configurations per lane. -1 means dynamic on 2.5 GA.
-const DEFAULT_THINKING_BUDGET   = -1;  // main conversational path: 2.5 FL dynamic (73.0/108 in bundle)
-const CRISIS_PRO_BUDGET         = 128; // 2.5 Pro at budget 128 scored 11.5/15 on Cat C, 3.7s avg
-const CRISIS_FL_BUDGET          = 512; // 2.5 Flash-Lite at budget 512 scored 12/15 on Cat C, best in family
-const DEEP_RESPONSE_BUDGET      = 128; // cron / weekly synthesis — quality matters more than latency
+// ---- Model identifiers ----
+export const FLASH_3_MODEL       = 'gemini-3-flash-preview';
+export const FLASH_LITE_31_MODEL = 'gemini-3.1-flash-lite-preview';
+export const FLASH_LITE_25_MODEL = 'gemini-2.5-flash-lite';
+export const PRO_31_MODEL        = 'gemini-3.1-pro-preview';
+export const PRO_25_MODEL        = 'gemini-2.5-pro';
+export const KIMI_MODEL          = '@cf/moonshotai/kimi-k2.6';
+export const GEMMA_MODEL         = '@cf/google/gemma-4-26b-a4b-it';
+
+// Legacy aliases kept so existing callers in handlers.js / responseCurator /
+// transcription / mood files continue to compile without restructuring.
+// PRIMARY = main convo Tier 1 (Flash 3). FALLBACK = main convo Tier 2 (3.1 FL).
+// FLASH_LITE_TEXT_MODEL = 3.1 FL (used by transcription fallback + curator + handlers.js model menu).
+export const PRIMARY_TEXT_MODEL    = FLASH_3_MODEL;
+export const FALLBACK_TEXT_MODEL   = FLASH_LITE_31_MODEL;
+export const FLASH_LITE_TEXT_MODEL = FLASH_LITE_31_MODEL;
+export const DEEP_RESPONSE_MODEL   = PRO_31_MODEL; // deep cron synthesis Tier 1
+
+const PRIMARY_IMAGE_MODEL  = 'gemini-3-pro-image-preview';
+const FALLBACK_IMAGE_MODEL = 'gemini-3.1-flash-image-preview';
+
+// Default thinking config for the main conversational lane (Flash 3 has no
+// thinking budget knob; this is the default applied to 2.5 GA tiers and to
+// Pro 3.1 medium when used as a fallback tier).
+const DEFAULT_THINKING_BUDGET = -1;
 
 const CACHE_TTL = '3600s';
 const MIN_CACHE_TOKENS_GEMINI3 = 4096;
@@ -61,16 +91,11 @@ async function withRetry(fn, maxRetries = 3, fallbackFn = null) {
       if (!isRetryable) throw err;
       lastError = err;
 
-      // Prefer the server-supplied Retry-After / retry_after when present.
-      // Gemini sometimes returns it as a Retry-After header (seconds) and
-      // sometimes inside the JSON error body's details. The SDK surfaces the
-      // raw error text in err.message, so we sniff a few shapes. Falls back
-      // to exponential backoff (1s, 2s, 4s) when nothing useful is present.
       const serverWaitMs = parseRetryAfter(err);
       const expoMs = Math.pow(2, i) * 1000;
       const wait = Math.min(
         Math.max(serverWaitMs ?? expoMs, expoMs),
-        30_000, // cap so a runaway value can't pin the Worker
+        30_000,
       );
       const reason = serverWaitMs ? `server retry-after ${serverWaitMs}ms` : `expo backoff ${expoMs}ms`;
       console.log(`⏳ Gemini retry ${i + 1}/${maxRetries} in ${wait}ms (${reason})`);
@@ -84,23 +109,16 @@ async function withRetry(fn, maxRetries = 3, fallbackFn = null) {
   throw lastError;
 }
 
-// Best-effort extraction of a retry-after hint from a Gemini SDK error.
-// Looks at: err.headers['retry-after'] (string seconds), err.retryAfter
-// (number seconds), and a JSON body in err.message with retryInfo.retryDelay.
-// Returns milliseconds, or null when nothing trustworthy is present.
 function parseRetryAfter(err) {
   if (!err) return null;
-  // 1. Explicit numeric field (SDK convenience)
   if (typeof err.retryAfter === 'number' && err.retryAfter > 0) {
     return Math.min(err.retryAfter * 1000, 30_000);
   }
-  // 2. Header style (string seconds)
   const header = err.headers?.['retry-after'] || err.headers?.['Retry-After'];
   if (header) {
     const sec = Number(header);
     if (Number.isFinite(sec) && sec > 0) return Math.min(sec * 1000, 30_000);
   }
-  // 3. Embedded protobuf-style detail in error message: "retryDelay":"42s"
   const m = (err.message || '').match(/retryDelay"?\s*:\s*"?(\d+(?:\.\d+)?)s"?/i);
   if (m) {
     const ms = Math.round(parseFloat(m[1]) * 1000);
@@ -111,18 +129,14 @@ function parseRetryAfter(err) {
 
 /**
  * Generate content with automatic Primary → Fallback chain.
- * Use this for cron jobs and background tasks instead of direct ai.models.generateContent.
- *
- * Architecture B+ chain:
- *   1. 2.5 Flash-Lite GA · dynamic budget   (PRIMARY_TEXT_MODEL)
- *   2. 2.5 Flash GA · budget 8192 fallback   (FALLBACK_TEXT_MODEL)
+ * 2-tier; used by some legacy call sites. For new code prefer
+ * runBackgroundCascade / runDeepCascade / runCrisisCascade.
  */
 export async function generateWithFallback(env, contents, config = {}) {
   const ai = getAI(env);
 
-  // Ensure thinking config is present. Caller may override via config.thinkingConfig.
   const primaryConfig = withThinkingDefaults(config, { thinkingBudget: DEFAULT_THINKING_BUDGET });
-  const fallbackConfig = withThinkingDefaults(config, { thinkingBudget: 8192 });
+  const fallbackConfig = withThinkingDefaults(config, { thinkingBudget: DEFAULT_THINKING_BUDGET });
 
   const doGenerate = (model, cfg) => ai.models.generateContent({
     model, contents, config: cfg
@@ -142,11 +156,9 @@ export async function generateWithFallback(env, contents, config = {}) {
   return { text: text.trim(), response };
 }
 
-// Helper: merge a thinkingConfig into a request config if one isn't already set.
-// Defaults to thinkingBudget unless thinkingLevel is explicitly passed.
 function withThinkingDefaults(baseConfig, defaults) {
   const out = { ...baseConfig };
-  if (out.thinkingConfig) return out; // caller already specified
+  if (out.thinkingConfig) return out;
   if (typeof defaults.thinkingBudget === 'number') {
     out.thinkingConfig = { thinkingBudget: defaults.thinkingBudget };
   } else if (defaults.thinkingLevel) {
@@ -159,11 +171,8 @@ function withThinkingDefaults(baseConfig, defaults) {
 const _cacheNames = new Map();
 
 async function getOrCreateCache(personaInstruction, formattingRules, mentalHealthDirective, env, model = PRIMARY_TEXT_MODEL) {
-  // Hash includes clinical directive so cache invalidates when the clinical
-  // protocol is edited, not just the persona.
   const cacheKey = `gemini_cache_${model}_${hashStr(personaInstruction + (mentalHealthDirective || '')).slice(0, 16)}`;
 
-  // Check in-memory cache first, but validate it's still alive on Google
   if (_cacheNames.has(cacheKey)) {
     try {
       await getAI(env).caches.get({ name: _cacheNames.get(cacheKey) });
@@ -186,11 +195,6 @@ async function getOrCreateCache(personaInstruction, formattingRules, mentalHealt
     }
   }
 
-  // Persona + formatting rules + clinical protocol all cached together.
-  // This ensures MENTAL_HEALTH_DIRECTIVE reaches the model on cache-hit calls,
-  // not just on cache-miss calls. The register override inside the directive
-  // means it's inert during casual chat but always available when warm register
-  // activates.
   const clinicalBlock = mentalHealthDirective ? `\n${mentalHealthDirective}` : '';
   const staticContent = `${personaInstruction}\n${formattingRules}${clinicalBlock}`;
   const estimatedTokens = Math.ceil(staticContent.length / CHARS_PER_TOKEN);
@@ -222,7 +226,7 @@ async function getOrCreateCache(personaInstruction, formattingRules, mentalHealt
     _cacheNames.set(cacheKey, cacheName);
     return cacheName;
   } catch (err) {
-    console.error(`⚠️ Cache creation failed for ${PRIMARY_TEXT_MODEL}: ${err.message}`);
+    console.error(`⚠️ Cache creation failed for ${model}: ${err.message}`);
     return null;
   }
 }
@@ -236,11 +240,6 @@ function hashStr(str) {
 }
 
 function buildConfig(systemInstruction, opts = {}) {
-  // codeExecution removed: was leaking ⚙️ Computing... segments into user-facing
-  // replies (notably after reminder/tool flows). The Python sandbox cannot access
-  // env, DB, KV, or user data — it was only ever useful for arithmetic, which our
-  // tools already handle. opts.skipCodeExecution is now a no-op kept for call-site
-  // compatibility; remove in a follow-up cleanup.
   const tools = [{ functionDeclarations: normalizedTools }, { googleSearch: {} }];
 
   const config = {
@@ -250,13 +249,9 @@ function buildConfig(systemInstruction, opts = {}) {
     temperature: 1.0,
   };
 
-  // Thinking config: 2.5 GA models use thinkingBudget (number, -1=dynamic, 0=off,
-  // up to 24576). 3.x preview models use thinkingLevel ('minimal'|'low'|'medium'|
-  // 'high'). Both cannot be set in the same call. Default to dynamic budget for
-  // the 2.5 GA primary; callers can pass opts.thinkingBudget or opts.thinkingLevel
-  // to override. Combined-evaluation bundle showed dynamic at 73.0/108 and budget
-  // 512 at 73.5/108 — essentially tied — and dynamic was 2.3s faster on average.
   config.thinkingConfig = resolveThinkingConfig(opts, { thinkingBudget: DEFAULT_THINKING_BUDGET });
+  // Drop thinkingConfig entirely when undefined (Flash 3 / Pro 3.1 default don't take it).
+  if (!config.thinkingConfig) delete config.thinkingConfig;
 
   return config;
 }
@@ -268,13 +263,11 @@ function buildCachedConfig(cacheName, opts = {}) {
   };
 
   config.thinkingConfig = resolveThinkingConfig(opts, { thinkingBudget: DEFAULT_THINKING_BUDGET });
+  if (!config.thinkingConfig) delete config.thinkingConfig;
 
   return config;
 }
 
-// Resolve which thinking config to use for a call. Precedence: explicit
-// opts.thinkingBudget > opts.thinkingLevel > the supplied default. Returns
-// an object suitable for spreading into the request config.
 function resolveThinkingConfig(opts, fallback) {
   if (typeof opts.thinkingBudget === 'number') {
     return { thinkingBudget: opts.thinkingBudget };
@@ -311,9 +304,7 @@ export async function setupCache(personaInstruction, formattingRules, dynamicCon
   return { cacheName, dynamicPrefix: dynamicContext };
 }
 
-// ---- Non-streaming: waits for full response (needed for function calling) ----
-// opts.fastFail: skip the retry loop — used when we're already recovering
-// from a 503 on a different transport and don't want to compound the wait.
+// ---- Non-streaming chat send ----
 export async function* sendChatMessage(chat, message, opts = {}) {
   const maxRetries = opts.fastFail ? 1 : 3;
   const response = await withRetry(
@@ -330,15 +321,7 @@ export async function* sendChatMessage(chat, message, opts = {}) {
   if (gm) yield { type: 'groundingMetadata', metadata: gm };
 }
 
-// ---- True streaming: yields text chunks as Gemini generates them ----
-// Used for the animated text appearing effect via Telegram's sendMessageDraft.
-//
-// READ-IDLE WATCHDOG: If no chunk arrives for STREAM_IDLE_MS while the
-// connection is still open, throw StreamIdleError. This surfaces silent
-// stalls as a distinct signal instead of letting Cloudflare kill the
-// invocation with no trace. The handler can then fall back cleanly.
-// This is NOT a total-generation timeout — there is no cap on overall
-// response length, only on inter-chunk silence.
+// ---- True streaming ----
 const STREAM_IDLE_MS = 25000;
 
 export class StreamIdleError extends Error {
@@ -355,12 +338,6 @@ export async function* sendChatMessageStream(chat, message) {
   try {
     stream = await chat.sendMessageStream({ message });
   } catch (err) {
-    // Initial call failed (network, 4xx, 5xx). Surface error details
-    // before falling back so logs capture what Gemini actually returned.
-    // fastFail: skip the 3x retry loop inside sendChatMessage — we already
-    // have one failure from the streaming attempt; burning 7s of backoff
-    // against the same overloaded model just causes Telegram to cancel
-    // the webhook.
     console.warn('⚠️ Stream open failed:', err.status || '', err.message);
     yield* sendChatMessage(chat, message, { fastFail: true });
     return;
@@ -391,7 +368,6 @@ export async function* sendChatMessageStream(chat, message) {
     const calls = parts.filter(p => p.functionCall && p.functionCall.name !== 'googleSearch');
     if (calls.length) yield { type: 'functionCall', calls };
 
-    // Observability: surface finishReason + blockReason so the handler can log them
     const candidate = chunk.candidates?.[0];
     if (candidate?.finishReason && candidate.finishReason !== 'STOP') {
       yield { type: 'finishReason', reason: candidate.finishReason };
@@ -438,169 +414,32 @@ export async function generateImage(prompt, env, inputImageBase64 = null, inputM
 }
 
 
-// ---- Short-response generation (greetings, observations, listen-mode) ----
-// Path B step 1: route through Cloudflare Gemma 4 first, fall back to Gemini
-// Flash-Lite, then Flash. Gemma handles ~80% of these cleanly and is free —
-// Gemini preview overload (the cause of silent morning check-ins) no longer
-// breaks the bot.
+// ============================================================================
+//  CASCADE PRIMITIVES — sequential fallback chain helpers
+// ============================================================================
 //
-// Each tier gets one attempt. No exponential backoff between tiers — that
-// only delays the user when Gemini is overloaded.
-//
-// systemPrompt is appended to the system instruction so the model knows it's
-// generating a short Telegram-shaped message.
-const SHORT_RESPONSE_GUIDE = '\n\nYou are generating a brief message for a Telegram bot. Keep it to 2-4 complete sentences. Be fully in character. No asterisks, no markdown, no HTML tags. You MUST finish every sentence completely. Never stop mid-sentence or mid-thought.';
+// Each tier is { kind: 'gemini'|'cf', model: string, opts?: object, label: string }.
+// runCascade walks tiers in order, returning the first non-empty text.
+// kind='gemini' uses the Gemini SDK with optional thinkingBudget/thinkingLevel.
+// kind='cf' uses Cloudflare AI (env.AI) — for Kimi and Gemma tiers.
 
-export async function generateShortResponse(prompt, systemInstruction, env) {
-  const fullSystem = `${systemInstruction}${SHORT_RESPONSE_GUIDE}`;
-
-  // Tier 1: Gemma 4 via Cloudflare (free, fast, independent of Gemini)
-  if (env.AI) {
-    try {
-      const { runCfAi } = await import('../ai-gateway');
-      const result = await runCfAi(env.AI, '@cf/google/gemma-4-26b-a4b-it', {
-        messages: [
-          { role: 'system', content: fullSystem },
-          { role: 'user', content: prompt },
-        ],
-        temperature: 1.0,
-        max_tokens: 1000,
-      });
-      const text = _extractCfText(result);
-      if (text) return _trimTrailing(text);
-      console.warn('Gemma returned empty text, falling through to Gemini');
-    } catch (err) {
-      console.warn('Gemma short-response failed, falling through to Gemini:', err.message);
-    }
-  }
-
-  // Tier 2: Gemini Flash-Lite (preview, cheap)
-  try {
-    const response = await getAI(env).models.generateContent({
-      model: FLASH_LITE_TEXT_MODEL,
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: { systemInstruction: fullSystem, temperature: 1.0, maxOutputTokens: 1000 }
-    });
-    const text = _extractGeminiText(response);
-    if (text) return _trimTrailing(text);
-  } catch (err) {
-    console.warn('Flash-Lite short-response failed, falling through to Flash:', err.status || '', err.message);
-  }
-
-  // Tier 3: Gemini Flash (more reliable, more expensive)
-  const response = await getAI(env).models.generateContent({
-    model: FALLBACK_TEXT_MODEL,
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    config: { systemInstruction: fullSystem, temperature: 1.0, maxOutputTokens: 1000 }
-  });
-  return _trimTrailing(_extractGeminiText(response));
-}
-
-function _extractCfText(result) {
-  if (!result) return '';
-  if (typeof result === 'string') return result;
-  if (result.choices?.[0]?.message?.content) return result.choices[0].message.content;
-  return result.response || '';
-}
-
-function _extractGeminiText(response) {
-  return response.candidates?.[0]?.content?.parts
-    ?.filter(p => p.text && !p.thought)
-    ?.map(p => p.text)
-    ?.join('') || '';
-}
-
-function _trimTrailing(text) {
-  text = (text || '').trim();
-  // If text doesn't end with sentence punctuation, trim to the last complete sentence.
-  if (text && !/[.!?…"']$/.test(text)) {
-    const ends = ['. ', '! ', '? ', '.', '!', '?'].map(s => text.lastIndexOf(s)).filter(i => i > 0);
-    if (ends.length) text = text.slice(0, Math.max(...ends) + 1).trim();
-  }
-  return text;
-}
-
-
-// ---- Deep Response Generation (Pro model, low budget) ----
-// Used for therapeutic synthesis, weekly reports, and other cron-tolerant work
-// where quality matters more than latency. No "brief message" override — the
-// caller controls length via prompt.
-//
-// Primary: 2.5 Pro budget 128 (68/108 in bundle, 11.5/15 on Cat C — best Pro tier)
-// Fallback: 2.5 Flash-Lite budget 512 (73.5/108, 12/15 on Cat C — best in family)
-//
-// Counter-intuitive but data-confirmed: 2.5 Pro budget 128 outperforms budget
-// 8192 and 24576 on this workload. Higher budget often causes Pro to overthink
-// simple tool decisions. Callers can still pass opts.thinkingBudget to override.
-export async function generateDeepResponse(prompt, systemInstruction, env, opts = {}) {
-  const maxOutputTokens = opts.maxOutputTokens || 2000;
-  // Translate legacy thinkingLevel ('low'|'medium'|'high') to a 2.5 Pro budget,
-  // so older callers still work without code changes.
-  const legacyLevelToBudget = { minimal: 0, low: 128, medium: 8192, high: 24576 };
-  let budget = DEEP_RESPONSE_BUDGET;
-  if (typeof opts.thinkingBudget === 'number') budget = opts.thinkingBudget;
-  else if (opts.thinkingLevel && legacyLevelToBudget[opts.thinkingLevel] !== undefined) {
-    budget = legacyLevelToBudget[opts.thinkingLevel];
-  }
-
-  const primaryConfig = {
-    systemInstruction,
-    temperature: 1.0,
-    maxOutputTokens,
-    thinkingConfig: { thinkingBudget: budget },
-  };
-  const fallbackConfig = {
-    systemInstruction,
-    temperature: 1.0,
-    maxOutputTokens,
-    thinkingConfig: { thinkingBudget: CRISIS_FL_BUDGET },
-  };
-
-  const response = await withRetry(
-    () => getAI(env).models.generateContent({
-      model: DEEP_RESPONSE_MODEL,
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: primaryConfig,
-    }),
-    2,
-    // Fallback: 2.5 Flash-Lite budget 512 — best non-Pro on mental health work.
-    () => getAI(env).models.generateContent({
-      model: PRIMARY_TEXT_MODEL,
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: fallbackConfig,
-    })
-  );
-
-  const text = response.candidates?.[0]?.content?.parts
-    ?.filter(p => p.text && !p.thought)
-    ?.map(p => p.text)
-    ?.join('') || '';
-  return text.trim();
-}
-
-// ---- Background-task Gemini helper ----
-// Used by cfAi.js, personaEvolution.js, etc. for non-user-facing background work
-// (tagging, observation extraction, summarisation). Returns trimmed text or
-// null on failure — mirrors the cfAiGenerate shape so call sites can swap
-// providers without restructuring.
-//
-// Defaults: thinkingBudget -1 (dynamic) on 2.5 GA models. Pass opts.thinkingBudget
-// to override (0=off, 128=low, 512=balanced, 8192=high). Pass opts.thinkingLevel
-// for 3.x preview models (minimal | low | medium | high).
-export async function geminiBackgroundGenerate(env, model, prompt, systemPrompt = '', opts = {}) {
+async function _runGeminiTier(env, model, prompt, systemPrompt, opts, label) {
   if (!env.GEMINI_API_KEY) return null;
+  const t0 = Date.now();
   try {
-    const ai = getAI(env);
-    const thinking = resolveThinkingConfig(opts, { thinkingBudget: DEFAULT_THINKING_BUDGET });
-    const response = await ai.models.generateContent({
+    const thinkingConfig = resolveThinkingConfig(opts || {}, { thinkingBudget: DEFAULT_THINKING_BUDGET });
+    const config = {
+      systemInstruction: systemPrompt || undefined,
+      temperature: 1.0,
+      maxOutputTokens: opts?.maxOutputTokens ?? 2000,
+    };
+    if (thinkingConfig) config.thinkingConfig = thinkingConfig;
+    if (opts?.responseMimeType) config.responseMimeType = opts.responseMimeType;
+
+    const response = await getAI(env).models.generateContent({
       model,
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: {
-        systemInstruction: systemPrompt || undefined,
-        temperature: 1.0,
-        maxOutputTokens: opts.maxOutputTokens ?? 2000,
-        thinkingConfig: thinking,
-      },
+      config,
     });
     let text = '';
     if (typeof response?.text === 'string') text = response.text;
@@ -614,90 +453,172 @@ export async function geminiBackgroundGenerate(env, model, prompt, systemPrompt 
         ?.join('') || '';
     }
     const trimmed = (text || '').trim();
-    return trimmed || null;
+    if (!trimmed) {
+      console.warn(`⚠️ ${label} (${model}) returned empty in ${Date.now() - t0}ms`);
+      return null;
+    }
+    console.log(`✅ ${label} (${model}) ok in ${Date.now() - t0}ms`);
+    return trimmed;
   } catch (err) {
-    console.error(`Gemini bg error (${model}):`, err.message?.slice(0, 200));
+    console.warn(`⚠️ ${label} (${model}) failed in ${Date.now() - t0}ms: ${(err.message || '').slice(0, 200)}`);
     return null;
   }
 }
 
+async function _runCfTier(env, model, prompt, systemPrompt, opts, label) {
+  if (!env.AI) return null;
+  const t0 = Date.now();
+  try {
+    const { runCfAi } = await import('../ai-gateway');
+    const messages = [];
+    if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+    messages.push({ role: 'user', content: prompt });
 
-// ---- Crisis-lane Two-Model Parallel Race ----
-// Used when the conversation classifier flags the turn as 'crisis' (or any
-// other lane where mental-health quality dominates). Fires 2.5 Pro budget 128
-// AND 2.5 Flash-Lite budget 512 in parallel and returns whichever succeeds
-// first. Token cost roughly doubles on crisis turns; absolute volume is small
-// (estimated <50/day) so the safety net is worth the spend.
-//
-// Combined-evaluation bundle scores on Cat C (mental health):
-//   2.5 Pro · budget 128       — 11.5/15, 3.7s avg
-//   2.5 Flash-Lite · budget 512 — 12.0/15, 8.6s avg (best in Gemini family)
-//
-// If both fail (both reject or both error), falls through to a single 2.5 Pro
-// dynamic call as last resort. Returns trimmed text.
+    const result = await runCfAi(env.AI, model, {
+      messages,
+      max_tokens: opts?.maxOutputTokens ?? 2000,
+      temperature: opts?.temperature ?? 1.0,
+    }, { headers: { 'x-session-affinity': 'xaridotis-cascade' } });
+
+    let text = '';
+    if (typeof result === 'string') text = result;
+    else if (typeof result?.response === 'string') text = result.response;
+    else if (result?.choices?.[0]?.message?.content) text = result.choices[0].message.content;
+
+    const trimmed = (text || '').trim();
+    if (!trimmed) {
+      console.warn(`⚠️ ${label} (${model}) returned empty in ${Date.now() - t0}ms`);
+      return null;
+    }
+    console.log(`✅ ${label} (${model}) ok in ${Date.now() - t0}ms`);
+    return trimmed;
+  } catch (err) {
+    console.warn(`⚠️ ${label} (${model}) failed in ${Date.now() - t0}ms: ${(err.message || '').slice(0, 200)}`);
+    return null;
+  }
+}
+
+/**
+ * Walk a sequential cascade of model tiers. Returns the first non-empty text
+ * from any tier, or null if every tier failed.
+ *
+ * @param {object} env
+ * @param {string} prompt
+ * @param {string} systemPrompt
+ * @param {Array<{kind:'gemini'|'cf', model:string, opts?:object, label:string}>} tiers
+ */
+export async function runCascade(env, prompt, systemPrompt, tiers) {
+  for (const tier of tiers) {
+    const text = tier.kind === 'gemini'
+      ? await _runGeminiTier(env, tier.model, prompt, systemPrompt, tier.opts, tier.label)
+      : await _runCfTier(env, tier.model, prompt, systemPrompt, tier.opts, tier.label);
+    if (text) return text;
+  }
+  return null;
+}
+
+
+// ============================================================================
+//  SHORT-RESPONSE CASCADE — greetings, listen-mode, observations
+// ============================================================================
+// Chain (Roma 2026-05-14): Gemma → Flash 3 → 3.1 FL.
+
+const SHORT_RESPONSE_GUIDE = '\n\nYou are generating a brief message for a Telegram bot. Keep it to 2-4 complete sentences. Be fully in character. No asterisks, no markdown, no HTML tags. You MUST finish every sentence completely. Never stop mid-sentence or mid-thought.';
+
+const SHORT_RESPONSE_TIERS = [
+  { kind: 'cf', model: GEMMA_MODEL, opts: { maxOutputTokens: 1000 }, label: 'short:gemma' },
+  { kind: 'gemini', model: FLASH_3_MODEL, opts: { maxOutputTokens: 1000 }, label: 'short:flash-3' },
+  { kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 1000, thinkingLevel: 'minimal' }, label: 'short:3.1-fl' },
+];
+
+export async function generateShortResponse(prompt, systemInstruction, env) {
+  const fullSystem = `${systemInstruction}${SHORT_RESPONSE_GUIDE}`;
+  const text = await runCascade(env, prompt, fullSystem, SHORT_RESPONSE_TIERS);
+  if (!text) return '';
+  return _trimTrailing(text);
+}
+
+function _trimTrailing(text) {
+  text = (text || '').trim();
+  if (text && !/[.!?…"']$/.test(text)) {
+    const ends = ['. ', '! ', '? ', '.', '!', '?'].map(s => text.lastIndexOf(s)).filter(i => i > 0);
+    if (ends.length) text = text.slice(0, Math.max(...ends) + 1).trim();
+  }
+  return text;
+}
+
+
+// ============================================================================
+//  DEEP-RESPONSE CASCADE — cron synthesis, weekly reports, therapeutic notes
+// ============================================================================
+// Chain (Roma 2026-05-14): Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro b128 → 2.5 FL b512.
+
+const DEEP_RESPONSE_TIERS = [
+  { kind: 'gemini', model: PRO_31_MODEL,        opts: { maxOutputTokens: 2000 },                            label: 'deep:pro-3.1' },
+  { kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 2000 },                            label: 'deep:flash-3' },
+  { kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 2000, thinkingLevel: 'medium' },   label: 'deep:3.1-fl' },
+  { kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 2000, thinkingBudget: 128 },       label: 'deep:2.5-pro-b128' },
+  { kind: 'gemini', model: FLASH_LITE_25_MODEL, opts: { maxOutputTokens: 2000, thinkingBudget: 512 },       label: 'deep:2.5-fl-b512' },
+];
+
+export async function generateDeepResponse(prompt, systemInstruction, env, opts = {}) {
+  const maxOutputTokens = opts.maxOutputTokens || 2000;
+  // Apply caller's maxOutputTokens to all tiers
+  const tiers = DEEP_RESPONSE_TIERS.map(t => ({
+    ...t,
+    opts: { ...t.opts, maxOutputTokens },
+  }));
+  const text = await runCascade(env, prompt, systemInstruction, tiers);
+  return text || '';
+}
+
+
+// ============================================================================
+//  CRISIS CASCADE — emotional / mental health conversational replies
+// ============================================================================
+// Chain (Roma 2026-05-14): Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro dyn → Kimi.
+
+const CRISIS_TIERS = [
+  { kind: 'gemini', model: PRO_31_MODEL,        opts: { maxOutputTokens: 2000 },                          label: 'crisis:pro-3.1' },
+  { kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 2000 },                          label: 'crisis:flash-3' },
+  { kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 2000 },                          label: 'crisis:3.1-fl' },
+  { kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 2000, thinkingBudget: -1 },      label: 'crisis:2.5-pro-dyn' },
+  { kind: 'cf',     model: KIMI_MODEL,          opts: { maxOutputTokens: 2000 },                          label: 'crisis:kimi' },
+];
+
 export async function generateCrisisResponse(prompt, systemInstruction, env, opts = {}) {
   const maxOutputTokens = opts.maxOutputTokens || 2000;
-  const baseConfig = {
-    systemInstruction,
-    temperature: 1.0,
-    maxOutputTokens,
-  };
+  const tiers = CRISIS_TIERS.map(t => ({ ...t, opts: { ...t.opts, maxOutputTokens } }));
+  const text = await runCascade(env, prompt, systemInstruction, tiers);
+  return text || '';
+}
 
-  const proCall = () => getAI(env).models.generateContent({
-    model: DEEP_RESPONSE_MODEL,
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    config: { ...baseConfig, thinkingConfig: { thinkingBudget: CRISIS_PRO_BUDGET } },
-  });
-  const flCall = () => getAI(env).models.generateContent({
-    model: PRIMARY_TEXT_MODEL,
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    config: { ...baseConfig, thinkingConfig: { thinkingBudget: CRISIS_FL_BUDGET } },
-  });
 
-  // Wrap each call so a failure resolves to a sentinel instead of rejecting.
-  // Then race for the first non-sentinel result.
-  const tagged = async (label, fn) => {
-    try {
-      const response = await fn();
-      const text = response.candidates?.[0]?.content?.parts
-        ?.filter(p => p.text && !p.thought)
-        ?.map(p => p.text)
-        ?.join('') || '';
-      if (!text.trim()) return { label, ok: false, error: 'empty_response' };
-      return { label, ok: true, text: text.trim() };
-    } catch (err) {
-      return { label, ok: false, error: err?.message || String(err) };
-    }
-  };
+// ============================================================================
+//  BACKGROUND CASCADE — generic helper for background tasks
+// ============================================================================
+// Chain (Roma 2026-05-14): Flash 3 → 3.1 FL → Kimi → 2.5 Pro b128.
+// Callers in cfAi.js / personaEvolution.js / etc. pass their own tier arrays
+// for task-specific chains; this default is for cases where they don't.
 
-  const proPromise = tagged('pro_b128', proCall);
-  const flPromise = tagged('fl_b512', flCall);
+const BACKGROUND_TIERS = [
+  { kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 2000 },                       label: 'bg:flash-3' },
+  { kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 2000 },                       label: 'bg:3.1-fl' },
+  { kind: 'cf',     model: KIMI_MODEL,          opts: { maxOutputTokens: 2000 },                       label: 'bg:kimi' },
+  { kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 2000, thinkingBudget: 128 },  label: 'bg:2.5-pro-b128' },
+];
 
-  // First-past-the-post: whoever returns a successful payload wins.
-  // If the first to finish failed, await the other before declaring failure.
-  const first = await Promise.race([proPromise, flPromise]);
-  if (first.ok) {
-    console.log(`🚨 Crisis lane winner: ${first.label}`);
-    return first.text;
-  }
+export async function runBackgroundCascade(env, prompt, systemPrompt, customTiers = null) {
+  const tiers = customTiers || BACKGROUND_TIERS;
+  return runCascade(env, prompt, systemPrompt, tiers);
+}
 
-  console.warn(`🚨 Crisis lane ${first.label} failed (${first.error?.slice(0, 100)}), awaiting other arm`);
-  const second = first.label === 'pro_b128' ? await flPromise : await proPromise;
-  if (second.ok) {
-    console.log(`🚨 Crisis lane second arm winner: ${second.label}`);
-    return second.text;
-  }
 
-  // Both raced arms failed. Last-resort fallback: 2.5 Pro dynamic, single call.
-  console.warn(`🚨 Crisis lane both arms failed (${second.label}: ${second.error?.slice(0, 100)}), falling through to Pro dynamic`);
-  const fallback = await getAI(env).models.generateContent({
-    model: DEEP_RESPONSE_MODEL,
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    config: { ...baseConfig, thinkingConfig: { thinkingBudget: -1 } },
-  });
-  const text = fallback.candidates?.[0]?.content?.parts
-    ?.filter(p => p.text && !p.thought)
-    ?.map(p => p.text)
-    ?.join('') || '';
-  return text.trim();
+// ============================================================================
+//  BACKGROUND GENERATE — single-model Gemini helper (kept for compat)
+// ============================================================================
+// Used by cfAi.js for single-model background calls. Returns trimmed text or
+// null on failure. Callers that want cascades should use runCascade directly.
+export async function geminiBackgroundGenerate(env, model, prompt, systemPrompt = '', opts = {}) {
+  return _runGeminiTier(env, model, prompt, systemPrompt, opts, `bg:${model}`);
 }

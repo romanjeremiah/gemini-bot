@@ -4,6 +4,220 @@ A log of significant engineering sessions on Xaridotis (gemini-bot). Most recent
 
 ================================================================================
 
+## 2026-05-14 (later) — Mood workflow: fixed duplicate-emotions-keyboard via idem-marker ordering
+
+### What
+
+After the Roma-cascade rewrite deployed, Roma ran /mood and got the emotions
+keyboard twice after picking a score. The tail showed only one workflow
+`score_received` event was dispatched, so the duplicate came from inside the
+workflow step itself, not from a duplicate dispatch.
+
+### Root cause
+
+In `src/workflows/moodEveningCheckin.js`, the `process-score` step had this
+order of operations:
+  1. runScoreAck (cascade)
+  2. telegram.sendMessage()      ← user-visible side effect
+  3. CHAT_KV.get + CHAT_KV.put   ← history persistence
+  4. idemSet('process-score')    ← idempotency marker SET HERE
+  5. return
+
+The step has `retries: { limit: 2 }, timeout: '30 seconds'`. The idem marker's
+stated purpose (per the helper comment at line 69) is to prevent duplicate
+Telegram sends if a step throws after the network round-trip succeeded — but
+the marker was being SET after operations that could throw (KV writes), not
+immediately after the send. So if KV.get / KV.put threw transiently, or the
+step hit its 30s wall-clock timeout between sendMessage and idemSet, the
+workflow retried the entire step body. The retry called idemGet, got null,
+ran runScoreAck again, sent another message.
+
+`process-emotions` had the identical pattern — same fix applied.
+
+Why this manifested today and not in earlier sessions: the Roma cascade
+rewrite earlier in the day expanded score_ack / emotions_ack from a 2-tier
+Cloudflare-only race with `Promise.race` timeouts to a 5-tier sequential
+Gemini-first cascade with maxOutputTokens raised from 256 → 1500. Step
+duration variance went up, and the latent race between user-visible send and
+idemSet completion got tipped into manifesting. The same code path was at
+risk before; the cascade rewrite made it more likely to fire.
+
+### Fix
+
+Moved `idemSet` to immediately after `telegram.sendMessage` in both
+`process-score` and `process-emotions`. Wrapped the history KV.put in
+try/catch so its failure can't propagate up and trigger a step retry of an
+action whose user-visible effect already landed.
+
+Audited the other step bodies (`send-activities-keyboard`, `send-photo-prompt`,
+`send-sleep-keyboard`, `process-sleep`, `fire-synthesis`) for the same bug
+pattern. They're all safe — either they call idemSet immediately after
+sendMessage, or the operations between sendMessage and idemSet are wrapped
+in `.catch(() => {})` so they cannot throw.
+
+### Files changed
+
+- src/workflows/moodEveningCheckin.js — reordered idem markers in `process-score`
+  and `process-emotions`. History persistence now wrapped in non-fatal
+  try/catch in both steps.
+
+### Verification
+
+File passes `node --check`. After deploy, the next mood check-in should show:
+  - one `score_ack` Telegram message, with one positive/negative emotion-category
+    keyboard
+  - one `emotions_ack` Telegram message after picking emotions
+If duplication happens again, check the tail for repeated `mood_workflow_event_sent`
+lines (which would indicate the queue is dispatching twice, not the step
+retrying) — different bug, different fix.
+
+================================================================================
+
+## 2026-05-14 — Roma cascade rewrite: replaced Architecture B+ chains after live failures
+
+### What
+
+Replaced every model cascade in the codebase with Roma's explicit non-negotiable
+spec. Architecture B+ deployed earlier today, then live-tested via /mood. Three
+failure modes surfaced:
+
+1. Mood micro-acks ran on Gemini 2.5 FL dynamic at 5-8s with 41-177 char output.
+   Too slow, robotic, and short for a friend-like acknowledgement.
+2. Mood synthesis ran on Gemini 2.5 Pro budget 128 at 2.2s and hallucinated
+   "motivated" (not in today's selected emotions). Pro at b128 had too little
+   reasoning budget to keep today's emotions separated from the 7-day history
+   block, so it pulled an emotion from older entries.
+3. Roma's 65-char reply to the synthesis was routed to gemini-3.1-pro-preview
+   by the emotional_content rule. Pro 3.1 returned 503 ("high demand"), the
+   SDK retried, total elapsed 162s, Cloudflare returned 524 (Worker timeout),
+   handleMessage crashed. The Architecture B+ migration updated PRIMARY_TEXT_MODEL
+   in gemini.js but never touched src/ai/router.js, which hardcodes
+   GEMINI_MODELS.pro = 'gemini-3.1-pro-preview' for emotional content. So every
+   emotional reply reached a model the bundle proved unusable, then crashed.
+
+### Roma's spec (implemented in this session)
+
+Conversational lanes:
+- Main conversational chat:    Flash 3 → 3.1 FL → 2.5 FL dyn → Pro 3.1 medium → Kimi → Gemma
+- Single-turn utility:         Flash 3 → 3.1 FL → 2.5 FL dyn → Pro 3.1 medium → Kimi → Gemma
+- Tagger / transactional:      Gemma → 3.1 FL → Flash 3 → Pro 3.1 medium
+- Crisis / mental health:      Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro dyn → Kimi
+- Multi-turn continuity:       Flash 3 → 3.1 FL → 2.5 Pro dyn → Kimi → Pro 3.1 default
+- Complex synthesis:           Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro dyn → Kimi
+- Code / analytical:           Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro dyn → Kimi
+- Routing classifier (Arch B): 3.1 FL minimal
+- Deep therapeutic / weekly:   Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro b128 → 2.5 FL b512
+- Short responses:             Gemma → Flash 3 → 3.1 FL
+- Cron / background:           Flash 3 → 3.1 FL → Kimi → 2.5 Pro b128
+- Images:                      unchanged
+
+Background task assignments:
+- Conversation tagging (mode classifier):    3.1 FL preview · thinkingLevel: minimal
+- Triple extraction (knowledge graph SPO):   3.1 FL preview · thinkingLevel: medium
+- Long summarisation (memory dedup):         Flash 3 → 3.1 FL → Kimi → 2.5 Pro b128 → Gemma
+- Style card consolidation (04:00 cron):     Gemma → Flash 3 → 3.1 FL → Kimi
+- Mood micro-acknowledgement (after log):    Gemma → Flash 3 → 3.1 FL → Pro 3.1 default → 2.5 Pro GA
+- Mood synthesis (end of mood flow):         Gemma → Flash 3 → 3.1 FL → Pro 3.1 default → 2.5 Pro GA
+- Persona evolution observations:            Gemma → Flash 3 → 3.1 FL → Pro 3.1 default → 2.5 Pro GA
+- Response curation (post-process polish):   Gemma → Flash 3 → 3.1 FL → Pro 3.1 default → 2.5 Pro GA
+- Embedding generation:                      unchanged
+- Reranker (memory recall):                  @cf/baai/bge-reranker-base
+- Transcription (audio → text):              gemini-3.1-pro-preview → gemini-3.1-flash-lite-preview
+
+### Files changed
+
+- src/lib/ai/gemini.js — complete rewrite. New model constants exported:
+  FLASH_3_MODEL, FLASH_LITE_31_MODEL, FLASH_LITE_25_MODEL, PRO_31_MODEL,
+  PRO_25_MODEL, KIMI_MODEL, GEMMA_MODEL. Legacy aliases retained for compat:
+  PRIMARY_TEXT_MODEL = FLASH_3_MODEL, FALLBACK_TEXT_MODEL = FLASH_LITE_31_MODEL,
+  FLASH_LITE_TEXT_MODEL = FLASH_LITE_31_MODEL, DEEP_RESPONSE_MODEL = PRO_31_MODEL.
+  Added runCascade(env, prompt, sys, tiers) primitive that walks a sequential
+  list of { kind:'gemini'|'cf', model, opts, label } tiers and returns the
+  first non-empty text. generateCrisisResponse rewritten as a 5-tier sequential
+  cascade (no longer a Promise.race); generateDeepResponse rewritten as 5-tier;
+  generateShortResponse uses Gemma → Flash 3 → 3.1 FL via runCascade. New
+  runBackgroundCascade helper exposed. responseMimeType plumbed through
+  _runGeminiTier opts (needed by curator JSON mode).
+
+- src/services/cfAi.js — extractObservation single tier on 3.1 FL preview
+  thinkingLevel medium (Triple extraction per spec). tagMoodEntry single tier
+  on 3.1 FL preview thinkingLevel minimal (aligned with mode classifier).
+  deduplicateMemories uses Long summarisation cascade (Flash 3 → 3.1 FL → Kimi
+  → 2.5 Pro b128 → Gemma). consolidateStyleCard uses Style card cascade (Gemma
+  → Flash 3 → 3.1 FL → Kimi). interpretReaction uses Persona evolution cascade
+  (Gemma → Flash 3 → 3.1 FL → Pro 3.1 default → 2.5 Pro GA). tagConversationMode
+  Tier 1 unchanged (3.1 FL minimal) with Llama/Gemma/Flash 3 fallback tiers
+  retained as resilience anchors for the routing classifier.
+
+- src/services/moodMicroAck.js — 5-tier cascade Gemma → Flash 3 → 3.1 FL →
+  Pro 3.1 default → 2.5 Pro GA via runCascade. maxOutputTokens 1500 (was 256
+  on the CF tier — that was constraining warmth). Static fallback text retained
+  as floor. Removed Promise.race timeout machinery; runCascade handles errors
+  per-tier without timeouts (sequential, not parallel).
+
+- src/services/moodSynthesis.js — 5-tier cascade Gemma → Flash 3 → 3.1 FL →
+  Pro 3.1 default → 2.5 Pro GA via runCascade. Added explicit prompt anchor:
+  "only reference emotions Roman recorded TODAY. The 7-day history is for
+  trend context, not for naming today's state — do not invent or mix in
+  emotions from other days." This addresses today's "motivated" hallucination
+  by giving the model an explicit instruction to separate today vs trend.
+  Old 4-tier CASCADE array removed. FIXED_FALLBACK_TEXT retained as floor.
+
+- src/services/personaEvolution.js — 5-tier cascade Gemma → Flash 3 → 3.1 FL
+  → Pro 3.1 default → 2.5 Pro GA via runCascade. Removed the inline Llama 8B
+  fallback (now part of the cascade as Kimi if/when CF tiers are wired into
+  the cascade).
+
+- src/services/responseCurator.js — 5-tier cascade Gemma → Flash 3 → 3.1 FL →
+  Pro 3.1 default → 2.5 Pro GA. Hermes 2 Pro removed entirely. Gemini tiers
+  pass responseMimeType='application/json' for strict structured output;
+  Gemma (CF) relies on prompt-only JSON instructions and the existing 3-tier
+  parser (direct → regex extraction → brace-balance truncation recovery).
+  Curator walks tiers one-by-one so each tier's output gets a chance through
+  the parser before falling to the next.
+
+- src/bot/handlers.js — extended streaming fallback. Old logic was a single-step
+  fallback that only triggered when textModel was PRIMARY or FLASH_LITE. New
+  logic defines MAIN_CASCADE and CRISIS_CASCADE arrays, determines lane from
+  route.reason (mode_crisis | multimodal_input | checkin_with_emotion |
+  emotional_content | complex_task → crisis lane), looks up the current model
+  in the cascade and advances to the next tier on retryable failure. Crisis
+  lane: Pro 3.1 default → Flash 3 → 3.1 FL → 2.5 Pro dyn. Main lane: Flash 3
+  → 3.1 FL → 2.5 FL dyn → Pro 3.1 medium. Thinking opts (thinkingBudget,
+  thinkingLevel) are passed via createChat's opts param. Single-step per
+  failure for now — if both Tier 1 and Tier 2 fail, the second throw still
+  propagates up to handleMessage; full while-loop cascade walking is a
+  follow-up. Kimi/Gemma CF tiers excluded from the handlers cascade because
+  the streaming path is Gemini-only; reaching the end of the Gemini portion
+  of the cascade still throws (improvement over today's behaviour where Pro
+  3.1 → throw was Tier 1 → throw).
+
+### Open follow-ups
+
+- Full while-loop cascade walking in handlers.js so a second tier failure
+  walks to a third tier rather than throwing. Worth doing if Flash 3 ever
+  fails simultaneously with Pro 3.1; today's bundle shows Flash 3 is reliable
+  but not infinitely so.
+- Wire Kimi and Gemma CF tiers into handlers.js streaming via a non-Gemini
+  code path. Currently they only feature in the cron/background cascades
+  (runCascade in gemini.js handles them transparently for non-streaming
+  callers). Streaming with CF models is a larger refactor.
+- BACKGROUND_TIERS in gemini.js (Flash 3 → 3.1 FL → Kimi → 2.5 Pro b128) is
+  defined as a default but not wired up everywhere a background cascade is
+  appropriate. Existing callers route through their task-specific cascades
+  (Long summarisation, Style card, Mood synthesis etc) so this is a default
+  for future helpers rather than an active path.
+
+### Verification
+
+All seven changed files pass `node --check`. Roma deploys with
+`npx wrangler deploy --minify`. Watch the tail for `cascade_fallback` log
+lines on the first emotional reply after deploy to confirm Pro 3.1 → Flash 3
+recovery is firing. Old `fallback_to_flash` log line is gone (replaced by
+`cascade_fallback`).
+
+================================================================================
+
 ## 2026-05-14 — Architecture B+: full Gemini-family rebuild with two-model crisis race
 
 ### What

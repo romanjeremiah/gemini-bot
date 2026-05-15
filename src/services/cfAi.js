@@ -1,17 +1,13 @@
 /**
  * Cloudflare AI Service — background processing layer.
  *
- * Roma cascade assignments (2026-05-14):
- *   - Conversation tagging (mode classifier): 3.1 FL preview thinkingLevel minimal (Tier 1)
- *   - Triple extraction (knowledge graph SPO):  3.1 FL preview thinkingLevel medium (single tier)
- *   - Mood entry tagging (clinical categories): 3.1 FL preview thinkingLevel minimal (single tier)
- *   - Long summarisation (memory dedup):        Flash 3 → 3.1 FL → Kimi → 2.5 Pro b128 → Gemma
- *   - Style card consolidation (04:00 cron):    Gemma → Flash 3 → 3.1 FL → Kimi
- *   - Reaction interpretation (persona signal): Gemma → Flash 3 → 3.1 FL → Pro 3.1 default → 2.5 Pro GA
- *
- * tagConversationMode retains its multi-tier fallback chain (Tier 1 is 3.1 FL
- * minimal per Roma's spec; Tiers 2–4 are kept as resilience anchors so the
- * routing classifier never returns null on Gemini outage).
+ * Data-driven cascade assignments (2026-05-15, post-bench):
+ *   - mode_classifier         qwen-coder-32b → llama-4-scout-17b (with 3.1-fl-min resilience tier)
+ *   - triple_extraction       llama-4-scout-17b → qwen-coder-32b
+ *   - mood_tagging            qwen-coder-32b → llama-4-scout-17b
+ *   - memory_dedup            llama-4-scout-17b → qwen-coder-32b
+ *   - style_card              llama-4-scout-17b → qwen-coder-32b
+ *   - interpretReaction       gemini-2.5-fl (thinking off) → llama-4-scout-17b
  */
 
 import {
@@ -19,10 +15,13 @@ import {
 	runCascade,
 	FLASH_3_MODEL,
 	FLASH_LITE_31_MODEL,
+	FLASH_LITE_25_MODEL,
 	PRO_31_MODEL,
 	PRO_25_MODEL,
 	KIMI_MODEL,
 	GEMMA_MODEL,
+	QWEN_CODER_32B_MODEL,
+	LLAMA_4_SCOUT_MODEL,
 } from '../lib/ai/gemini';
 
 const MODELS = {
@@ -32,28 +31,33 @@ const MODELS = {
 	tools: '@cf/google/gemma-4-26b-a4b-it',                // legacy reference
 };
 
-// Cascade definitions per Roma's spec.
+// Data-driven cascade definitions (post-bench 2026-05-15).
 const SUMMARISATION_TIERS = [
-	{ kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 3000 },                       label: 'summ:flash-3' },
-	{ kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 3000 },                       label: 'summ:3.1-fl' },
-	{ kind: 'cf',     model: KIMI_MODEL,          opts: { maxOutputTokens: 3000 },                       label: 'summ:kimi' },
-	{ kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 3000, thinkingBudget: 128 }, label: 'summ:2.5-pro-b128' },
-	{ kind: 'cf',     model: GEMMA_MODEL,         opts: { maxOutputTokens: 3000 },                       label: 'summ:gemma' },
+	{ kind: 'cf', model: LLAMA_4_SCOUT_MODEL,   opts: { maxOutputTokens: 3000 }, label: 'summ:llama-4-scout' },
+	{ kind: 'cf', model: QWEN_CODER_32B_MODEL,  opts: { maxOutputTokens: 3000 }, label: 'summ:qwen-coder-32b' },
 ];
 
 const STYLE_CARD_TIERS = [
-	{ kind: 'cf',     model: GEMMA_MODEL,         opts: { maxOutputTokens: 3000 },                       label: 'style:gemma' },
-	{ kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 3000 },                       label: 'style:flash-3' },
-	{ kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 3000 },                       label: 'style:3.1-fl' },
-	{ kind: 'cf',     model: KIMI_MODEL,          opts: { maxOutputTokens: 3000 },                       label: 'style:kimi' },
+	{ kind: 'cf', model: LLAMA_4_SCOUT_MODEL,   opts: { maxOutputTokens: 3000 }, label: 'style:llama-4-scout' },
+	{ kind: 'cf', model: QWEN_CODER_32B_MODEL,  opts: { maxOutputTokens: 3000 }, label: 'style:qwen-coder-32b' },
 ];
 
+const TRIPLE_EXTRACTION_TIERS = [
+	{ kind: 'cf', model: LLAMA_4_SCOUT_MODEL,   opts: { maxOutputTokens: 600 },  label: 'triple:llama-4-scout' },
+	{ kind: 'cf', model: QWEN_CODER_32B_MODEL,  opts: { maxOutputTokens: 600 },  label: 'triple:qwen-coder-32b' },
+];
+
+const MOOD_TAGGING_TIERS = [
+	{ kind: 'cf', model: QWEN_CODER_32B_MODEL,  opts: { maxOutputTokens: 200 },  label: 'moodtag:qwen-coder-32b' },
+	{ kind: 'cf', model: LLAMA_4_SCOUT_MODEL,   opts: { maxOutputTokens: 200 },  label: 'moodtag:llama-4-scout' },
+];
+
+// interpretReaction cascade (post-bench 2026-05-15, Roma spec):
+//   Tier 1: gemini-2.5-flash-lite, thinking off (thinkingBudget: 0)
+//   Tier 2: llama-4-scout-17b (CF, ~1.8s on extraction-shape tasks)
 const REACTION_TIERS = [
-	{ kind: 'cf',     model: GEMMA_MODEL,         opts: { maxOutputTokens: 200 },                       label: 'reaction:gemma' },
-	{ kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 200 },                       label: 'reaction:flash-3' },
-	{ kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 200 },                       label: 'reaction:3.1-fl' },
-	{ kind: 'gemini', model: PRO_31_MODEL,        opts: { maxOutputTokens: 200 },                       label: 'reaction:pro-3.1' },
-	{ kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 200, thinkingBudget: -1 },   label: 'reaction:2.5-pro-ga' },
+	{ kind: 'gemini', model: FLASH_LITE_25_MODEL, opts: { maxOutputTokens: 200, thinkingBudget: 0 }, label: 'reaction:2.5-fl-off' },
+	{ kind: 'cf',     model: LLAMA_4_SCOUT_MODEL, opts: { maxOutputTokens: 200 },                    label: 'reaction:llama-4-scout' },
 ];
 
 /**
@@ -103,10 +107,7 @@ Examples: TRIPLE: Roman | enjoys | Coffee, TRIPLE: Gym | reduces | Anxiety
 If nothing new, respond: NOTHING_NEW`;
 	const sys = 'You are a silent observer. Be concise. Only note genuinely new information.';
 
-	return geminiBackgroundGenerate(env, FLASH_LITE_31_MODEL, prompt, sys, {
-		thinkingLevel: 'medium',
-		maxOutputTokens: 600,
-	});
+	return runCascade(env, prompt, sys, TRIPLE_EXTRACTION_TIERS);
 }
 
 /**
@@ -124,10 +125,7 @@ depressive_episode, anxiety_state, hypomanic_signs, stable_baseline, mixed_state
 Respond with ONLY the tags, comma-separated. Example: anxiety_state, sleep_disruption`;
 	const sys = 'You are a clinical tagger. Return only tags, no explanation.';
 
-	return geminiBackgroundGenerate(env, FLASH_LITE_31_MODEL, prompt, sys, {
-		thinkingLevel: 'minimal',
-		maxOutputTokens: 200,
-	});
+	return runCascade(env, prompt, sys, MOOD_TAGGING_TIERS);
 }
 
 /**
@@ -235,40 +233,31 @@ Respond with ONLY one word: venting, processing, transactional, or crisis.`;
 	let mode = null;
 	let source = null;
 
-	// Tier 1: Gemini 3.1 Flash-Lite preview, minimal thinking
+	// Tier 1: Qwen 2.5 Coder 32B via CF (215ms P50 in bench, 100% parse)
+	if (!mode && env.AI && budgetLeft() > 100) {
+		mode = await _tryProvider(
+			() => _classifyWithCfModel(env, QWEN_CODER_32B_MODEL, prompt, systemPrompt),
+			tierTimeout(1500)
+		);
+		if (mode) source = 'qwen-coder-32b';
+	}
+
+	// Tier 2: Llama 4 Scout 17B via CF (329ms P50 in bench, 100% parse)
+	if (!mode && env.AI && budgetLeft() > 100) {
+		mode = await _tryProvider(
+			() => _classifyWithCfModel(env, LLAMA_4_SCOUT_MODEL, prompt, systemPrompt),
+			tierTimeout(1500)
+		);
+		if (mode) source = 'llama-4-scout-17b';
+	}
+
+	// Tier 3 (cross-provider resilience): Gemini 3.1 Flash-Lite minimal
 	if (!mode && env.GEMINI_API_KEY && budgetLeft() > 100) {
 		mode = await _tryProvider(
 			() => _classifyWithGemini31FLMinimal(env, prompt, systemPrompt),
 			tierTimeout(2500)
 		);
-		if (mode) source = 'gemini-3.1-fl-minimal';
-	}
-
-	// Tier 2: Llama 3.1 8B
-	if (!mode && env.AI && budgetLeft() > 100) {
-		mode = await _tryProvider(
-			() => _classifyWithLlama8B(env, prompt, systemPrompt),
-			tierTimeout(1500)
-		);
-		if (mode) source = 'llama-8b';
-	}
-
-	// Tier 3: Gemma 4 26B
-	if (!mode && env.AI && budgetLeft() > 100) {
-		mode = await _tryProvider(
-			() => _classifyWithGemma(env, prompt, systemPrompt),
-			tierTimeout(3500)
-		);
-		if (mode) source = 'gemma-4';
-	}
-
-	// Tier 4: Gemini Flash 3 preview
-	if (!mode && env.GEMINI_API_KEY && budgetLeft() > 100) {
-		mode = await _tryProvider(
-			() => _classifyWithGemini(env, prompt, systemPrompt, '@gemini-flash'),
-			tierTimeout(2500)
-		);
-		if (mode) source = 'gemini-flash';
+		if (mode) source = 'gemini-3.1-fl-min';
 	}
 
 	if (!mode) {
@@ -324,6 +313,25 @@ async function _classifyWithGemma(env, prompt, systemPrompt) {
 		],
 		temperature: 0.2,
 		max_tokens: 2000,
+	});
+	const text = result?.choices?.[0]?.message?.content || result?.response;
+	return text || result;
+}
+
+// Generic CF model classifier — used by Tier 1 (qwen-coder) and Tier 2 (scout)
+// in tagConversationMode. Replaces the model-specific _classifyWithGemma /
+// _classifyWithLlama8B helpers (those are now dead code, kept for compat).
+async function _classifyWithCfModel(env, modelBinding, prompt, systemPrompt) {
+	const { runCfAi } = await import('../lib/ai-gateway.js');
+	const result = await runCfAi(env.AI, modelBinding, {
+		messages: [
+			{ role: 'system', content: systemPrompt },
+			{ role: 'user', content: prompt },
+		],
+		temperature: 0.2,
+		max_tokens: 64,
+	}, {
+		headers: { 'x-session-affinity': 'xaridotis-tag' },
 	});
 	const text = result?.choices?.[0]?.message?.content || result?.response;
 	return text || result;

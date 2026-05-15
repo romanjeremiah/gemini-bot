@@ -5,8 +5,12 @@
 // AI call per check-in that produces the therapeutic observation that
 // connects today's data to past patterns.
 //
-// Roma cascade (2026-05-14):
-//   Gemma → Flash 3 → 3.1 Flash-Lite → Pro 3.1 default → 2.5 Pro GA
+// Data-driven cascade (2026-05-15, post-bench):
+//   Tier 1: llama-3.3-70b-fp8-fast (CF) — 100% parse, 3.9s P50.
+//           Only model with 100% on the today-only emotions anchor.
+//   Tier 2: llama-4-scout-17b      (CF) — 93% parse, 2.1s P50.
+//           Insurance fallback per Roma's call: prefer occasional
+//           hallucination risk over silent failure on Tier 1 outage.
 //
 // Synthesis-readiness check: maybeFireSynthesis() only checks whether sleep
 // has been logged today. Score/emotions/activities/photo are guaranteed by
@@ -17,25 +21,18 @@ import * as episodeStore from './episodeStore';
 import * as vectorStore from './vectorStore';
 import {
 	runCascade,
-	FLASH_3_MODEL,
-	FLASH_LITE_31_MODEL,
-	PRO_31_MODEL,
-	PRO_25_MODEL,
-	GEMMA_MODEL,
+	LLAMA_33_70B_MODEL,
+	LLAMA_4_SCOUT_MODEL,
 } from '../lib/ai/gemini';
 import { getCheckinTiming } from '../lib/moodFlow';
 import { MOOD_POLL_OPTIONS } from '../config/moodScale';
 import { log } from '../lib/logger';
 
-// Roma cascade for end-of-flow synthesis.
-// Generous token budget (2000) so the synthesis can connect patterns properly.
-// Pro 3.1 default = no thinking config; 2.5 Pro GA = dynamic thinking budget.
+// Cascade for end-of-flow synthesis. Generous token budget (2000) so the
+// synthesis can connect patterns properly.
 const SYNTHESIS_TIERS = [
-	{ kind: 'cf',     model: GEMMA_MODEL,         opts: { maxOutputTokens: 2000 },                       label: 'synth:gemma' },
-	{ kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 2000 },                       label: 'synth:flash-3' },
-	{ kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 2000 },                       label: 'synth:3.1-fl' },
-	{ kind: 'gemini', model: PRO_31_MODEL,        opts: { maxOutputTokens: 2000 },                       label: 'synth:pro-3.1' },
-	{ kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 2000, thinkingBudget: -1 },   label: 'synth:2.5-pro-ga' },
+	{ kind: 'cf', model: LLAMA_33_70B_MODEL,  opts: { maxOutputTokens: 2000 }, label: 'synth:llama-3.3-70b-fast' },
+	{ kind: 'cf', model: LLAMA_4_SCOUT_MODEL, opts: { maxOutputTokens: 2000 }, label: 'synth:llama-4-scout' },
 ];
 
 const FIXED_FALLBACK_TEXT = 'Logged for tonight. We can talk through it whenever you are ready.';

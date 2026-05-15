@@ -4,12 +4,14 @@
 //   1. After the user picks a score on the poll  -> runScoreAck()
 //   2. After the user finishes selecting emotions -> runEmotionsAck()
 //
-// Roma cascade (2026-05-14):
-//   Gemma → Flash 3 → 3.1 Flash-Lite → Pro 3.1 default → 2.5 Pro GA
+// Data-driven cascades (2026-05-15, post-bench):
+//   mood_score_ack:    qwen-coder-32b → llama-3.3-70b-fp8-fast
+//   mood_emotions_ack: llama-4-scout-17b → llama-3.3-70b-fp8-fast
 //
-// Mid-flow latency budget matters less than warmth — Gemma is warm and free
-// at Tier 1, Flash 3 is fast at Tier 2, then increasingly capable tiers if
-// the cheaper ones fail. Final fallback is static text.
+// Both cascades pull from CF Workers AI — the bench showed CF models dominate
+// persona-heavy tasks at lower latency than Gemini equivalents. Tier 1 is
+// fastest under load; Tier 2 (llama-3.3-70b-fp8-fast) is the universal
+// performer (100% parse across all 10 benched tasks).
 //
 // Prompts are intentionally minimal: situation + role description, nothing
 // about HOW to respond. Persona system prompt handles tone.
@@ -17,24 +19,24 @@
 import * as moodStore from './moodStore';
 import {
 	runCascade,
-	FLASH_3_MODEL,
-	FLASH_LITE_31_MODEL,
-	PRO_31_MODEL,
-	PRO_25_MODEL,
-	GEMMA_MODEL,
+	QWEN_CODER_32B_MODEL,
+	LLAMA_4_SCOUT_MODEL,
+	LLAMA_33_70B_MODEL,
 } from '../lib/ai/gemini';
 import { getCheckinTiming } from '../lib/moodFlow';
 import { MOOD_POLL_OPTIONS } from '../config/moodScale';
 import { log } from '../lib/logger';
 
-// Roma cascade: Gemma → Flash 3 → 3.1 FL → Pro 3.1 default → 2.5 Pro GA.
-// Token budget intentionally generous (1500) so warmth has room to breathe.
-const MICRO_ACK_TIERS = [
-	{ kind: 'cf',     model: GEMMA_MODEL,         opts: { maxOutputTokens: 1500 },                       label: 'ack:gemma' },
-	{ kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 1500 },                       label: 'ack:flash-3' },
-	{ kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 1500 },                       label: 'ack:3.1-fl' },
-	{ kind: 'gemini', model: PRO_31_MODEL,        opts: { maxOutputTokens: 1500 },                       label: 'ack:pro-3.1' },
-	{ kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 1500, thinkingBudget: -1 },   label: 'ack:2.5-pro-ga' },
+// Score ack: qwen-coder Tier 1 (921ms P50, 100% bench), llama-70b Tier 2.
+const SCORE_ACK_TIERS = [
+	{ kind: 'cf', model: QWEN_CODER_32B_MODEL, opts: { maxOutputTokens: 1500 }, label: 'score-ack:qwen-coder-32b' },
+	{ kind: 'cf', model: LLAMA_33_70B_MODEL,   opts: { maxOutputTokens: 1500 }, label: 'score-ack:llama-3.3-70b-fast' },
+];
+
+// Emotions ack: scout Tier 1 (1.25s P50, 100% bench), llama-70b Tier 2.
+const EMOTIONS_ACK_TIERS = [
+	{ kind: 'cf', model: LLAMA_4_SCOUT_MODEL,  opts: { maxOutputTokens: 1500 }, label: 'emo-ack:llama-4-scout' },
+	{ kind: 'cf', model: LLAMA_33_70B_MODEL,   opts: { maxOutputTokens: 1500 }, label: 'emo-ack:llama-3.3-70b-fast' },
 ];
 
 const STATIC_SCORE_ACK = 'Got it. Tap below to share what you are feeling.';
@@ -70,7 +72,7 @@ ${therapeuticNotes}
 Briefly respond as a supportive and understanding friend who notices.`;
 
 	const t0 = Date.now();
-	const text = await runCascade(env, prompt, systemPrompt, MICRO_ACK_TIERS);
+	const text = await runCascade(env, prompt, systemPrompt, SCORE_ACK_TIERS);
 	const finalText = (text || '').trim() || STATIC_SCORE_ACK;
 	log.info('mood_score_ack_done', {
 		userId,
@@ -103,7 +105,7 @@ ${therapeuticNotes}
 Briefly respond as a supportive and understanding friend who notices patterns.`;
 
 	const t0 = Date.now();
-	const text = await runCascade(env, prompt, systemPrompt, MICRO_ACK_TIERS);
+	const text = await runCascade(env, prompt, systemPrompt, EMOTIONS_ACK_TIERS);
 	const finalText = (text || '').trim() || STATIC_EMOTIONS_ACK;
 	log.info('mood_emotions_ack_done', {
 		userId,

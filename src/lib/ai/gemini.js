@@ -33,6 +33,12 @@ export const PRO_25_MODEL        = 'gemini-2.5-pro';
 export const KIMI_MODEL          = '@cf/moonshotai/kimi-k2.6';
 export const GEMMA_MODEL         = '@cf/google/gemma-4-26b-a4b-it';
 
+// Background-task model constants (data-driven cascade rewrite 2026-05-15).
+// Top performers from the 3,750-trial benchmark — see bg_task_bench_*.md.
+export const QWEN_CODER_32B_MODEL = '@cf/qwen/qwen2.5-coder-32b-instruct';
+export const LLAMA_4_SCOUT_MODEL  = '@cf/meta/llama-4-scout-17b-16e-instruct';
+export const LLAMA_33_70B_MODEL   = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+
 // Legacy aliases kept so existing callers in handlers.js / responseCurator /
 // transcription / mood files continue to compile without restructuring.
 // PRIMARY = main convo Tier 1 (Flash 3). FALLBACK = main convo Tier 2 (3.1 FL).

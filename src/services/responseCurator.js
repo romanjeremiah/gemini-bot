@@ -5,13 +5,12 @@
 // summary that gets PREPENDED to the prompt. The main model then receives a
 // tighter, decision-ready context instead of raw memory dumps.
 //
-// Roma cascade (2026-05-14):
-//   Gemma → Flash 3 → 3.1 Flash-Lite → Pro 3.1 default → 2.5 Pro GA
-//
-// Gemma (CF Tier 1) does not support responseMimeType; we rely on the prompt
-// instructing JSON-only output and on the parser's truncation-recovery layer
-// to handle imperfect JSON. Gemini tiers pass responseMimeType=application/json
-// for strict structured output.
+// Data-driven cascade (2026-05-15, post-bench):
+//   Tier 1: llama-3.3-70b-fp8-fast (CF)        — 100% JSON parse, 2.3s P50.
+//           Replaces deprecated Hermes 2 Pro — same latency profile,
+//           native JSON shape compliance without responseMimeType.
+//   Tier 2: gemini-2.5-flash-lite (thinkingBudget=512) — 100% parse, 3.5s P50.
+//           Cross-provider fallback with strict JSON via responseMimeType.
 //
 // What the curator outputs:
 //   - relevant_memory_ids: which memCtx memories actually relate to this turn
@@ -26,20 +25,14 @@
 
 import {
 	runCascade,
-	FLASH_3_MODEL,
-	FLASH_LITE_31_MODEL,
-	PRO_31_MODEL,
-	PRO_25_MODEL,
-	GEMMA_MODEL,
+	FLASH_LITE_25_MODEL,
+	LLAMA_33_70B_MODEL,
 } from '../lib/ai/gemini';
 import { log } from '../lib/logger';
 
 const CURATOR_TIERS = [
-	{ kind: 'cf',     model: GEMMA_MODEL,         opts: { maxOutputTokens: 800 },                                                       label: 'curator:gemma' },
-	{ kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 800, responseMimeType: 'application/json' },                 label: 'curator:flash-3' },
-	{ kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 800, responseMimeType: 'application/json' },                 label: 'curator:3.1-fl' },
-	{ kind: 'gemini', model: PRO_31_MODEL,        opts: { maxOutputTokens: 800, responseMimeType: 'application/json' },                 label: 'curator:pro-3.1' },
-	{ kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 800, responseMimeType: 'application/json', thinkingBudget: -1 }, label: 'curator:2.5-pro-ga' },
+	{ kind: 'cf',     model: LLAMA_33_70B_MODEL, opts: { maxOutputTokens: 800 },                                                       label: 'curator:llama-3.3-70b-fast' },
+	{ kind: 'gemini', model: FLASH_LITE_25_MODEL, opts: { maxOutputTokens: 800, responseMimeType: 'application/json', thinkingBudget: 512 }, label: 'curator:2.5-fl-b512' },
 ];
 
 const CURATOR_PROMPT = `You are a pre-response curator for an AI companion called Xaridotis.

@@ -4,8 +4,9 @@
 // evolved_traits + communication_notes columns with observations. Runs as part
 // of the daily 04:00 cron alongside style card consolidation.
 //
-// Roma cascade (2026-05-14):
-//   Gemma → Flash 3 → 3.1 Flash-Lite → Pro 3.1 default → 2.5 Pro GA
+// Data-driven cascade (2026-05-15, post-bench):
+//   Tier 1: llama-3.3-70b-fp8-fast (CF) — 100% parse, 1.6s P50
+//   Tier 2: qwen-coder-32b         (CF) — 100% parse, 1.85s P50
 //
 // SIGNAL SOURCES (in order of priority):
 //   1. Recent feedback memories (RLHF reactions — strongest signal)
@@ -15,20 +16,14 @@
 
 import {
 	runCascade,
-	FLASH_3_MODEL,
-	FLASH_LITE_31_MODEL,
-	PRO_31_MODEL,
-	PRO_25_MODEL,
-	GEMMA_MODEL,
+	LLAMA_33_70B_MODEL,
+	QWEN_CODER_32B_MODEL,
 } from '../lib/ai/gemini';
 import { getPersonaConfig, updatePersonaConfig } from './persona';
 
 const EVOLUTION_TIERS = [
-	{ kind: 'cf',     model: GEMMA_MODEL,         opts: { maxOutputTokens: 700 },                       label: 'persona:gemma' },
-	{ kind: 'gemini', model: FLASH_3_MODEL,       opts: { maxOutputTokens: 700 },                       label: 'persona:flash-3' },
-	{ kind: 'gemini', model: FLASH_LITE_31_MODEL, opts: { maxOutputTokens: 700 },                       label: 'persona:3.1-fl' },
-	{ kind: 'gemini', model: PRO_31_MODEL,        opts: { maxOutputTokens: 700 },                       label: 'persona:pro-3.1' },
-	{ kind: 'gemini', model: PRO_25_MODEL,        opts: { maxOutputTokens: 700, thinkingBudget: -1 },   label: 'persona:2.5-pro-ga' },
+	{ kind: 'cf', model: LLAMA_33_70B_MODEL,   opts: { maxOutputTokens: 700 }, label: 'persona:llama-3.3-70b-fast' },
+	{ kind: 'cf', model: QWEN_CODER_32B_MODEL, opts: { maxOutputTokens: 700 }, label: 'persona:qwen-coder-32b' },
 ];
 
 const EVOLUTION_PROMPT = `You are analysing recent interactions between a user and their AI companion to extract DURABLE observations.
